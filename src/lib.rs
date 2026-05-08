@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -99,6 +100,15 @@ impl Action {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum KoilError {
+    #[error("`{0}` appears more than once")]
+    DuplicatePath(String),
+
+    #[error("Invalid ID: `{0}`, this ID is not recognized")]
+    InvalidID(ID),
+}
+
 pub struct Koil {
     min_id_len: usize,
     ids: Vec<PathBuf>,
@@ -130,7 +140,7 @@ impl Koil {
         let mut entries = Vec::new();
 
         for i in 0..self.ids.len() {
-            entries.push(self.get_entry(i));
+            entries.push(self.get_entry(i).unwrap());
         }
         entries.sort();
 
@@ -154,16 +164,21 @@ impl Koil {
         s
     }
 
-    pub fn compute_actions(&self, content: String) -> Vec<Action> {
+    pub fn compute_actions(&self, content: String) -> Result<Vec<Action>, KoilError> {
         self.compute_actions_parsed(parse::parse_listing(content))
     }
 
-    pub fn compute_actions_parsed(&self, parsed: parse::ParsedFile) -> Vec<Action> {
+    pub fn compute_actions_parsed(
+        &self,
+        parsed: parse::ParsedFile,
+    ) -> Result<Vec<Action>, KoilError> {
+        self.validate(&parsed)?;
+
         let mut actions = Vec::new();
 
         // Deletes
         for i in 0..self.ids.len() {
-            let entry = self.get_entry(i);
+            let entry = self.get_entry(i).unwrap();
             if !parsed.with_id.contains_key(&entry.id) {
                 if entry.is_dir {
                     actions.push(Action::DeleteDir(entry.name.clone()));
@@ -184,12 +199,7 @@ impl Koil {
 
         // Renames / Copy
         for (id, mut entries) in parsed.with_id {
-            // TODO: do a better job at telling ppl about invalid ID
-            assert!(
-                usize::from_str_radix(&id, 16).is_ok_and(|i| i < self.ids.len()),
-                "unrecognized ID: {id:?}"
-            );
-            let orig = self.get_entry_by_id(&id);
+            let orig = self.get_entry_by_id(&id)?;
             if let Some(i) = entries.iter().position(|e| e.name == orig.name) {
                 // remove original name from entries, to avoid copy(A, A)
                 entries.swap_remove(i);
@@ -207,24 +217,45 @@ impl Koil {
         }
 
         // sort the actions in correct order
-        planner::plan_actions(&actions)
+        Ok(planner::plan_actions(&actions))
     }
 
-    pub fn get_entry(&self, index: usize) -> Entry {
-        let path = &self.ids[index];
+    fn validate(&self, parsed: &parse::ParsedFile) -> Result<(), KoilError> {
+        let mut seen = HashSet::new();
+        for (id, entries) in &parsed.with_id {
+            self.get_entry_by_id(id)?;
+            for entry in entries {
+                if !seen.insert(&entry.name) {
+                    return Err(KoilError::DuplicatePath(entry.name.clone()));
+                }
+            }
+        }
+
+        for name in &parsed.without_id {
+            if !seen.insert(name) {
+                return Err(KoilError::DuplicatePath(name.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_entry(&self, index: usize) -> Option<Entry> {
+        let path = &self.ids.get(index)?;
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let id = self.to_id(index);
 
-        Entry {
+        Some(Entry {
             id,
             name,
             is_dir: path.is_dir(),
-        }
+        })
     }
 
-    pub fn get_entry_by_id(&self, id: &str) -> Entry {
+    pub fn get_entry_by_id(&self, id: &str) -> Result<Entry, KoilError> {
         let index = usize::from_str_radix(id, 16).unwrap();
         self.get_entry(index)
+            .ok_or(KoilError::InvalidID(id.to_string()))
     }
 
     pub fn to_id(&self, index: usize) -> String {

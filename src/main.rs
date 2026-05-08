@@ -4,7 +4,7 @@ use koil::Koil;
 
 const FORCE: bool = true;
 
-fn main() -> io::Result<()> {
+fn main() -> anyhow::Result<()> {
     let dir = std::env::current_dir()?;
 
     let listing_path = dir.join(".koil_listing");
@@ -14,10 +14,9 @@ fn main() -> io::Result<()> {
             "Error: {} already exists.\nAnother instance may be running. Remove it and try again.",
             listing_path.display()
         );
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "listing file already exists",
-        ));
+        return Err(
+            io::Error::new(io::ErrorKind::AlreadyExists, "listing file already exists").into(),
+        );
     }
 
     let mut k = Koil::new();
@@ -38,7 +37,7 @@ fn main() -> io::Result<()> {
     }
 
     let content = fs::read_to_string(&listing_path)?;
-    let actions = k.compute_actions(content);
+    let actions = k.compute_actions(content)?;
     for action in actions {
         println!("{}", action.command());
     }

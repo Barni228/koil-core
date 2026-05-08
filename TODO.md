@@ -1,6 +1,6 @@
 ## Features
 
-- [ ] Don't panic when user created a random id for some reason
+- [ ] Allow cross-directory edits
 - [ ] Generate unique IDs using HashId (convert number to random looking string)
 - [ ] Make a `KoilBuilder`
 - [ ] create `koil undo`, which undoes whatever it just did
@@ -13,3 +13,7 @@
 - [ ] Allow different sorting
 - [ ] Parse file with `chumsky`
 - [ ] Publish to crates.io
+
+## Done
+
+- [x] Don't panic when user created a random id for some reason
