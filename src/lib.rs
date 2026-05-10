@@ -1,19 +1,17 @@
-use std::{
-    collections::HashSet,
-    fmt, fs, io,
-    path::{Path, PathBuf},
-};
+use crate::diff::Diff;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::{fmt, fs, io};
 
+pub mod diff;
 pub mod parse;
 pub mod planner;
-
-type ID = String;
 
 /// A single file or directory captured from a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Hexadecimal ID
-    pub id: ID,
+    pub id: String,
     /// Display name, without trailing `/`.
     pub name: String,
     /// Whether this entry is a directory.
@@ -46,34 +44,34 @@ impl Ord for Entry {
 /// Represent a filesystem operation
 pub enum Action {
     /// rm -rf <name>
-    DeleteDir(String),
+    DeleteDir(PathBuf),
     /// rm -f <name>
-    DeleteFile(String),
+    DeleteFile(PathBuf),
     /// mv <src> <dst>
-    Rename(String, String),
+    Rename(PathBuf, PathBuf),
     /// cp <src> <dst>
-    Copy(String, String),
+    Copy(PathBuf, PathBuf),
     /// touch <name>
-    CreateFile(String),
+    CreateFile(PathBuf),
     /// mkdir -p <name>
-    CreateDir(String),
+    CreateDir(PathBuf),
 }
 
 impl Action {
-    /// A shell command representing what this action would do
-    pub fn command(&self) -> String {
-        match self {
-            Action::CreateFile(n) => format!("touch {}", n),
-            Action::CreateDir(n) => format!("mkdir {}", n),
-            Action::DeleteFile(n) => format!("rm {}", n),
-            Action::DeleteDir(n) => format!("rm -rf {}", n),
-            Action::Rename(s, d) => format!("mv {} {}", s, d),
-            Action::Copy(s, d) => format!("cp {} {}", s, d),
-        }
-    }
+    // /// A shell command representing what this action would do
+    // pub fn command(&self) -> String {
+    //     match self {
+    //         Action::CreateFile(n) => format!("touch {}", n),
+    //         Action::CreateDir(n) => format!("mkdir {}", n),
+    //         Action::DeleteFile(n) => format!("rm {}", n),
+    //         Action::DeleteDir(n) => format!("rm -rf {}", n),
+    //         Action::Rename(s, d) => format!("mv {} {}", s, d),
+    //         Action::Copy(s, d) => format!("cp {} {}", s, d),
+    //     }
+    // }
 
-    /// The name this action **frees** (removes from the filesystem), if any.
-    pub fn clears(&self) -> Option<&str> {
+    /// The path this action **removes** (deletes from the filesystem), if any.
+    pub fn removes(&self) -> Option<&Path> {
         match self {
             Action::DeleteFile(n) | Action::DeleteDir(n) => Some(n),
             Action::Rename(s, _) => Some(s),
@@ -81,8 +79,8 @@ impl Action {
         }
     }
 
-    /// The name this action **creates** (places on the filesystem), if any.
-    pub fn creates(&self) -> Option<&str> {
+    /// The path this action **creates** (places on the filesystem), if any.
+    pub fn creates(&self) -> Option<&Path> {
         match self {
             Action::CreateFile(n) | Action::CreateDir(n) | Action::Copy(_, n) => Some(n),
             Action::Rename(_, d) => Some(d),
@@ -90,8 +88,8 @@ impl Action {
         }
     }
 
-    /// The name this action requires to exist, if any
-    pub fn depends_on(&self) -> Option<&str> {
+    /// The path this action requires to exist, if any
+    pub fn depends_on(&self) -> Option<&Path> {
         match self {
             Action::DeleteFile(n) | Action::DeleteDir(n) => Some(n),
             Action::Rename(s, _) | Action::Copy(s, _) => Some(s),
@@ -106,138 +104,136 @@ pub enum KoilError {
     DuplicatePath(String),
 
     #[error("Invalid ID: `{0}`, this ID is not recognized")]
-    InvalidID(ID),
+    InvalidID(String),
 }
 
 pub struct Koil {
+    /// The minimum length to use for IDs, IDs can be longer than this but never shorter
     min_id_len: usize,
+
+    /// All IDs, pointing to their corresponding path
     ids: Vec<PathBuf>,
+
+    /// The saved indexes that are shows in the current listing
+    current_listing: HashSet<usize>,
+
+    /// The currently open directory
+    current_dir: PathBuf,
+
+    /// Partial diff, which stores all changes made in other listings
+    diff: Diff,
 }
 
 impl Default for Koil {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Koil {
-    pub fn new() -> Self {
         Koil {
             min_id_len: 6,
             ids: Vec::new(),
+            current_listing: HashSet::new(),
+            current_dir: PathBuf::new(),
+            diff: Diff::default(),
         }
     }
+}
 
+// Public functions
+impl Koil {
+    /// Create new [`Koil`], with default values
+    pub fn new() -> Koil {
+        Koil::default()
+    }
+
+    /// Open the dir given
+    /// If it is a relative path, it will be opened relative to [`Koil::current_dir`]
     pub fn open<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
-        for item in fs::read_dir(dir)? {
+        self.current_listing.clear();
+        self.current_dir = if dir.as_ref().is_relative() {
+            self.current_dir.join(dir).canonicalize()?
+        } else {
+            dir.as_ref().canonicalize()?
+        };
+
+        for item in fs::read_dir(&self.current_dir)? {
             let item = item?;
-            self.ids.push(item.path());
-        }
-        Ok(())
-    }
-
-    pub fn entries(&self) -> Vec<Entry> {
-        let mut entries = Vec::new();
-
-        for i in 0..self.ids.len() {
-            entries.push(self.get_entry(i).unwrap());
-        }
-        entries.sort();
-
-        entries
-    }
-
-    pub fn write_listing<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
-        for (i, entry) in self.entries().iter().enumerate() {
-            if i > 0 {
-                out.write_char('\n')?;
-            }
-            write!(out, "{entry}")?;
+            let id = self
+                .ids
+                .iter()
+                .position(|p| p == &item.path())
+                .unwrap_or_else(|| {
+                    self.ids.push(item.path());
+                    self.ids.len() - 1
+                });
+            self.current_listing.insert(id);
         }
 
         Ok(())
     }
 
+    /// The currently open listing, which user should modify
     pub fn listing(&self) -> String {
-        let mut s = String::new();
-        self.write_listing(&mut s).unwrap();
-        s
-    }
+        let mut entries = Vec::new();
+        // returns true if this path should be shown in the current listing
+        let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
 
-    pub fn compute_actions(&self, content: String) -> Result<Vec<Action>, KoilError> {
-        self.compute_actions_parsed(parse::parse_listing(content))
-    }
-
-    pub fn compute_actions_parsed(
-        &self,
-        parsed: parse::ParsedFile,
-    ) -> Result<Vec<Action>, KoilError> {
-        self.validate(&parsed)?;
-
-        let mut actions = Vec::new();
-
-        // Deletes
-        for i in 0..self.ids.len() {
-            let entry = self.get_entry(i).unwrap();
-            if !parsed.with_id.contains_key(&entry.id) {
-                if entry.is_dir {
-                    actions.push(Action::DeleteDir(entry.name.clone()));
-                } else {
-                    actions.push(Action::DeleteFile(entry.name.clone()));
+        // IDs from current listing
+        for &index in &self.current_listing {
+            if let Some((_before, afters)) = self.diff.with_id.get(&index) {
+                for path in afters.iter().filter(|p| in_this_listing(p)) {
+                    entries.push(Entry {
+                        id: self.to_id(index),
+                        name: path.file_name().unwrap().to_string_lossy().to_string(),
+                        is_dir: self.ids[index].is_dir(),
+                    });
                 }
-            }
-        }
-
-        // Creates
-        for name in parsed.without_id {
-            if name.ends_with('/') {
-                actions.push(Action::CreateDir(name.clone()));
             } else {
-                actions.push(Action::CreateFile(name.clone()));
+                entries.push(self.get_entry(index).unwrap())
             }
         }
 
-        // Renames / Copy
-        for (id, mut entries) in parsed.with_id {
-            let orig = self.get_entry_by_id(&id)?;
-            if let Some(i) = entries.iter().position(|e| e.name == orig.name) {
-                // remove original name from entries, to avoid copy(A, A)
-                entries.swap_remove(i);
-            // if the original name no longer exists, then there was a rename
-            } else {
-                // TODO: make the logic of detecting to who we renamed to smarter
-                let renamed_to = entries.pop().unwrap();
-                actions.push(Action::Rename(orig.name.to_string(), renamed_to.name));
+        // IDs from other folders
+        for (&index, (_before, afters)) in &self.diff.with_id {
+            // if it is in current_listing, then I already added it above
+            if self.current_listing.contains(&index) {
+                continue;
             }
-
-            // every name that is not original must be a copy
-            for entry in entries {
-                actions.push(Action::Copy(orig.name.clone(), entry.name));
+            for path in afters.iter().filter(|p| in_this_listing(p)) {
+                entries.push(Entry {
+                    id: self.to_id(index),
+                    name: path.file_name().unwrap().to_string_lossy().to_string(),
+                    is_dir: self.ids[index].is_dir(),
+                });
             }
         }
 
-        // sort the actions in correct order
-        Ok(planner::plan_actions(&actions))
+        entries.sort();
+        let mut lines: Vec<_> = entries.iter().map(|e| e.to_string()).collect();
+
+        for (path, &is_dir) in self
+            .diff
+            .without_id
+            .iter()
+            .filter(|(p, _)| p.parent().is_some_and(|p| p == self.current_dir))
+        {
+            let mut name = path.file_name().unwrap().to_string_lossy().to_string();
+            if is_dir {
+                name.push('/');
+            }
+            lines.push(name);
+        }
+
+        lines.join("\n")
     }
 
-    fn validate(&self, parsed: &parse::ParsedFile) -> Result<(), KoilError> {
-        let mut seen = HashSet::new();
-        for (id, entries) in &parsed.with_id {
-            self.get_entry_by_id(id)?;
-            for entry in entries {
-                if !seen.insert(&entry.name) {
-                    return Err(KoilError::DuplicatePath(entry.name.clone()));
-                }
-            }
-        }
+    /// Update the internal diff based on modifications made in `modified_listing`
+    pub fn update(&mut self, modified_listing: &str) -> Result<(), KoilError> {
+        self.update_parsed(parse::parse_listing(modified_listing))
+    }
 
-        for name in &parsed.without_id {
-            if !seen.insert(name) {
-                return Err(KoilError::DuplicatePath(name.clone()));
-            }
-        }
-
-        Ok(())
+    /// This will consume the diff, and return the actions required to do what user did
+    pub fn compute_actions(&mut self) -> Vec<Action> {
+        // `take` will return an owned value, and replace the `&mut` to [`Default::default`]
+        let diff = std::mem::take(&mut self.diff);
+        diff.compute_actions()
     }
 
     pub fn get_entry(&self, index: usize) -> Option<Entry> {
@@ -252,22 +248,129 @@ impl Koil {
         })
     }
 
-    pub fn get_entry_by_id(&self, id: &str) -> Result<Entry, KoilError> {
+    /// Convert an ID string to index
+    /// returned index is guaranteed to be in [`Koil::ids`]
+    pub fn id_to_index(&self, id: &str) -> Result<usize, KoilError> {
         let index = usize::from_str_radix(id, 16).unwrap();
-        self.get_entry(index)
-            .ok_or(KoilError::InvalidID(id.to_string()))
+        if index >= self.ids.len() {
+            Err(KoilError::InvalidID(id.to_string()))
+        } else {
+            Ok(index)
+        }
     }
 
+    /// Convert an `index` to ID
     pub fn to_id(&self, index: usize) -> String {
         format!("{:0width$x}", index, width = self.min_id_len)
     }
+}
 
-    pub fn format_entry(&self, id: usize) -> String {
-        let id_hex = format!("{:0width$x}", id, width = self.min_id_len);
-        let path = &self.ids[id];
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let entry_type = if path.is_dir() { '/' } else { '-' };
-        format!("{id_hex}{entry_type} {name}")
+// Private functions
+impl Koil {
+    /// See [`Koil::update`]
+    fn update_parsed(&mut self, modified_listing: parse::ParsedFile) -> Result<(), KoilError> {
+        self.validate(&modified_listing)?;
+        let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
+
+        // clear the diff for the current listing, since it is outdated
+        self.diff.with_id.retain(|_index, (before, afters)| {
+            afters.retain(|p| !in_this_listing(p));
+            // if before and after are from this listing, remove this from diff
+            // or if before and after are exactly the same, then also remove it
+            (!afters.is_empty() || !in_this_listing(before))
+                && afters.as_slice() != [before.as_path()]
+        });
+        self.diff.without_id.retain(|p, _| !in_this_listing(p));
+
+        // if something existed before, but does not exist now, tell the diff that it used to exist
+        for &index in &self.current_listing {
+            if !modified_listing.with_id.contains_key(&self.to_id(index)) {
+                self.diff.add_before_from(index, &self.ids);
+            }
+        }
+
+        // Creates
+        for name in &modified_listing.without_id {
+            self.add_create(name)?;
+        }
+
+        // Renames / Copy
+        for (id, entries) in modified_listing.with_id {
+            let index = self.id_to_index(&id)?;
+            // if this id only has 1 name, and that name is same as before, user did nothing
+            if entries.len() == 1
+                && self.current_listing.contains(&index)
+                && entries[0].name == self.get_entry(index).unwrap().name
+                && !self.diff.with_id.contains_key(&index)
+            {
+                continue;
+            }
+            // at this point, user did something...
+
+            // If this ID came from current listing, just update before and after
+            if self.current_listing.contains(&index) {
+                self.diff.add_before_from(index, &self.ids);
+
+            // If this ID did NOT come from current listing (came from another folder) AND
+            // If we are the first ppl to know about this ID being involved in some actions
+            } else if !self.diff.with_id.contains_key(&index) {
+                // tell diff_before about this ID
+                self.diff.add_before_from(index, &self.ids);
+
+                // tell diff_after that this ID still exists in the place where it came from
+                // (since if it didn't exist there, then that folder would already add it to diff_before)
+                self.diff.push_after(index, self.ids[index].to_path_buf());
+            }
+
+            // Add what we see to `diff`
+            for entry in entries {
+                let path = self.current_dir.join(&entry.name);
+                self.diff.push_after(index, path);
+            }
+        }
+
+        dbg!(&self.diff);
+
+        Ok(())
+    }
+
+    /// Add `name_to_create` to [`Koil::diff`]
+    /// If `name_to_create` ends with `/`, a dir will be created
+    /// If this is a duplicate, [`KoilError`] is returned
+    fn add_create(&mut self, name_to_create: &str) -> Result<(), KoilError> {
+        let (path, is_dir) = if let Some(stripped) = name_to_create.strip_suffix('/') {
+            (self.current_dir.join(stripped), true)
+        } else {
+            (self.current_dir.join(name_to_create), false)
+        };
+
+        if self.diff.without_id.insert(path, is_dir).is_some() {
+            return Err(KoilError::DuplicatePath(name_to_create.to_string()));
+        }
+        Ok(())
+    }
+
+    // TODO: don't validate, make parsed file never have duplicates
+    fn validate(&self, parsed: &parse::ParsedFile) -> Result<(), KoilError> {
+        let mut seen = HashSet::new();
+        for (id, entries) in &parsed.with_id {
+            // make sure that the ID is valid
+            self.id_to_index(id)?;
+            // detect duplicates
+            for entry in entries {
+                if !seen.insert(&entry.name) {
+                    return Err(KoilError::DuplicatePath(entry.name.clone()));
+                }
+            }
+        }
+
+        for name in &parsed.without_id {
+            if !seen.insert(name) {
+                return Err(KoilError::DuplicatePath(name.clone()));
+            }
+        }
+
+        Ok(())
     }
 }
 

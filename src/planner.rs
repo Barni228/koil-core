@@ -31,10 +31,10 @@ pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
             Action::Rename(from, to) => (from, to),
             _ => unreachable!(),
         };
-        result.push(Action::Rename(first_from, "tmp".to_string()));
+        result.push(Action::Rename(first_from, "tmp".into()));
         result.extend(iter.rev());
 
-        result.push(Action::Rename("tmp".to_string(), first_to));
+        result.push(Action::Rename("tmp".into(), first_to));
     }
 
     // result.extend(topological_sort(actions, successors).unwrap());
@@ -95,11 +95,9 @@ fn successors(actions: &[Action], action: &Action) -> Vec<Action> {
             // If I depend on something, and `other` removes that, I go first
             (action
                 .depends_on()
-                .is_some_and(|f| other.clears() == Some(f)))
-            // If I remove something and `other` creates it, I should remove it first
-                || (action.clears().is_some_and(|f| other.creates() == Some(f)))
-            // If I create something, and `a` depends on that, I go first
-            // || (action.creates().is_some_and(|c| a.depends_on() == Some(c)))
+                .is_some_and(|f| other.removes() == Some(f)))
+                // If I remove something and `other` creates it, I should remove it first
+                || (action.removes().is_some_and(|f| other.creates() == Some(f)))
         })
         .cloned()
         .collect()

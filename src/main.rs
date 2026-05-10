@@ -1,11 +1,11 @@
-use std::{fs, io};
-
+use io::Write;
 use koil::Koil;
+use std::{fs, io};
 
 const FORCE: bool = true;
 
 fn main() -> anyhow::Result<()> {
-    let dir = std::env::current_dir()?;
+    let mut dir = std::env::current_dir()?;
 
     let listing_path = dir.join(".koil_listing");
 
@@ -20,26 +20,41 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut k = Koil::new();
-    println!("Reading: {}", dir.display());
-    k.open(dir)?;
-    fs::write(&listing_path, k.listing())?;
+    // TODO: maybe do the fancy stdin.lock stuff
 
-    println!(
-        "Opened {}.\
-        Edit it, then press Enter...",
-        listing_path.display()
-    );
+    loop {
+        println!("Reading: {}", dir.display());
+        k.open(&dir)?;
+        fs::write(&listing_path, k.listing())?;
 
-    {
-        let stdin = io::stdin();
-        let mut buf = String::new();
-        io::BufRead::read_line(&mut stdin.lock(), &mut buf)?;
+        println!(
+            "Opened {}.\n\
+            Edit it, then press Enter...",
+            listing_path.display()
+        );
+
+        let new = input("Enter, or new path: ");
+        // {
+        //     let stdin = io::stdin();
+        //     let mut buf = String::new();
+        //     io::BufRead::read_line(&mut stdin.lock(), &mut buf)?;
+        // }
+
+        let content = fs::read_to_string(&listing_path)?;
+        k.update(&content)?;
+        if new.is_empty() {
+            break;
+        // } else if new == ".." {
+        //     dir.pop();
+        } else {
+            dir = new.into()
+            // dir.push(new);
+        }
     }
 
-    let content = fs::read_to_string(&listing_path)?;
-    let actions = k.compute_actions(content)?;
+    let actions = k.compute_actions();
     for action in actions {
-        println!("{}", action.command());
+        println!("{:?}", action);
     }
 
     let _ = fs::remove_file(&listing_path);
@@ -47,3 +62,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn input(prompt: &str) -> String {
+    let mut line = String::new();
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    io::stdin()
+        .read_line(&mut line)
+        .expect("Failed to read the line");
+    line.trim_end().to_string()
+}

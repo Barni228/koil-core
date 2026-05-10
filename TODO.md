@@ -1,6 +1,6 @@
 ## Features
 
-- [ ] Allow cross-directory edits
+- [ ] Dont always rename to `tmp` when resolving renames
 - [ ] Generate unique IDs using HashId (convert number to random looking string)
 - [ ] Make a `KoilBuilder`
 - [ ] create `koil undo`, which undoes whatever it just did
@@ -16,4 +16,5 @@
 
 ## Done
 
+- [x] Allow cross-directory edits
 - [x] Don't panic when user created a random id for some reason

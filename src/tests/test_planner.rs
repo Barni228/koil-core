@@ -296,22 +296,6 @@ fn test_cycle3_plus_lone_rename() {
     );
 }
 
-// --- assert / panic cases -------------------------------------------------
-
-// #[test]
-// #[should_panic]
-// fn test_duplicate_source_panics() {
-//     // A appears as source twice — violates the assert
-//     plan_actions(&[rename("A", "B"), rename("A", "C")]);
-// }
-
-// #[test]
-// #[should_panic]
-// fn test_duplicate_destination_panics() {
-//     // Both A and B want to become C
-//     plan_actions(&[rename("A", "C"), rename("B", "C")]);
-// }
-
 // --- ADD ----------------------------------------------------------------
 
 #[test]
@@ -711,23 +695,3 @@ fn test_copy_with_add_and_delete() {
         plan_actions(&[copy("A", "B"), delete("B"), add("C")])
     );
 }
-
-// --- copy: panic cases ----------------------------------------------------
-
-// #[test]
-// #[should_panic]
-// fn test_copy_and_rename_same_destination_panics() {
-//     plan_actions(&[copy("A", "C"), rename("B", "C")]);
-// }
-
-// #[test]
-// #[should_panic]
-// fn test_two_copies_same_destination_panics() {
-//     plan_actions(&[copy("A", "C"), copy("B", "C")]);
-// }
-
-// #[test]
-// #[should_panic]
-// fn test_copy_and_add_same_destination_panics() {
-//     plan_actions(&[copy("A", "B"), add("B")]);
-// }

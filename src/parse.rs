@@ -1,9 +1,10 @@
-use crate::{Entry, ID};
+use crate::Entry;
 use std::collections::HashMap;
 
+#[derive(Debug, Default, Clone)]
 pub struct ParsedFile {
     /// id -> name
-    pub with_id: HashMap<ID, Vec<Entry>>,
+    pub with_id: HashMap<String, Vec<Entry>>,
     /// bare names with no id - to be created
     pub without_id: Vec<String>,
 }
@@ -38,7 +39,7 @@ fn parse_line(raw: &str) -> Option<ParsedLine> {
     }
 }
 
-pub fn parse_listing(content: String) -> ParsedFile {
+pub fn parse_listing(content: &str) -> ParsedFile {
     let mut with_id: HashMap<String, Vec<Entry>> = HashMap::new();
     let mut without_id = Vec::new();
 
