@@ -1,8 +1,18 @@
 use crate::Entry;
 use std::collections::HashMap;
 
+///////////////////////////////////////////////
+// TODO: improve everything about this file  //
+///////////////////////////////////////////////
+
+#[derive(Debug, Default, Clone)]
+pub struct Settings {
+    pub glob: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ParsedFile {
+    pub settings: Settings,
     /// id -> name
     pub with_id: HashMap<String, Vec<Entry>>,
     /// bare names with no id - to be created
@@ -40,23 +50,40 @@ fn parse_line(raw: &str) -> Option<ParsedLine> {
 }
 
 pub fn parse_listing(content: &str) -> ParsedFile {
-    let mut with_id: HashMap<String, Vec<Entry>> = HashMap::new();
-    let mut without_id = Vec::new();
+    let mut parsed = ParsedFile::default();
 
-    for line in content.lines() {
+    let mut lines = content.lines();
+    if let Some(settings) = parse_settings(&mut lines) {
+        parsed.settings = dbg!(settings)
+    } else {
+        lines = content.lines();
+    }
+
+    for line in lines {
         match parse_line(line) {
             None => {}
             Some(ParsedLine::Entry(e)) => {
-                with_id.entry(e.id.clone()).or_default().push(e);
+                parsed.with_id.entry(e.id.clone()).or_default().push(e);
             }
             Some(ParsedLine::WithoutId(name)) => {
-                without_id.push(name);
+                parsed.without_id.push(name);
             }
         }
     }
 
-    ParsedFile {
-        with_id,
-        without_id,
+    parsed
+}
+
+fn parse_settings<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<Settings> {
+    if !lines.next()?.starts_with("===") {
+        return None;
     }
+
+    // let glob = lines.next()?.trim().strip_prefix("glob: ")?.to_string();
+    let glob = lines.next()?.trim().to_string();
+    if !lines.next()?.starts_with("===") {
+        return None;
+    }
+
+    Some(Settings { glob })
 }

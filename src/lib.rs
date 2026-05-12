@@ -93,13 +93,29 @@ impl Action {
         match self {
             Action::DeleteFile(n) | Action::DeleteDir(n) => Some(n),
             Action::Rename(s, _) | Action::Copy(s, _) => Some(s),
-            Action::CreateFile(_) | Action::CreateDir(_) => None,
+            Action::CreateFile(n) | Action::CreateDir(n) => n.parent(),
+            // Action::CreateFile(_) | Action::CreateDir(_) => None,
+        }
+    }
+
+    /// Return the path that this action is operating on
+    pub fn path(&self) -> &Path {
+        match self {
+            Action::DeleteFile(p)
+            | Action::DeleteDir(p)
+            | Action::Rename(p, _)
+            | Action::Copy(p, _)
+            | Action::CreateFile(p)
+            | Action::CreateDir(p) => p,
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum KoilError {
+    #[error("IO Error")]
+    IOError(#[from] io::Error),
+
     #[error("`{0}` appears more than once")]
     DuplicatePath(String),
 
@@ -108,6 +124,9 @@ pub enum KoilError {
 }
 
 pub struct Koil {
+    /// If true, the settings label will be shown in the listing
+    show_settings: bool,
+
     /// The minimum length to use for IDs, IDs can be longer than this but never shorter
     min_id_len: usize,
 
@@ -120,6 +139,9 @@ pub struct Koil {
     /// The currently open directory
     current_dir: PathBuf,
 
+    /// Ignore every path in this set
+    ignore: HashSet<PathBuf>,
+
     /// Partial diff, which stores all changes made in other listings
     diff: Diff,
 }
@@ -127,10 +149,12 @@ pub struct Koil {
 impl Default for Koil {
     fn default() -> Self {
         Koil {
+            show_settings: true,
             min_id_len: 6,
             ids: Vec::new(),
             current_listing: HashSet::new(),
             current_dir: PathBuf::new(),
+            ignore: HashSet::new(),
             diff: Diff::default(),
         }
     }
@@ -141,6 +165,13 @@ impl Koil {
     /// Create new [`Koil`], with default values
     pub fn new() -> Koil {
         Koil::default()
+    }
+
+    /// Will ignore the given path (never show in the listing)
+    /// This can be used to hide the koil listing file
+    /// You can call this multiple times to ignore multiple files
+    pub fn ignore(&mut self, path: PathBuf) {
+        self.ignore.insert(path);
     }
 
     /// Open the dir given
@@ -155,6 +186,9 @@ impl Koil {
 
         for item in fs::read_dir(&self.current_dir)? {
             let item = item?;
+            if self.ignore.contains(&item.path()) {
+                continue;
+            }
             let id = self
                 .ids
                 .iter()
@@ -171,6 +205,16 @@ impl Koil {
 
     /// The currently open listing, which user should modify
     pub fn listing(&self) -> String {
+        let mut lines = Vec::new();
+
+        if self.show_settings {
+            let glob = self.current_dir.to_string_lossy();
+            let sep = "=".repeat(glob.len().max(42));
+            lines.push(sep.clone());
+            lines.push(glob.to_string());
+            lines.push(sep);
+        }
+
         let mut entries = Vec::new();
         // returns true if this path should be shown in the current listing
         let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
@@ -205,8 +249,9 @@ impl Koil {
             }
         }
 
+        // Add the sorted entries
         entries.sort();
-        let mut lines: Vec<_> = entries.iter().map(|e| e.to_string()).collect();
+        lines.extend(entries.iter().map(ToString::to_string));
 
         for (path, &is_dir) in self
             .diff
@@ -329,7 +374,8 @@ impl Koil {
             }
         }
 
-        dbg!(&self.diff);
+        self.open(modified_listing.settings.glob)?;
+        // dbg!(&self.diff);
 
         Ok(())
     }

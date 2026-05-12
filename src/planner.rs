@@ -17,7 +17,10 @@ pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
             continue;
         }
         // only rename actions can create a cycle
-        assert!(cycle.iter().all(|a| matches!(a, Action::Rename(_, _))));
+        assert!(
+            cycle.iter().all(|a| matches!(a, Action::Rename(_, _))),
+            "Invalid cycle: {cycle:?}"
+        );
 
         let mut iter = cycle.into_iter();
 
@@ -42,6 +45,27 @@ pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
     result
 }
 
+/// this returns all actions that should happen AFTER this action
+fn successors(actions: &[Action], action: &Action) -> Vec<Action> {
+    actions
+        .iter()
+        .filter(|&a| action != a)
+        // Return true if `action` should happen before `other`
+        .filter(|&other| {
+            // If I depend on something, and `other` removes that, I go first
+            matches!((action.depends_on(), other.removes()),
+                (Some(depend), Some(removed)) if depend.starts_with(removed))
+            // If I remove something and `other` creates it, I should remove it first
+            || matches!((action.removes(), other.creates()),
+                (Some(removed), Some(created)) if created == removed)
+            //             // // If I create a directory and `other` depends on something in that dir, I go first
+            //             || dbg!(matches!((action.creates(), other.creates().and_then(|d| d.parent())),
+            //                 (Some(created), Some(parent)) if parent.starts_with(created)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// A deterministic version of `pathfinding` `topological_sort`
 fn topo_sort<N, FN, IN>(roots: &[N], successors: FN) -> Result<Vec<N>, ()>
 where
@@ -57,12 +81,6 @@ where
             g
         })
         .collect())
-    // let mut groups = topological_sort_into_groups(roots, successors).map_err(|_| ())?;
-    // for g in groups.iter_mut() {
-    //     g.sort()
-    // }
-
-    // Ok(groups.into_iter().flatten().collect())
 }
 
 /// A deterministic version of `pathfinding` `strongly_connected_components`
@@ -84,21 +102,4 @@ where
     }
 
     cycles
-}
-
-/// this returns all actions that should happen AFTER this action
-fn successors(actions: &[Action], action: &Action) -> Vec<Action> {
-    actions
-        .iter()
-        .filter(|&a| action != a)
-        .filter(|&other| {
-            // If I depend on something, and `other` removes that, I go first
-            (action
-                .depends_on()
-                .is_some_and(|f| other.removes() == Some(f)))
-                // If I remove something and `other` creates it, I should remove it first
-                || (action.removes().is_some_and(|f| other.creates() == Some(f)))
-        })
-        .cloned()
-        .collect()
 }

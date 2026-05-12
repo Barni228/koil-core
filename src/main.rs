@@ -5,7 +5,7 @@ use std::{fs, io};
 const FORCE: bool = true;
 
 fn main() -> anyhow::Result<()> {
-    let mut dir = std::env::current_dir()?;
+    let dir = std::env::current_dir()?;
 
     let listing_path = dir.join(".koil_listing");
 
@@ -20,20 +20,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut k = Koil::new();
+    k.ignore(listing_path.clone());
     // TODO: maybe do the fancy stdin.lock stuff
+    println!("Reading: {}", dir.display());
+    k.open(&dir)?;
 
     loop {
-        println!("Reading: {}", dir.display());
-        k.open(&dir)?;
         fs::write(&listing_path, k.listing())?;
 
-        println!(
-            "Opened {}.\n\
-            Edit it, then press Enter...",
-            listing_path.display()
-        );
+        // println!(
+        //     "Opened {}.\n\
+        //     Edit it, then press Enter...",
+        //     listing_path.display()
+        // );
 
-        let new = input("Enter, or new path: ");
+        let new = input("Press Enter to update: ");
         // {
         //     let stdin = io::stdin();
         //     let mut buf = String::new();
@@ -42,13 +43,8 @@ fn main() -> anyhow::Result<()> {
 
         let content = fs::read_to_string(&listing_path)?;
         k.update(&content)?;
-        if new.is_empty() {
+        if !new.is_empty() {
             break;
-        // } else if new == ".." {
-        //     dir.pop();
-        } else {
-            dir = new.into()
-            // dir.push(new);
         }
     }
 

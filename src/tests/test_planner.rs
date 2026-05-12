@@ -695,3 +695,99 @@ fn test_copy_with_add_and_delete() {
         plan_actions(&[copy("A", "B"), delete("B"), add("C")])
     );
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+// --- path / directory rename ordering ------------------------------------
+
+#[test]
+fn test_remove_child_then_rename_parent_dir() {
+    // remove a/b before renaming a/ -> c/ (so we don't move a/b along for the ride)
+    assert_eq!(
+        vec![delete("A/B"), rename("A", "C")],
+        plan_actions(&[rename("A", "C"), delete("A/B")])
+    );
+}
+
+#[test]
+fn test_rename_child_before_renaming_parent_dir() {
+    // a/b -> a/d must happen before a -> c, otherwise a/b is gone
+    assert_eq!(
+        vec![rename("A/B", "A/D"), rename("A", "C")],
+        plan_actions(&[rename("A", "C"), rename("A/B", "A/D")])
+    );
+}
+
+#[test]
+fn test_add_child_before_renaming_parent_dir() {
+    // adding a/b should happen before a is renamed to c
+    assert_eq!(
+        vec![add("A/B"), rename("A", "C")],
+        plan_actions(&[add("A/B"), rename("A", "C")])
+    );
+}
+
+#[test]
+fn test_copy_out_of_dir_before_dir_rename() {
+    // copy a/b -> x/b before renaming a -> c
+    assert_eq!(
+        vec![copy("A/B", "X/B"), rename("A", "C")],
+        plan_actions(&[copy("A/B", "X/B"), rename("A", "C")])
+    );
+}
+
+#[test]
+fn test_multiple_child_removes_then_parent_rename() {
+    // remove a/b and a/c before renaming a -> d
+    assert_eq!(
+        vec![delete("A/B"), delete("A/C"), rename("A", "D")],
+        plan_actions(&[rename("A", "D"), delete("A/B"), delete("A/C")])
+    );
+}
+
+#[test]
+fn test_child_rename_and_child_remove_then_parent_rename() {
+    // rename a/b -> a/d and remove a/c before renaming a -> e
+    assert_eq!(
+        vec![delete("A/C"), rename("A/B", "A/D"), rename("A", "E")],
+        plan_actions(&[rename("A", "E"), rename("A/B", "A/D"), delete("A/C")])
+    );
+}
+
+#[test]
+fn test_nested_dir_rename_order() {
+    // a/b -> a/c must happen before a -> d
+    // d/c -> e must happen after a is renamed (it's now d/c)
+    assert_eq!(
+        vec![rename("A/B", "A/C"), rename("A", "D")],
+        plan_actions(&[rename("A", "D"), rename("A/B", "A/C")])
+    );
+}
+
+#[test]
+fn test_two_sibling_dir_renames_with_child_removals() {
+    // a/x removed before a -> b; p/y removed before p -> q
+    assert_eq!(
+        vec![
+            delete("A/X"),
+            delete("P/Y"),
+            rename("A", "B"),
+            rename("P", "Q")
+        ],
+        plan_actions(&[
+            rename("A", "B"),
+            rename("P", "Q"),
+            delete("A/X"),
+            delete("P/Y")
+        ])
+    );
+}
+
+// This probably passes only because of the sorting
+#[test]
+fn test_add_child() {
+    assert_eq!(
+        vec![add("A"), add("A/B")],
+        plan_actions(&[add("A/B"), add("A")])
+    );
+}
