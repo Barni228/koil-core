@@ -19,8 +19,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let mut k = Koil::new();
-    k.ignore(listing_path.clone());
+    let mut k = Koil::builder().ignore(&listing_path).build();
     // TODO: maybe do the fancy stdin.lock stuff
     println!("Reading: {}", dir.display());
     k.open(&dir)?;

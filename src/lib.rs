@@ -2,6 +2,7 @@ use crate::diff::Diff;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
+use typed_builder::TypedBuilder;
 
 pub mod diff;
 pub mod parse;
@@ -123,57 +124,54 @@ pub enum KoilError {
     InvalidID(String),
 }
 
+#[derive(Debug, TypedBuilder)]
+#[builder(mutators(
+    /// Will ignore the given path (never show in the listing)
+    /// This can be used to hide the koil listing file
+    /// You can call this multiple times to ignore multiple files
+    pub fn ignore<P: Into<PathBuf>>(self, path: P) {
+        self.ignore.insert(path.into());
+    }
+))]
 pub struct Koil {
+    #[builder(default = true)]
     /// If true, the settings label will be shown in the listing
     show_settings: bool,
 
+    #[builder(default = 6)]
     /// The minimum length to use for IDs, IDs can be longer than this but never shorter
     min_id_len: usize,
 
-    /// All IDs, pointing to their corresponding path
-    ids: Vec<PathBuf>,
-
-    /// The saved indexes that are shows in the current listing
-    current_listing: HashSet<usize>,
-
-    /// The currently open directory
-    current_dir: PathBuf,
-
+    #[builder(via_mutators)]
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
 
+    // Private fields
+    #[builder(default, setter(skip))]
+    /// All IDs, pointing to their corresponding path
+    ids: Vec<PathBuf>,
+
+    #[builder(default, setter(skip))]
+    /// The saved indexes that are shows in the current listing
+    current_listing: HashSet<usize>,
+
+    #[builder(default, setter(skip))]
+    /// The currently open directory
+    current_dir: PathBuf,
+
+    #[builder(default, setter(skip))]
     /// Partial diff, which stores all changes made in other listings
     diff: Diff,
 }
 
 impl Default for Koil {
     fn default() -> Self {
-        Koil {
-            show_settings: true,
-            min_id_len: 6,
-            ids: Vec::new(),
-            current_listing: HashSet::new(),
-            current_dir: PathBuf::new(),
-            ignore: HashSet::new(),
-            diff: Diff::default(),
-        }
+        Koil::builder().build()
     }
 }
 
 // Public functions
 impl Koil {
-    /// Create new [`Koil`], with default values
-    pub fn new() -> Koil {
-        Koil::default()
-    }
-
-    /// Will ignore the given path (never show in the listing)
-    /// This can be used to hide the koil listing file
-    /// You can call this multiple times to ignore multiple files
-    pub fn ignore(&mut self, path: PathBuf) {
-        self.ignore.insert(path);
-    }
-
     /// Open the dir given
     /// If it is a relative path, it will be opened relative to [`Koil::current_dir`]
     pub fn open<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
