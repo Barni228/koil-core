@@ -3,7 +3,7 @@ use crate::planner;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diff {
     /// ID, which points to the name it had before, and names that now it has after
     pub with_id: HashMap<usize, (PathBuf, Vec<PathBuf>)>,

@@ -12,25 +12,34 @@ pub struct Settings {
 
 #[derive(Debug, Default, Clone)]
 pub struct ParsedFile {
-    pub settings: Settings,
+    /// The settings for the current listing
+    pub settings: Option<Settings>,
     /// id -> name
     pub with_id: HashMap<String, Vec<Entry>>,
     /// bare names with no id - to be created
     pub without_id: Vec<String>,
+    /// A currently selected ID, if any
+    pub selected: Option<String>,
 }
 
 enum ParsedLine {
-    Entry(Entry),
+    Entry(Entry, bool),
     WithoutId(String),
 }
 
 fn parse_line(raw: &str) -> Option<ParsedLine> {
-    let line = raw.trim();
+    let mut line = raw.trim();
+    let selected = line.starts_with("::");
+
+    if selected {
+        line = &line[1..];
+    }
+
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
 
-    if line.starts_with(':') && !line.starts_with("::") {
+    if line.starts_with(':') {
         let mut is_dir = false;
         let (mut id, mut name) = line.split_once(' ').unwrap_or_default();
         id = id.strip_prefix(':').unwrap();
@@ -38,11 +47,14 @@ fn parse_line(raw: &str) -> Option<ParsedLine> {
             name = stripped;
             is_dir = true;
         }
-        Some(ParsedLine::Entry(Entry {
-            id: id.to_string(),
-            name: name.to_string(),
-            is_dir,
-        }))
+        Some(ParsedLine::Entry(
+            Entry {
+                id: id.to_string(),
+                name: name.to_string(),
+                is_dir,
+            },
+            selected,
+        ))
     } else {
         // TODO: actually respect ::
         Some(ParsedLine::WithoutId(line.to_string()))
@@ -54,7 +66,7 @@ pub fn parse_listing(content: &str) -> ParsedFile {
 
     let mut lines = content.lines();
     if let Some(settings) = parse_settings(&mut lines) {
-        parsed.settings = dbg!(settings)
+        parsed.settings = Some(settings)
     } else {
         lines = content.lines();
     }
@@ -62,7 +74,12 @@ pub fn parse_listing(content: &str) -> ParsedFile {
     for line in lines {
         match parse_line(line) {
             None => {}
-            Some(ParsedLine::Entry(e)) => {
+            Some(ParsedLine::Entry(e, selected)) => {
+                if selected && parsed.selected.is_some() {
+                    panic!("More than 1 thing is selected");
+                } else if selected {
+                    parsed.selected = Some(e.id.clone());
+                }
                 parsed.with_id.entry(e.id.clone()).or_default().push(e);
             }
             Some(ParsedLine::WithoutId(name)) => {

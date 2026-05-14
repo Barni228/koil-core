@@ -372,8 +372,12 @@ impl Koil {
             }
         }
 
-        self.open(modified_listing.settings.glob)?;
-        // dbg!(&self.diff);
+        if let Some(selected_id) = modified_listing.selected {
+            let index = self.id_to_index(&selected_id)?;
+            self.open(self.ids[index].clone())?;
+        } else if let Some(settings) = modified_listing.settings {
+            self.open(settings.glob)?;
+        }
 
         Ok(())
     }
