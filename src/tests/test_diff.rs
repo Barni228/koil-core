@@ -196,8 +196,11 @@ fn test_generated_diff_undo() {
 #[test]
 fn test_generated_diff_copy_cross_dir() {
     let mut koil = Koil::builder().show_settings(false).build();
+    // open test_dir, to load all the IDs
     koil.open("test_dir").unwrap();
+    // open the dir, to also load all of its IDs
     koil.open("dir").unwrap();
+    // 000004 is ID that I loaded from `dir`
     koil.update(
         "\
         :000004 inside\n",
@@ -224,4 +227,41 @@ fn test_generated_diff_copy_cross_dir() {
     assert_eq!(Diff::default(), koil.diff);
 }
 
-// Test to do weird stuff, like copy but delete original
+#[test]
+fn test_copy_then_delete_original() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    koil.update(
+        "\
+        ::000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n",
+    )
+    .unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+
+    koil.update(
+        "\
+        :000004 inside\n\
+        :000002 qwerty\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        diff([(2, "qwerty", &["qwerty", "dir/qwerty"])], []),
+        koil.diff
+    );
+
+    koil.open("..").unwrap();
+    // delete qwerty
+    koil.update(
+        "\
+        ::000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n",
+    )
+    .unwrap();
+
+    assert_eq!(diff([(2, "qwerty", &["dir/qwerty"])], []), koil.diff);
+}
