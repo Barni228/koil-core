@@ -22,7 +22,7 @@ pub struct ParsedFile {
     pub selected: Option<Selected>,
 }
 
-/// A line that was selected with `::`
+/// A line that was selected with `>`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selected {
     /// An existing entry, by its ID
@@ -37,22 +37,17 @@ enum ParsedLine {
 }
 
 fn parse_line(raw: &str) -> Option<ParsedLine> {
-    let line = raw.trim();
+    // `>` selects this line, so it is opened after the update
+    let (line, selected) = match raw.trim().strip_prefix('>') {
+        Some(rest) => (rest.trim_start(), true),
+        None => (raw.trim(), false),
+    };
 
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
 
-    let (id_line, selected) = match line.strip_prefix("::") {
-        // `::name` without an ID selects a new entry
-        Some(rest) if !has_id(rest) => {
-            return Some(ParsedLine::WithoutId(rest.to_string(), true));
-        }
-        Some(rest) => (Some(rest), true),
-        None => (line.strip_prefix(':'), false),
-    };
-
-    if let Some(id_line) = id_line {
+    if let Some(id_line) = line.strip_prefix(':') {
         let mut is_dir = false;
         let (id, mut name) = id_line.split_once(' ').unwrap_or_default();
         if let Some(stripped) = name.strip_suffix('/') {
@@ -68,14 +63,8 @@ fn parse_line(raw: &str) -> Option<ParsedLine> {
             selected,
         ))
     } else {
-        Some(ParsedLine::WithoutId(line.to_string(), false))
+        Some(ParsedLine::WithoutId(line.to_string(), selected))
     }
-}
-
-/// Return true if `line` (with `:` or `::` stripped) starts with `<hexid> `
-fn has_id(line: &str) -> bool {
-    line.split_once(' ')
-        .is_some_and(|(id, _)| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 pub fn parse_listing(content: &str) -> ParsedFile {

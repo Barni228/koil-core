@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.102"
-pathfinding = "4.15.0"
-thiserror = "2.0.18"
+anyhow = "1.0"
+pathfinding = "4.16"
+thiserror = "2.0"
 typed-builder = "0.23.2"
