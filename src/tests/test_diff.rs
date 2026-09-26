@@ -442,3 +442,154 @@ fn test_enter_new_file_fails() {
         Err(KoilError::NotADirectory(_))
     ));
 }
+
+// ── nested paths ─────────────────────────────────────────────────────────────
+
+/// The unchanged `test_dir` listing
+const TEST_DIR_LISTING: &str = "\
+    :000003 dir/\n\
+    :000001 file\n\
+    :000000 file2\n\
+    :000002 qwerty\n";
+
+/// Open `test_dir`, and update it with the unchanged listing + `extra`
+fn update_test_dir(extra: &str) -> Result<Koil, KoilError> {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    koil.update(&format!("{TEST_DIR_LISTING}{extra}"))?;
+    Ok(koil)
+}
+
+#[test]
+fn test_nested_create_with_parent() {
+    let koil = update_test_dir(
+        "newdir/\n\
+         newdir/A",
+    )
+    .unwrap();
+    assert_eq!(diff([], ["newdir/", "newdir/A"]), koil.diff);
+}
+
+#[test]
+fn test_nested_create_without_parent() {
+    // same as writing `newdir/` too
+    let koil = update_test_dir("newdir/A").unwrap();
+    assert_eq!(diff([], ["newdir/", "newdir/A"]), koil.diff);
+}
+
+#[test]
+fn test_nested_create_many() {
+    let mut koil = update_test_dir(
+        "newdir/A\n\
+         newdir/B",
+    )
+    .unwrap();
+    assert_eq!(diff([], ["newdir/", "newdir/A", "newdir/B"]), koil.diff);
+
+    // `newdir/` is shown here, and its files are shown inside it
+    assert_eq!(format!("{TEST_DIR_LISTING}newdir/"), koil.listing());
+    koil.open("newdir").unwrap();
+    let mut listing: Vec<_> = koil.listing().lines().map(str::to_string).collect();
+    listing.sort();
+    assert_eq!(vec!["A", "B"], listing);
+
+    assert_eq!(
+        vec![
+            Action::CreateDir(test_path("newdir")),
+            Action::CreateFile(test_path("newdir/A")),
+            Action::CreateFile(test_path("newdir/B")),
+        ],
+        koil.compute_actions()
+    );
+}
+
+#[test]
+fn test_nested_create_deep() {
+    let koil = update_test_dir("a/b/c/").unwrap();
+    assert_eq!(diff([], ["a/", "a/b/", "a/b/c/"]), koil.diff);
+}
+
+#[test]
+fn test_nested_create_in_existing_dir() {
+    // `dir/` already exists, so only the file is created
+    let koil = update_test_dir("dir/A").unwrap();
+    assert_eq!(diff([], ["dir/A"]), koil.diff);
+}
+
+#[test]
+fn test_nested_move() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    // move qwerty into newdir
+    let listing = "\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 newdir/qwerty\n";
+    koil.update(listing).unwrap();
+    assert_eq!(
+        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        koil.diff
+    );
+
+    // the same listing again does not change anything
+    koil.update(listing).unwrap();
+    assert_eq!(
+        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        koil.diff
+    );
+}
+
+#[test]
+fn test_nested_create_in_renamed_dir() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    koil.update(
+        "\
+        :000003 dir2/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n\
+        dir2/A\n",
+    )
+    .unwrap();
+    // `dir2/` comes from the rename, so it is not created
+    assert_eq!(diff([(3, "dir", &["dir2"])], ["dir2/A"]), koil.diff);
+}
+
+#[test]
+fn test_nested_create_inside_file_fails() {
+    // `file` exists, and is not a dir
+    assert!(matches!(
+        update_test_dir("file/A"),
+        Err(KoilError::NotADirectory(name)) if name == "file"
+    ));
+    // `new` is a new file, and is not a dir
+    assert!(matches!(
+        update_test_dir("new\nnew/A"),
+        Err(KoilError::NotADirectory(name)) if name == "new"
+    ));
+}
+
+#[test]
+fn test_invalid_names_fail() {
+    for name in ["../A", "/A", "./A", "a/../b", "a/./b"] {
+        assert!(
+            matches!(
+                update_test_dir(&format!("{name}\n")),
+                Err(KoilError::InvalidName(_))
+            ),
+            "{name} should be invalid"
+        );
+    }
+}
+
+#[test]
+fn test_nested_duplicates_fail() {
+    for extra in ["new/\nnew\n", "new/A\nnew/A\n", "dir\n"] {
+        assert!(
+            matches!(update_test_dir(extra), Err(KoilError::DuplicatePath(_))),
+            "{extra:?} should be a duplicate"
+        );
+    }
+}

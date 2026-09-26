@@ -23,8 +23,12 @@ impl Diff {
         self.add_before(index, paths[index].clone());
     }
 
+    /// Add an after value for this index, if it is not there already
     pub fn push_after(&mut self, index: usize, after_path: PathBuf) {
-        self.with_id.entry(index).or_default().1.push(after_path);
+        let afters = &mut self.with_id.entry(index).or_default().1;
+        if !afters.contains(&after_path) {
+            afters.push(after_path);
+        }
     }
 
     /// Return true if `path` is a dir that does not exist yet, but will after this diff

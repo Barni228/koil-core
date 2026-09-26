@@ -18,6 +18,7 @@
 
 ## Done
 
+- [x] Allow nested paths in the listing (`dir/A`)
 - [x] Allow entering into not yet created directories (`>dir/`)
 - [x] Dont always rename to `tmp` when resolving renames
 - [x] Make it so when line starts with `::`, it means "open this" (like pressing enter)

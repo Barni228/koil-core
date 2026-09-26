@@ -148,8 +148,11 @@ pub enum KoilError {
     #[error("Invalid ID: `{0}`, this ID is not recognized")]
     InvalidID(String),
 
-    #[error("`{0}` is not a directory, so it can not be opened")]
+    #[error("`{0}` is not a directory")]
     NotADirectory(String),
+
+    #[error("`{0}` is not a valid name, it can not be empty, absolute, or contain `.` or `..`")]
+    InvalidName(String),
 }
 
 #[derive(Debug, TypedBuilder)]
@@ -378,9 +381,12 @@ impl Koil {
             }
         }
 
+        // every path written in this listing, to create its missing parents later
+        let mut written = Vec::new();
+
         // Creates
         for name in &modified_listing.without_id {
-            self.add_create(name)?;
+            written.push(self.add_create(name)?);
         }
 
         // Renames / Copy
@@ -413,9 +419,15 @@ impl Koil {
 
             // Add what we see to `diff`
             for entry in entries {
-                let path = self.current_dir.join(&entry.name);
-                self.diff.push_after(index, path);
+                let path = self.current_dir.join(parse_name(&entry.name)?.0);
+                self.diff.push_after(index, path.clone());
+                written.push(path);
             }
+        }
+
+        // `dir/A` also means create `dir/`, if it does not exist yet
+        for path in written {
+            self.add_missing_parents(&path)?;
         }
 
         let warning = match modified_listing.selected {
@@ -437,18 +449,46 @@ impl Koil {
         Ok(warning)
     }
 
-    /// Add `name_to_create` to [`Koil::diff`]
+    /// Add `name_to_create` to [`Koil::diff`], and return its path
     /// If `name_to_create` ends with `/`, a dir will be created
-    /// If this is a duplicate, [`KoilError`] is returned
-    fn add_create(&mut self, name_to_create: &str) -> Result<(), KoilError> {
-        let (path, is_dir) = if let Some(stripped) = name_to_create.strip_suffix('/') {
-            (self.current_dir.join(stripped), true)
-        } else {
-            (self.current_dir.join(name_to_create), false)
-        };
+    fn add_create(&mut self, name_to_create: &str) -> Result<PathBuf, KoilError> {
+        let (path, is_dir) = parse_name(name_to_create)?;
+        let path = self.current_dir.join(path);
+        self.diff.without_id.insert(path.clone(), is_dir);
+        Ok(path)
+    }
 
-        if self.diff.without_id.insert(path, is_dir).is_some() {
-            return Err(KoilError::DuplicatePath(name_to_create.to_string()));
+    /// Add every parent of `path` (inside [`Koil::current_dir`]) that does not exist yet
+    /// to [`Koil::diff`] as a new dir
+    fn add_missing_parents(&mut self, path: &Path) -> Result<(), KoilError> {
+        let parents: Vec<PathBuf> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir)
+            .map(Path::to_path_buf)
+            .collect();
+
+        for parent in parents {
+            let not_a_dir = || {
+                let name = parent.strip_prefix(&self.current_dir).unwrap();
+                KoilError::NotADirectory(name.to_string_lossy().to_string())
+            };
+            if parent.symlink_metadata().is_ok() {
+                if parent.is_dir() {
+                    break;
+                }
+                return Err(not_a_dir());
+            }
+            // a dir that was renamed or copied to this path
+            let is_after = |(_, afters): &(PathBuf, Vec<PathBuf>)| afters.contains(&parent);
+            match self.diff.without_id.get(&parent) {
+                Some(true) => {}
+                Some(false) => return Err(not_a_dir()),
+                None if self.diff.with_id.values().any(is_after) => {}
+                None => {
+                    self.diff.without_id.insert(parent, true);
+                }
+            }
         }
         Ok(())
     }
@@ -461,20 +501,37 @@ impl Koil {
             self.id_to_index(id)?;
             // detect duplicates
             for entry in entries {
-                if !seen.insert(&entry.name) {
+                if !seen.insert(parse_name(&entry.name)?.0) {
                     return Err(KoilError::DuplicatePath(entry.name.clone()));
                 }
             }
         }
 
         for name in &parsed.without_id {
-            if !seen.insert(name) {
+            if !seen.insert(parse_name(name)?.0) {
                 return Err(KoilError::DuplicatePath(name.clone()));
             }
         }
 
         Ok(())
     }
+}
+
+/// Convert a name from the listing to a path relative to the listing's dir,
+/// and whether it is a dir (ends with `/`)
+/// Name can have `/` inside, like `dir/A`
+fn parse_name(name: &str) -> Result<(PathBuf, bool), KoilError> {
+    let (stripped, is_dir) = match name.strip_suffix('/') {
+        Some(stripped) => (stripped, true),
+        None => (name, false),
+    };
+    let path = Path::new(stripped);
+    // `Path::components` ignores `.` in the middle of a path, so check the raw parts
+    if stripped.is_empty() || path.has_root() || stripped.split('/').any(|p| p == "." || p == "..")
+    {
+        return Err(KoilError::InvalidName(name.to_string()));
+    }
+    Ok((path.components().collect(), is_dir))
 }
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist
