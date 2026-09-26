@@ -1,6 +1,6 @@
 use crate::diff::Diff;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
@@ -112,6 +112,31 @@ impl Action {
     }
 }
 
+/// Something that did not stop koil, but user should know about
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Warning {
+    /// The dir is neither on disk nor new in the diff, so its closest parent was opened instead
+    DirNotFound {
+        /// The dir that user wanted to open
+        requested: PathBuf,
+        /// The dir that was opened instead
+        opened: PathBuf,
+    },
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Warning::DirNotFound { requested, opened } => write!(
+                f,
+                "`{}` is not a directory, and is not written in the listing, opened `{}` instead",
+                requested.display(),
+                opened.display()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KoilError {
     #[error("IO Error")]
@@ -122,6 +147,9 @@ pub enum KoilError {
 
     #[error("Invalid ID: `{0}`, this ID is not recognized")]
     InvalidID(String),
+
+    #[error("`{0}` is not a directory, so it can not be opened")]
+    NotADirectory(String),
 }
 
 #[derive(Debug, TypedBuilder)]
@@ -174,13 +202,29 @@ impl Default for Koil {
 impl Koil {
     /// Open the dir given
     /// If it is a relative path, it will be opened relative to [`Koil::current_dir`]
-    pub fn open<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<()> {
+    /// It can also be a new dir from [`Koil::diff`] that does not exist yet,
+    /// then it is opened with an empty listing
+    /// If the dir is neither on disk nor in the diff, the closest parent that is gets opened
+    /// This never changes [`Koil::diff`], new dirs must be written in the listing
+    /// Returns a warning, if the dir was not found and a parent was opened instead
+    pub fn open<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<Option<Warning>> {
+        let path = resolve(&self.current_dir.join(dir))?;
+        let dir = path
+            .ancestors()
+            .find(|p| p.is_dir() || self.diff.creates_dir(p))
+            .ok_or(io::ErrorKind::NotFound)?
+            .to_path_buf();
+        let warning = (dir != path).then(|| Warning::DirNotFound {
+            requested: path,
+            opened: dir.clone(),
+        });
+
         self.current_listing.clear();
-        self.current_dir = if dir.as_ref().is_relative() {
-            self.current_dir.join(dir).canonicalize()?
-        } else {
-            dir.as_ref().canonicalize()?
-        };
+        let on_disk = dir.is_dir();
+        self.current_dir = dir;
+        if !on_disk {
+            return Ok(warning);
+        }
 
         for item in fs::read_dir(&self.current_dir)? {
             let item = item?;
@@ -198,7 +242,7 @@ impl Koil {
             self.current_listing.insert(id);
         }
 
-        Ok(())
+        Ok(warning)
     }
 
     /// The currently open listing, which user should modify
@@ -268,7 +312,8 @@ impl Koil {
     }
 
     /// Update the internal diff based on modifications made in `modified_listing`
-    pub fn update(&mut self, modified_listing: &str) -> Result<(), KoilError> {
+    /// Returns a warning, if something user asked for was ignored
+    pub fn update(&mut self, modified_listing: &str) -> Result<Option<Warning>, KoilError> {
         self.update_parsed(parse::parse_listing(modified_listing))
     }
 
@@ -294,11 +339,9 @@ impl Koil {
     /// Convert an ID string to index
     /// returned index is guaranteed to be in [`Koil::ids`]
     pub fn id_to_index(&self, id: &str) -> Result<usize, KoilError> {
-        let index = usize::from_str_radix(id, 16).unwrap();
-        if index >= self.ids.len() {
-            Err(KoilError::InvalidID(id.to_string()))
-        } else {
-            Ok(index)
+        match usize::from_str_radix(id, 16) {
+            Ok(index) if index < self.ids.len() => Ok(index),
+            _ => Err(KoilError::InvalidID(id.to_string())),
         }
     }
 
@@ -311,7 +354,10 @@ impl Koil {
 // Private functions
 impl Koil {
     /// See [`Koil::update`]
-    fn update_parsed(&mut self, modified_listing: parse::ParsedFile) -> Result<(), KoilError> {
+    fn update_parsed(
+        &mut self,
+        modified_listing: parse::ParsedFile,
+    ) -> Result<Option<Warning>, KoilError> {
         self.validate(&modified_listing)?;
         let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
 
@@ -372,14 +418,23 @@ impl Koil {
             }
         }
 
-        if let Some(selected_id) = modified_listing.selected {
-            let index = self.id_to_index(&selected_id)?;
-            self.open(self.ids[index].clone())?;
-        } else if let Some(settings) = modified_listing.settings {
-            self.open(settings.glob)?;
-        }
+        let warning = match modified_listing.selected {
+            Some(parse::Selected::Id(id)) => {
+                let index = self.id_to_index(&id)?;
+                self.open(self.ids[index].clone())?
+            }
+            // a new dir, that is not created yet
+            Some(parse::Selected::New(name)) => match name.strip_suffix('/') {
+                Some(dir) => self.open(dir)?,
+                None => return Err(KoilError::NotADirectory(name)),
+            },
+            None => match modified_listing.settings {
+                Some(settings) => self.open(settings.glob)?,
+                None => None,
+            },
+        };
 
-        Ok(())
+        Ok(warning)
     }
 
     /// Add `name_to_create` to [`Koil::diff`]
@@ -420,6 +475,28 @@ impl Koil {
 
         Ok(())
     }
+}
+
+/// Like [`Path::canonicalize`], but `path` does not need to exist
+/// Existing part of the path is canonicalized, the rest is normalized without touching the filesystem
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            Component::CurDir => {}
+            // `resolved` is canonical (no symlinks), so `..` is just its parent
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            c => {
+                resolved.push(c);
+                if resolved.symlink_metadata().is_ok() {
+                    resolved = resolved.canonicalize()?;
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]

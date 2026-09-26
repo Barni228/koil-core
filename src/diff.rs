@@ -1,7 +1,7 @@
 use crate::Action;
 use crate::planner;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diff {
@@ -25,6 +25,14 @@ impl Diff {
 
     pub fn push_after(&mut self, index: usize, after_path: PathBuf) {
         self.with_id.entry(index).or_default().1.push(after_path);
+    }
+
+    /// Return true if `path` is a dir that does not exist yet, but will after this diff
+    /// Either it is created, or something new is placed inside it
+    pub fn creates_dir(&self, path: &Path) -> bool {
+        let afters = self.with_id.values().flat_map(|(_, afters)| afters);
+        self.without_id.get(path) == Some(&true)
+            || (self.without_id.keys().chain(afters)).any(|p| p != path && p.starts_with(path))
     }
 
     /// Compute actions required to resolve this diff

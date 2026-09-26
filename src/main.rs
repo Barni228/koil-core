@@ -41,7 +41,9 @@ fn main() -> anyhow::Result<()> {
         // }
 
         let content = fs::read_to_string(&listing_path)?;
-        k.update(&content)?;
+        if let Some(warning) = k.update(&content)? {
+            eprintln!("Warning: {warning}");
+        }
         if !new.is_empty() {
             break;
         }

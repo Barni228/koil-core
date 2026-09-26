@@ -265,3 +265,172 @@ fn test_copy_then_delete_original() {
 
     assert_eq!(diff([(2, "qwerty", &["dir/qwerty"])], []), koil.diff);
 }
+
+fn test_path(s: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_dir")
+        .join(s)
+}
+
+#[test]
+fn test_parse_select_new_dir() {
+    let parsed = parse::parse_listing("::newdir/\n:000001 file\n");
+    assert_eq!(
+        Some(parse::Selected::New("newdir/".into())),
+        parsed.selected
+    );
+    assert_eq!(vec!["newdir/".to_string()], parsed.without_id);
+
+    let parsed = parse::parse_listing("::000003 dir/\n");
+    assert_eq!(Some(parse::Selected::Id("000003".into())), parsed.selected);
+}
+
+#[test]
+fn test_enter_new_dir() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    koil.update(
+        "\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n\
+        ::newdir/\n",
+    )
+    .unwrap();
+    assert_eq!(test_path("newdir"), koil.current_dir);
+    assert_eq!("", koil.listing());
+    assert_eq!(diff([], ["newdir/"]), koil.diff);
+
+    // copy qwerty into the new dir
+    koil.update(":000002 qwerty\n").unwrap();
+    assert_eq!(":000002 qwerty", koil.listing());
+    assert_eq!(
+        diff([(2, "qwerty", &["qwerty", "newdir/qwerty"])], ["newdir/"]),
+        koil.diff
+    );
+
+    // go back, and delete the original, so it becomes a move
+    koil.open("..").unwrap();
+    assert_eq!(
+        ":000003 dir/\n:000001 file\n:000000 file2\n:000002 qwerty\nnewdir/",
+        koil.listing()
+    );
+    koil.update(
+        "\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        newdir/\n",
+    )
+    .unwrap();
+    assert_eq!(
+        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        koil.diff
+    );
+}
+
+#[test]
+fn test_settings_made_up_dir() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    // `made/up` does not exist, and is not in the listing, so go as far as possible
+    let warning = koil
+        .update(&format!(
+            "===\n\
+        {}\n\
+        ===\n\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n",
+            test_path("dir/made/up").display()
+        ))
+        .unwrap();
+    assert_eq!(
+        Some(Warning::DirNotFound {
+            requested: test_path("dir/made/up"),
+            opened: test_path("dir"),
+        }),
+        warning
+    );
+    assert_eq!(test_path("dir"), koil.current_dir);
+    assert_eq!(Diff::default(), koil.diff);
+}
+
+#[test]
+fn test_settings_enter_new_dir() {
+    let listing = "\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n\
+        newdir/\n";
+    let with_settings = |dir: &str| format!("===\n{}\n===\n{listing}", test_path(dir).display());
+
+    // a new dir written in the same listing can be entered
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+
+    assert_eq!(None, koil.update(&with_settings("newdir")).unwrap());
+    assert_eq!(test_path("newdir"), koil.current_dir);
+    assert_eq!(diff([], ["newdir/"]), koil.diff);
+
+    // a new dir written in an earlier listing can be entered too,
+    // but a made up dir inside it is not created
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    koil.update(listing).unwrap();
+    assert_eq!(
+        Some(Warning::DirNotFound {
+            requested: test_path("newdir/made/up"),
+            opened: test_path("newdir"),
+        }),
+        koil.update(&with_settings("newdir/made/up")).unwrap()
+    );
+    assert_eq!(test_path("newdir"), koil.current_dir);
+    assert_eq!(diff([], ["newdir/"]), koil.diff);
+}
+
+#[test]
+fn test_enter_new_dir_same_as_create_then_enter() {
+    let listing = "\
+        :000003 dir/\n\
+        :000001 file\n\
+        :000000 file2\n\
+        :000002 qwerty\n";
+
+    // enter the new dir right away
+    let mut one_step = Koil::builder().show_settings(false).build();
+    one_step.open("test_dir").unwrap();
+    one_step
+        .update(&format!(
+            "\
+        {listing}\
+        ::newdir/\n"
+        ))
+        .unwrap();
+
+    // create the new dir first, then enter it
+    let mut two_steps = Koil::builder().show_settings(false).build();
+    two_steps.open("test_dir").unwrap();
+    two_steps.update(&format!("{listing}newdir/\n")).unwrap();
+    assert_eq!(format!("{listing}newdir/"), two_steps.listing());
+    assert_eq!(diff([], ["newdir/"]), two_steps.diff);
+    two_steps.update(&format!("{listing}::newdir/\n")).unwrap();
+
+    assert_eq!(diff([], ["newdir/"]), one_step.diff);
+    assert_eq!(diff([], ["newdir/"]), two_steps.diff);
+    assert_eq!(one_step.current_dir, two_steps.current_dir);
+    assert_eq!(one_step.listing(), two_steps.listing());
+}
+
+#[test]
+fn test_enter_new_file_fails() {
+    let mut koil = Koil::builder().show_settings(false).build();
+    koil.open("test_dir").unwrap();
+    assert!(matches!(
+        koil.update("::newfile\n"),
+        Err(KoilError::NotADirectory(_))
+    ));
+}

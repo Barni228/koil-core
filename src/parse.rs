@@ -18,31 +18,43 @@ pub struct ParsedFile {
     pub with_id: HashMap<String, Vec<Entry>>,
     /// bare names with no id - to be created
     pub without_id: Vec<String>,
-    /// A currently selected ID, if any
-    pub selected: Option<String>,
+    /// A currently selected line, if any
+    pub selected: Option<Selected>,
+}
+
+/// A line that was selected with `::`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selected {
+    /// An existing entry, by its ID
+    Id(String),
+    /// A new entry that does not exist yet, by its name
+    New(String),
 }
 
 enum ParsedLine {
     Entry(Entry, bool),
-    WithoutId(String),
+    WithoutId(String, bool),
 }
 
 fn parse_line(raw: &str) -> Option<ParsedLine> {
-    let mut line = raw.trim();
-    let selected = line.starts_with("::");
-
-    if selected {
-        line = &line[1..];
-    }
+    let line = raw.trim();
 
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
 
-    if line.starts_with(':') {
+    let (id_line, selected) = match line.strip_prefix("::") {
+        // `::name` without an ID selects a new entry
+        Some(rest) if !has_id(rest) => {
+            return Some(ParsedLine::WithoutId(rest.to_string(), true));
+        }
+        Some(rest) => (Some(rest), true),
+        None => (line.strip_prefix(':'), false),
+    };
+
+    if let Some(id_line) = id_line {
         let mut is_dir = false;
-        let (mut id, mut name) = line.split_once(' ').unwrap_or_default();
-        id = id.strip_prefix(':').unwrap();
+        let (id, mut name) = id_line.split_once(' ').unwrap_or_default();
         if let Some(stripped) = name.strip_suffix('/') {
             name = stripped;
             is_dir = true;
@@ -56,9 +68,14 @@ fn parse_line(raw: &str) -> Option<ParsedLine> {
             selected,
         ))
     } else {
-        // TODO: actually respect ::
-        Some(ParsedLine::WithoutId(line.to_string()))
+        Some(ParsedLine::WithoutId(line.to_string(), false))
     }
+}
+
+/// Return true if `line` (with `:` or `::` stripped) starts with `<hexid> `
+fn has_id(line: &str) -> bool {
+    line.split_once(' ')
+        .is_some_and(|(id, _)| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 pub fn parse_listing(content: &str) -> ParsedFile {
@@ -75,20 +92,28 @@ pub fn parse_listing(content: &str) -> ParsedFile {
         match parse_line(line) {
             None => {}
             Some(ParsedLine::Entry(e, selected)) => {
-                if selected && parsed.selected.is_some() {
-                    panic!("More than 1 thing is selected");
-                } else if selected {
-                    parsed.selected = Some(e.id.clone());
+                if selected {
+                    select(&mut parsed, Selected::Id(e.id.clone()));
                 }
                 parsed.with_id.entry(e.id.clone()).or_default().push(e);
             }
-            Some(ParsedLine::WithoutId(name)) => {
+            Some(ParsedLine::WithoutId(name, selected)) => {
+                if selected {
+                    select(&mut parsed, Selected::New(name.clone()));
+                }
                 parsed.without_id.push(name);
             }
         }
     }
 
     parsed
+}
+
+fn select(parsed: &mut ParsedFile, selected: Selected) {
+    if parsed.selected.is_some() {
+        panic!("More than 1 thing is selected");
+    }
+    parsed.selected = Some(selected);
 }
 
 fn parse_settings<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<Settings> {
