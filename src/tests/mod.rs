@@ -4,6 +4,10 @@ fn add(f: &str) -> Action {
     Action::CreateFile(f.into())
 }
 
+fn add_dir(f: &str) -> Action {
+    Action::CreateDir(f.into())
+}
+
 fn delete(f: &str) -> Action {
     Action::DeleteFile(f.into())
 }

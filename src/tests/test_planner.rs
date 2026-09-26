@@ -791,3 +791,56 @@ fn test_add_child() {
         plan_actions(&[add("A/B"), add("A")])
     );
 }
+
+// --- creating inside a new directory ---------------------------------------
+
+#[test]
+fn test_add_dir_before_file_inside() {
+    // `CreateFile` sorts before `CreateDir`, so this needs a real dependency
+    assert_eq!(
+        vec![add_dir("A"), add("A/B")],
+        plan_actions(&[add("A/B"), add_dir("A")])
+    );
+}
+
+#[test]
+fn test_add_dir_before_nested_dir() {
+    assert_eq!(
+        vec![add_dir("A"), add_dir("A/B"), add("A/B/C")],
+        plan_actions(&[add("A/B/C"), add_dir("A/B"), add_dir("A")])
+    );
+}
+
+#[test]
+fn test_add_dir_before_rename_into_it() {
+    assert_eq!(
+        vec![add_dir("A"), rename("X", "A/X")],
+        plan_actions(&[rename("X", "A/X"), add_dir("A")])
+    );
+}
+
+#[test]
+fn test_add_dir_before_copy_into_it() {
+    assert_eq!(
+        vec![add_dir("A"), copy("X", "A/X")],
+        plan_actions(&[copy("X", "A/X"), add_dir("A")])
+    );
+}
+
+#[test]
+fn test_rename_dir_before_add_inside_new_name() {
+    // A -> C must happen before C/B can be created
+    assert_eq!(
+        vec![rename("A", "C"), add("C/B")],
+        plan_actions(&[add("C/B"), rename("A", "C")])
+    );
+}
+
+#[test]
+fn test_add_dir_does_not_affect_siblings() {
+    // AB is not inside A, so no dependency (plain sort order)
+    assert_eq!(
+        vec![add("AB"), add_dir("A")],
+        plan_actions(&[add_dir("A"), add("AB")])
+    );
+}

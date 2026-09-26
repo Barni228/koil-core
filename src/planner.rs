@@ -1,6 +1,6 @@
 use crate::Action;
 use pathfinding::prelude::*;
-use std::{cmp::Ord, hash::Hash};
+use std::{cmp::Ord, hash::Hash, path::Path};
 
 pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
     let mut result = Vec::new();
@@ -58,9 +58,9 @@ fn successors(actions: &[Action], action: &Action) -> Vec<Action> {
             // If I remove something and `other` creates it, I should remove it first
             || matches!((action.removes(), other.creates()),
                 (Some(removed), Some(created)) if created == removed)
-            //             // // If I create a directory and `other` depends on something in that dir, I go first
-            //             || dbg!(matches!((action.creates(), other.creates().and_then(|d| d.parent())),
-            //                 (Some(created), Some(parent)) if parent.starts_with(created)))
+            // If I create something and `other` creates something inside it, I go first
+            || matches!((action.creates(), other.creates().and_then(Path::parent)),
+                (Some(created), Some(parent)) if parent.starts_with(created))
         })
         .cloned()
         .collect()
