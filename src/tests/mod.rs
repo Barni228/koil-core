@@ -21,4 +21,6 @@ fn copy(from: &str, to: &str) -> Action {
 }
 
 mod test_diff;
+mod test_koil;
+mod test_parse;
 mod test_planner;
