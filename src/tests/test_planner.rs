@@ -837,10 +837,93 @@ fn test_rename_dir_before_add_inside_new_name() {
 }
 
 #[test]
+fn test_swap_children_before_swapping_parent_dirs() {
+    // A/x and A/y are inside the old A, so they must be swapped before B takes A's place
+    assert_eq!(
+        vec![
+            rename("A/x", "tmp"),
+            rename("A/y", "A/x"),
+            rename("tmp", "A/y"),
+            rename("A", "tmp"),
+            rename("B", "A"),
+            rename("tmp", "B")
+        ],
+        plan_actions(&[
+            rename("A", "B"),
+            rename("B", "A"),
+            rename("A/x", "A/y"),
+            rename("A/y", "A/x")
+        ])
+    );
+}
+
+#[test]
 fn test_add_dir_does_not_affect_siblings() {
     // AB is not inside A, so no dependency (plain sort order)
     assert_eq!(
         vec![add("AB"), add_dir("A")],
         plan_actions(&[add_dir("A"), add("AB")])
     );
+}
+
+// --- determinism ------------------------------------------------------------
+
+/// Every ordering of `items`
+fn permutations(items: &[Action]) -> Vec<Vec<Action>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut result = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut perm in permutations(&rest) {
+            perm.insert(0, first.clone());
+            result.push(perm);
+        }
+    }
+    result
+}
+
+#[test]
+fn test_output_does_not_depend_on_input_order() {
+    let inputs = [
+        // a 3-cycle, a swap and an unrelated delete
+        vec![
+            rename("A", "B"),
+            rename("B", "C"),
+            rename("C", "A"),
+            rename("P", "Q"),
+            rename("Q", "P"),
+            delete("X"),
+        ],
+        // nested swaps, plus a file inside a new dir
+        vec![
+            rename("A", "B"),
+            rename("B", "A"),
+            rename("A/x", "A/y"),
+            rename("A/y", "A/x"),
+            add_dir("N"),
+            add("N/f"),
+        ],
+        // a swap that depends on a copy, and a rename into a deleted slot
+        vec![
+            rename("A", "B"),
+            rename("B", "A"),
+            rename("Q", "P"),
+            delete("P"),
+            copy("A", "Z"),
+            rename("D", "E"),
+        ],
+    ];
+
+    for input in inputs {
+        let expected = plan_actions(&input);
+        for perm in permutations(&input) {
+            // run each ordering a few times, since `pathfinding` uses randomly seeded hashing
+            for _ in 0..3 {
+                assert_eq!(expected, plan_actions(&perm), "input: {perm:?}");
+            }
+        }
+    }
 }
