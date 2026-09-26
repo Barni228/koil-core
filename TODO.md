@@ -1,6 +1,5 @@
 ## Features
 
-- [ ] Dont always rename to `tmp` when resolving renames
 - [ ] Generate unique IDs using HashId (convert number to random looking string)
 - [ ] create `koil undo`, which undoes whatever it just did
 - [ ] Allow updating listing on save
@@ -13,10 +12,12 @@
 - [ ] Add file icons
 - [ ] Allow different sorting
 - [ ] Parse file with `chumsky`
+- [ ] Handle cases where file system changes while this is still running (open koil, then create new file)
 - [ ] Publish to crates.io
 
 ## Done
 
+- [x] Dont always rename to `tmp` when resolving renames
 - [x] Make it so when line starts with `::`, it means "open this" (like pressing enter)
 - [x] Make a `KoilBuilder`
 - [x] Allow cross-directory edits

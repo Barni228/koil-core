@@ -70,6 +70,7 @@ impl Diff {
         }
 
         // sort the actions in correct order
-        planner::plan_actions(&actions)
+        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
+        planner::plan_actions(&actions, |p| p.symlink_metadata().is_ok())
     }
 }

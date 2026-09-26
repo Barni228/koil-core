@@ -1,5 +1,9 @@
 use super::*;
-use planner::*;
+
+/// [`planner::plan_actions`], as if nothing exists on the filesystem
+fn plan_actions(actions: &[Action]) -> Vec<Action> {
+    planner::plan_actions(actions, |_| false)
+}
 
 #[test]
 fn test_delete_rename() {
@@ -42,7 +46,11 @@ fn test_single_rename() {
 #[test]
 fn test_swap_ab() {
     assert_eq!(
-        vec![rename("A", "tmp"), rename("B", "A"), rename("tmp", "B")],
+        vec![
+            rename("A", ".A.koil0"),
+            rename("B", "A"),
+            rename(".A.koil0", "B")
+        ],
         plan_actions(&[rename("A", "B"), rename("B", "A")])
     );
 }
@@ -51,7 +59,11 @@ fn test_swap_ab() {
 fn test_swap_ab_reversed_input_order() {
     // Same rename, input listed the other way; result must still be valid
     assert_eq!(
-        vec![rename("A", "tmp"), rename("B", "A"), rename("tmp", "B")],
+        vec![
+            rename("A", ".A.koil0"),
+            rename("B", "A"),
+            rename(".A.koil0", "B")
+        ],
         plan_actions(&[rename("B", "A"), rename("A", "B")])
     )
 }
@@ -110,10 +122,10 @@ fn test_chain_input_order_scrambled() {
 fn test_cycle_three() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("C", "A"),
             rename("B", "C"),
-            rename("tmp", "B")
+            rename(".A.koil0", "B")
         ],
         plan_actions(&[rename("A", "B"), rename("B", "C"), rename("C", "A")])
     );
@@ -123,11 +135,11 @@ fn test_cycle_three() {
 fn test_cycle_four() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("D", "A"),
             rename("C", "D"),
             rename("B", "C"),
-            rename("tmp", "B")
+            rename(".A.koil0", "B")
         ],
         plan_actions(&[
             rename("A", "B"),
@@ -142,12 +154,12 @@ fn test_cycle_four() {
 fn test_cycle_five() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("E", "A"),
             rename("D", "E"),
             rename("C", "D"),
             rename("B", "C"),
-            rename("tmp", "B")
+            rename(".A.koil0", "B")
         ],
         plan_actions(&[
             rename("A", "B"),
@@ -202,12 +214,12 @@ fn test_two_independent_chains() {
 fn test_two_independent_swaps() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
-            rename("P", "tmp"),
+            rename(".A.koil0", "B"),
+            rename("P", ".P.koil0"),
             rename("Q", "P"),
-            rename("tmp", "Q")
+            rename(".P.koil0", "Q")
         ],
         plan_actions(&[
             rename("A", "B"),
@@ -224,9 +236,9 @@ fn test_two_independent_swaps() {
 fn test_swap_plus_lone_rename() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             rename("P", "Q")
         ],
         plan_actions(&[rename("A", "B"), rename("B", "A"), rename("P", "Q")])
@@ -238,9 +250,9 @@ fn test_cycle_plus_chain() {
     // A <-> B (swap), C -> D -> E (chain)
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             rename("D", "E"),
             rename("C", "D"),
         ],
@@ -257,12 +269,12 @@ fn test_cycle_plus_chain() {
 fn test_two_swaps_plus_chain() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
-            rename("P", "tmp"),
+            rename(".A.koil0", "B"),
+            rename("P", ".P.koil0"),
             rename("Q", "P"),
-            rename("tmp", "Q"),
+            rename(".P.koil0", "Q"),
             rename("Y", "Z"),
             rename("X", "Y"),
         ],
@@ -281,10 +293,10 @@ fn test_two_swaps_plus_chain() {
 fn test_cycle3_plus_lone_rename() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("C", "A"),
             rename("B", "C"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             rename("P", "Q")
         ],
         plan_actions(&[
@@ -501,9 +513,9 @@ fn test_delete_middle_of_chain() {
 fn test_cycle_plus_remove() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             delete("P"),
         ],
         plan_actions(&[rename("A", "B"), rename("B", "A"), delete("P")])
@@ -514,9 +526,9 @@ fn test_cycle_plus_remove() {
 fn test_cycle_plus_add() {
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             add("P"),
         ],
         plan_actions(&[rename("A", "B"), rename("B", "A"), add("P")])
@@ -528,9 +540,9 @@ fn test_cycle_plus_add_into_freed_slot() {
     // cycle swaps A<->B; separately, slot C freed by rename C->D, then add at C
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             rename("C", "D"),
             add("C"),
         ],
@@ -548,9 +560,9 @@ fn test_cycle_plus_remove_frees_for_rename() {
     // cycle A<->B; slot P deleted, then Q renamed into P
     assert_eq!(
         vec![
-            rename("A", "tmp"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B"),
+            rename(".A.koil0", "B"),
             delete("P"),
             rename("Q", "P"),
         ],
@@ -679,9 +691,9 @@ fn test_copy_dst_blocked_by_cycle() {
     // swap B<->C; copy A->B; swap must resolve before copy lands in B
     assert_eq!(
         vec![
-            rename("B", "tmp"),
+            rename("B", ".B.koil0"),
             rename("C", "B"),
-            rename("tmp", "C"),
+            rename(".B.koil0", "C"),
             copy("A", "B"),
         ],
         plan_actions(&[copy("A", "B"), rename("B", "C"), rename("C", "B")])
@@ -841,12 +853,12 @@ fn test_swap_children_before_swapping_parent_dirs() {
     // A/x and A/y are inside the old A, so they must be swapped before B takes A's place
     assert_eq!(
         vec![
-            rename("A/x", "tmp"),
+            rename("A/x", "A/.x.koil0"),
             rename("A/y", "A/x"),
-            rename("tmp", "A/y"),
-            rename("A", "tmp"),
+            rename("A/.x.koil0", "A/y"),
+            rename("A", ".A.koil0"),
             rename("B", "A"),
-            rename("tmp", "B")
+            rename(".A.koil0", "B")
         ],
         plan_actions(&[
             rename("A", "B"),
@@ -926,4 +938,45 @@ fn test_output_does_not_depend_on_input_order() {
             }
         }
     }
+}
+
+// --- temporary names ----------------------------------------------------------
+
+#[test]
+fn test_temp_is_next_to_renamed_file() {
+    assert_eq!(
+        vec![
+            rename("dir/A", "dir/.A.koil0"),
+            rename("dir/B", "dir/A"),
+            rename("dir/.A.koil0", "dir/B")
+        ],
+        plan_actions(&[rename("dir/A", "dir/B"), rename("dir/B", "dir/A")])
+    );
+}
+
+#[test]
+fn test_temp_skips_existing_paths() {
+    let taken = |p: &Path| p == Path::new(".A.koil0") || p == Path::new(".A.koil1");
+    assert_eq!(
+        vec![
+            rename("A", ".A.koil2"),
+            rename("B", "A"),
+            rename(".A.koil2", "B")
+        ],
+        planner::plan_actions(&[rename("A", "B"), rename("B", "A")], taken)
+    );
+}
+
+#[test]
+fn test_temp_skips_paths_used_by_plan() {
+    // `.A.koil0` is created by the plan itself, so it can't be used as a temp
+    assert_eq!(
+        vec![
+            rename("A", ".A.koil1"),
+            rename("B", "A"),
+            rename(".A.koil1", "B"),
+            add(".A.koil0")
+        ],
+        plan_actions(&[rename("A", "B"), rename("B", "A"), add(".A.koil0")])
+    );
 }

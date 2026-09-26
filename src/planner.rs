@@ -1,8 +1,16 @@
 use crate::Action;
 use pathfinding::prelude::*;
-use std::{cmp::Ord, collections::HashMap, hash::Hash, path::Path};
+use std::{
+    cmp::Ord,
+    collections::HashMap,
+    hash::Hash,
+    path::{Path, PathBuf},
+};
 
-pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
+/// Order `actions` so they can be run one after another
+/// `exists` should return true if a path is already taken on the filesystem,
+/// it is used to pick a free temporary name when breaking rename cycles
+pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<Action> {
     let mut result = Vec::new();
 
     // detect all rename cycles (like rename A to B and B to A)
@@ -54,13 +62,33 @@ pub fn plan_actions(actions: &[Action]) -> Vec<Action> {
             Action::Rename(from, to) => (from, to),
             _ => unreachable!(),
         };
-        result.push(Action::Rename(first_from, "tmp".into()));
+        let tmp = temp_path(&first_from, actions, &exists);
+        result.push(Action::Rename(first_from, tmp.clone()));
         result.extend(iter.rev());
 
-        result.push(Action::Rename("tmp".into(), first_to));
+        result.push(Action::Rename(tmp, first_to));
     }
 
     result
+}
+
+/// A free path next to `from`, to temporarily move it out of the way
+/// Tries `.name.koil0`, `.name.koil1`, ... until a path that does not exist,
+/// and that no action creates or removes, is found
+fn temp_path(from: &Path, actions: &[Action], exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let dir = from.parent().unwrap_or(Path::new(""));
+    let name = from.file_name().unwrap().to_string_lossy();
+    let taken = |path: &Path| {
+        exists(path)
+            || actions
+                .iter()
+                .any(|a| a.creates() == Some(path) || a.removes() == Some(path))
+    };
+
+    (0..)
+        .map(|i| dir.join(format!(".{name}.koil{i}")))
+        .find(|path| !taken(path))
+        .unwrap()
 }
 
 /// this returns all actions that should happen AFTER this action
