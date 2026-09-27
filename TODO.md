@@ -1,6 +1,5 @@
 ## Features
 
-- [ ] Generate unique IDs using HashId (convert number to random looking string)
 - [ ] create `koil undo`, which undoes whatever it just did
 - [ ] Allow updating listing on save
 - [ ] Allow entering a glob pattern, to see every file with matching path
@@ -18,6 +17,7 @@
 
 ## Done
 
+- [x] Generate random looking IDs with `sqids`
 - [x] Allow nested paths in the listing (`dir/A`)
 - [x] Allow entering into not yet created directories (`>dir/`)
 - [x] Dont always rename to `tmp` when resolving renames

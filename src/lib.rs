@@ -1,4 +1,5 @@
 use crate::diff::Diff;
+use sqids::Sqids;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
@@ -11,7 +12,7 @@ pub mod planner;
 /// A single file or directory captured from a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// Hexadecimal ID
+    /// ID encoded with [`Sqids`]
     pub id: String,
     /// Display name, without trailing `/`.
     pub name: String,
@@ -171,13 +172,18 @@ pub struct Koil {
 
     #[builder(default = 6)]
     /// The minimum length to use for IDs, IDs can be longer than this but never shorter
-    min_id_len: usize,
+    #[allow(dead_code)] // Only used to build `sqids`
+    min_id_len: u8,
 
     #[builder(via_mutators)]
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
 
     // Private fields
+    #[builder(default = new_sqids(min_id_len), setter(skip))]
+    /// Encodes indexes into random looking IDs, so they don't look sequential
+    sqids: Sqids,
+
     #[builder(default, setter(skip))]
     /// All IDs, pointing to their corresponding path
     ids: Vec<PathBuf>,
@@ -342,15 +348,20 @@ impl Koil {
     /// Convert an ID string to index
     /// returned index is guaranteed to be in [`Koil::ids`]
     pub fn id_to_index(&self, id: &str) -> Result<usize, KoilError> {
-        match usize::from_str_radix(id, 16) {
-            Ok(index) if index < self.ids.len() => Ok(index),
+        match self.sqids.decode(id)[..] {
+            // Many strings decode to the same number, only accept the canonical one
+            [index] if (index as usize) < self.ids.len() && self.to_id(index as usize) == id => {
+                Ok(index as usize)
+            }
             _ => Err(KoilError::InvalidID(id.to_string())),
         }
     }
 
     /// Convert an `index` to ID
     pub fn to_id(&self, index: usize) -> String {
-        format!("{:0width$x}", index, width = self.min_id_len)
+        self.sqids
+            .encode(&[index as u64])
+            .expect("the blocklist can not block every ID")
     }
 }
 
@@ -558,3 +569,13 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+/// Only lowercase letters and digits, so IDs are easy to type
+fn new_sqids(min_id_len: &u8) -> Sqids {
+    // default alphabet is every lowercase and uppercase letter, and digits
+    Sqids::builder()
+        .alphabet("abcdefghijklmnopqrstuvwxyz0123456789".chars().collect())
+        .min_length(*min_id_len)
+        .build()
+        .expect("the alphabet is valid")
+}

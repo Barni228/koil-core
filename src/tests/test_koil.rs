@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 /// The unchanged `test_dir` listing
 const TEST_DIR_LISTING: &str = "\
-    :000003 dir/\n\
-    :000001 file\n\
-    :000000 file2\n\
-    :000002 qwerty\n";
+    :d0n6oe dir/\n\
+    :52updl file\n\
+    :tdffoi file2\n\
+    :75ra32 qwerty\n";
 
 /// Path to `s` inside `test_dir`
 fn test_path(s: &str) -> PathBuf {
@@ -76,9 +76,9 @@ fn test_generated_diff_delete() {
     let mut koil = test_koil();
     koil.update(
         "\
-        :000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n",
+        :d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n",
     )
     .unwrap();
     assert_eq!(diff([(2, "qwerty", &[])], []), koil.diff);
@@ -89,10 +89,10 @@ fn test_generated_diff_rename() {
     let mut koil = test_koil();
     koil.update(
         "\
-        :000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n\
-        :000002 qwerty1\n",
+        :d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
+        :75ra32 qwerty1\n",
     )
     .unwrap();
     assert_eq!(diff([(2, "qwerty", &["qwerty1"])], []), koil.diff);
@@ -103,11 +103,11 @@ fn test_generated_diff_copy() {
     let mut koil = test_koil();
     koil.update(
         "\
-        :000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n\
-        :000002 qwerty\n\
-        :000002 qwerty2\n",
+        :d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
+        :75ra32 qwerty\n\
+        :75ra32 qwerty2\n",
     )
     .unwrap();
     assert_eq!(diff([(2, "qwerty", &["qwerty", "qwerty2"])], []), koil.diff);
@@ -118,10 +118,10 @@ fn test_generated_diff_undo() {
     let mut koil = test_koil();
     koil.update(
         "\
-        :000003 dir/\n\
-        :000000 file3\n\
-        :000002 poppy\n\
-        :000002 another\n\
+        :d0n6oe dir/\n\
+        :tdffoi file3\n\
+        :75ra32 poppy\n\
+        :75ra32 another\n\
         new",
     )
     .unwrap();
@@ -148,18 +148,18 @@ fn test_generated_diff_copy_cross_dir() {
     let mut koil = test_koil();
     // open the dir, to also load all of its IDs
     koil.open("dir").unwrap();
-    // 000004 is ID that I loaded from `dir`
+    // f0djx0 is ID that I loaded from `dir`
     koil.update(
         "\
-        :000004 inside\n",
+        :f0djx0 inside\n",
     )
     .unwrap();
     assert_eq!(Diff::default(), koil.diff);
 
     koil.update(
         "\
-        :000004 inside\n\
-        :000002 qwerty\n",
+        :f0djx0 inside\n\
+        :75ra32 qwerty\n",
     )
     .unwrap();
     assert_eq!(
@@ -169,7 +169,7 @@ fn test_generated_diff_copy_cross_dir() {
 
     koil.update(
         "\
-        :000004 inside\n",
+        :f0djx0 inside\n",
     )
     .unwrap();
     assert_eq!(Diff::default(), koil.diff);
@@ -180,18 +180,18 @@ fn test_copy_then_delete_original() {
     let mut koil = test_koil();
     koil.update(
         "\
-        >:000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n\
-        :000002 qwerty\n",
+        >:d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
+        :75ra32 qwerty\n",
     )
     .unwrap();
     assert_eq!(Diff::default(), koil.diff);
 
     koil.update(
         "\
-        :000004 inside\n\
-        :000002 qwerty\n",
+        :f0djx0 inside\n\
+        :75ra32 qwerty\n",
     )
     .unwrap();
 
@@ -204,9 +204,9 @@ fn test_copy_then_delete_original() {
     // delete qwerty
     koil.update(
         "\
-        >:000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n",
+        >:d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n",
     )
     .unwrap();
 
@@ -221,8 +221,8 @@ fn test_enter_new_dir() {
     assert_eq!(diff([], ["newdir/"]), koil.diff);
 
     // copy qwerty into the new dir
-    koil.update(":000002 qwerty\n").unwrap();
-    assert_eq!(":000002 qwerty", koil.listing());
+    koil.update(":75ra32 qwerty\n").unwrap();
+    assert_eq!(":75ra32 qwerty", koil.listing());
     assert_eq!(
         diff([(2, "qwerty", &["qwerty", "newdir/qwerty"])], ["newdir/"]),
         koil.diff
@@ -233,9 +233,9 @@ fn test_enter_new_dir() {
     assert_eq!(format!("{TEST_DIR_LISTING}newdir/"), koil.listing());
     koil.update(
         "\
-        :000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n\
+        :d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
         newdir/\n",
     )
     .unwrap();
@@ -398,10 +398,10 @@ fn test_nested_move() {
     let mut koil = test_koil();
     // move qwerty into newdir
     let listing = "\
-        :000003 dir/\n\
-        :000001 file\n\
-        :000000 file2\n\
-        :000002 newdir/qwerty\n";
+        :d0n6oe dir/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
+        :75ra32 newdir/qwerty\n";
     koil.update(listing).unwrap();
     assert_eq!(
         diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
@@ -421,10 +421,10 @@ fn test_nested_create_in_renamed_dir() {
     let mut koil = test_koil();
     koil.update(
         "\
-        :000003 dir2/\n\
-        :000001 file\n\
-        :000000 file2\n\
-        :000002 qwerty\n\
+        :d0n6oe dir2/\n\
+        :52updl file\n\
+        :tdffoi file2\n\
+        :75ra32 qwerty\n\
         dir2/A\n",
     )
     .unwrap();
@@ -479,6 +479,28 @@ fn test_nested_duplicates_fail() {
         assert!(
             matches!(update_test_dir(extra), Err(KoilError::DuplicatePath(_))),
             "{extra:?} should be a duplicate"
+        );
+    }
+}
+
+#[test]
+fn test_ids_round_trip() {
+    let koil = test_koil();
+    for index in 0..4 {
+        assert_eq!(index, koil.id_to_index(&koil.to_id(index)).unwrap());
+    }
+}
+
+#[test]
+fn test_invalid_ids_fail() {
+    // Typos of `d0n6oe`, an ID not in the listing, and the old hex format
+    for id in ["d0n6of", "d0n6o", "d0n6oee", "D0N6OE", "f0djx0", "000003"] {
+        assert!(
+            matches!(
+                update_test_dir(&format!(":{id} new\n")),
+                Err(KoilError::InvalidID(_))
+            ),
+            "{id} should be invalid"
         );
     }
 }
