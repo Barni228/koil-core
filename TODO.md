@@ -2,6 +2,8 @@
 
 - [ ] create `koil undo`, which undoes whatever it just did
 - [ ] Allow updating listing on save
+- [ ] Allow showing hidden paths (including `../`)
+- [ ] Allow commands to be entered in the settings box
 - [ ] Allow entering a glob pattern, to see every file with matching path
 - [ ] Allow entering a regex pattern, so like glob but its regex
 - [ ] Allow having BOTH glob AND regex in one expression

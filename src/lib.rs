@@ -1,10 +1,12 @@
 use crate::diff::Diff;
+use serde::{Deserialize, Serialize};
 use sqids::Sqids;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
+pub mod apply;
 pub mod diff;
 pub mod parse;
 pub mod planner;
@@ -60,18 +62,6 @@ pub enum Action {
 }
 
 impl Action {
-    // /// A shell command representing what this action would do
-    // pub fn command(&self) -> String {
-    //     match self {
-    //         Action::CreateFile(n) => format!("touch {}", n),
-    //         Action::CreateDir(n) => format!("mkdir {}", n),
-    //         Action::DeleteFile(n) => format!("rm {}", n),
-    //         Action::DeleteDir(n) => format!("rm -rf {}", n),
-    //         Action::Rename(s, d) => format!("mv {} {}", s, d),
-    //         Action::Copy(s, d) => format!("cp {} {}", s, d),
-    //     }
-    // }
-
     /// The path this action **removes** (deletes from the filesystem), if any.
     pub fn removes(&self) -> Option<&Path> {
         match self {
@@ -156,7 +146,7 @@ pub enum KoilError {
     InvalidName(String),
 }
 
-#[derive(Debug, TypedBuilder)]
+#[derive(Debug, Clone, TypedBuilder, Serialize, Deserialize)]
 #[builder(mutators(
     /// Will ignore the given path (never show in the listing)
     /// This can be used to hide the koil listing file
@@ -181,6 +171,7 @@ pub struct Koil {
 
     // Private fields
     #[builder(default = new_sqids(min_id_len), setter(skip))]
+    #[serde(skip)] // rebuilt from `min_id_len` in [`Koil::load_state`]
     /// Encodes indexes into random looking IDs, so they don't look sequential
     sqids: Sqids,
 
@@ -331,6 +322,28 @@ impl Koil {
         // `take` will return an owned value, and replace the `&mut` to [`Default::default`]
         let diff = std::mem::take(&mut self.diff);
         diff.compute_actions()
+    }
+
+    /// Forget every change, and reopen [`Koil::current_dir`] from the filesystem
+    /// Use this after the actions were applied, so the listing shows what is on disk now
+    /// IDs are kept, so an ID never starts pointing to a different path
+    pub fn refresh(&mut self) -> io::Result<Option<Warning>> {
+        self.diff = Diff::default();
+        let dir = std::mem::take(&mut self.current_dir);
+        self.open(dir)
+    }
+
+    /// Save the whole session (IDs, open dir, and diff), so it can be continued later
+    /// with [`Koil::load_state`], even by a different process
+    pub fn save_state(&self) -> String {
+        serde_json::to_string(self).expect("koil state is always valid JSON")
+    }
+
+    /// Continue a session saved with [`Koil::save_state`]
+    pub fn load_state(state: &str) -> serde_json::Result<Koil> {
+        let mut koil: Koil = serde_json::from_str(state)?;
+        koil.sqids = new_sqids(&koil.min_id_len);
+        Ok(koil)
     }
 
     pub fn get_entry(&self, index: usize) -> Option<Entry> {

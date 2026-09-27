@@ -1,9 +1,10 @@
 use crate::Action;
 use crate::planner;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diff {
     /// ID, which points to the name it had before, and names that now it has after
     pub with_id: HashMap<usize, (PathBuf, Vec<PathBuf>)>,

@@ -504,3 +504,11 @@ fn test_invalid_ids_fail() {
         );
     }
 }
+
+#[test]
+fn test_refresh() {
+    let mut koil = update_test_dir("new").unwrap();
+    koil.refresh().unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+    assert_eq!(TEST_DIR_LISTING.trim_end(), koil.listing());
+}
