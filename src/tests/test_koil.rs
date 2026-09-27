@@ -512,3 +512,72 @@ fn test_refresh() {
     assert_eq!(Diff::default(), koil.diff);
     assert_eq!(TEST_DIR_LISTING.trim_end(), koil.listing());
 }
+
+#[test]
+fn test_undo_last_apply_first() {
+    let mut koil = test_koil();
+    koil.push_undo(vec![Undo::Trash("a".into())]);
+    koil.push_undo(vec![]);
+    koil.push_undo(vec![Undo::Rename("b".into(), "c".into())]);
+    assert_eq!(
+        Some(&[Undo::Rename("b".into(), "c".into())][..]),
+        koil.undo_steps().unwrap()
+    );
+}
+
+#[test]
+fn test_undo_trashes_dir_with_its_contents() {
+    let mut koil = test_koil();
+    koil.push_undo(vec![
+        Undo::Trash("new/dir/y".into()),
+        Undo::Trash("new/x".into()),
+        Undo::Rename("new2/b".into(), "b".into()),
+        Undo::Trash("new".into()),
+        Undo::Trash("new2".into()),
+    ]);
+    assert_eq!(
+        Some(
+            &[
+                Undo::Rename("new2/b".into(), "b".into()),
+                Undo::Trash("new".into()),
+                Undo::Trash("new2".into()),
+            ][..]
+        ),
+        koil.undo_steps().unwrap()
+    );
+}
+
+#[test]
+fn test_undo_is_saved() {
+    let mut koil = test_koil();
+    koil.push_undo(vec![Undo::Trash("a".into())]);
+    let loaded = Koil::load_state(&koil.save_state()).unwrap();
+    assert_eq!(
+        Some(&[Undo::Trash("a".into())][..]),
+        loaded.undo_steps().unwrap()
+    );
+}
+
+#[test]
+fn test_undo_with_pending_changes_fails() {
+    let mut koil = update_test_dir("new").unwrap();
+    koil.push_undo(vec![Undo::Trash("a".into())]);
+    assert!(matches!(koil.undo_steps(), Err(KoilError::PendingChanges)));
+    assert!(matches!(koil.undo(), Err(KoilError::PendingChanges)));
+}
+
+#[test]
+fn test_nothing_to_undo() {
+    let mut koil = test_koil();
+    assert_eq!(None, koil.undo_steps().unwrap());
+    assert!(matches!(koil.undo(), Err(KoilError::NothingToUndo)));
+}
+
+#[test]
+fn test_invalid_update_changes_nothing() {
+    let mut koil = test_koil();
+    let before = koil.save_state();
+    // `file` is deleted, before the invalid ID is found
+    assert!(koil.update(":d0n6oe dir/\n:zzzzzz new\n").is_err());
+    assert_eq!(before, koil.save_state());
+}

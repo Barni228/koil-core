@@ -20,6 +20,7 @@ fn copy(from: &str, to: &str) -> Action {
     Action::Copy(from.into(), to.into())
 }
 
+mod test_apply;
 mod test_diff;
 mod test_koil;
 mod test_parse;

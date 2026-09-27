@@ -1,9 +1,10 @@
 use anyhow::{Context, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use io::Write;
-use koil::{Action, Koil};
+use koil::session::Session;
+use koil::{Koil, Warning};
 use std::path::{Path, PathBuf};
-use std::{env, fs, io};
+use std::{env, io};
 
 /// Edit directories as text
 ///
@@ -40,6 +41,8 @@ enum Command {
     /// Apply every change made so far, and keep the session going
     #[command(visible_alias = "a")]
     Apply(EndArgs),
+    /// Revert the last apply of this session, deleted paths come back from the trash
+    Undo(EndArgs),
     /// End the session, and apply every change made in it
     #[command(visible_alias = "e")]
     End(EndArgs),
@@ -59,6 +62,8 @@ enum Interactive {
     /// Apply every change made so far, and keep the session going
     #[command(visible_alias = "a")]
     Apply(EndArgs),
+    /// Revert the last apply of this session, deleted paths come back from the trash
+    Undo(EndArgs),
     /// End the session, and apply every change made in it
     #[command(visible_alias = "e")]
     End(EndArgs),
@@ -78,92 +83,6 @@ struct EndArgs {
     dry_run: bool,
 }
 
-/// Files that belong to one session
-struct Session {
-    /// The listing file that user edits
-    listing: PathBuf,
-    /// The saved [`Koil`], so `koil update` and `koil end` can continue the session
-    state: PathBuf,
-}
-
-impl Session {
-    fn new(listing: &Path) -> anyhow::Result<Self> {
-        let name = listing
-            .file_name()
-            .with_context(|| format!("`{}` is not a file name", listing.display()))?;
-        let parent = match listing.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        // canonical, so koil can recognize and hide these files in the listing
-        let dir = fs::canonicalize(parent)
-            .with_context(|| format!("Can not open `{}`", parent.display()))?;
-        let mut state_name = name.to_os_string();
-        state_name.push(".session");
-
-        Ok(Session {
-            listing: dir.join(name),
-            state: dir.join(state_name),
-        })
-    }
-
-    /// Open the current dir, and write its listing
-    fn start(&self) -> anyhow::Result<Koil> {
-        if self.listing.exists() || self.state.exists() {
-            bail!(
-                "`{}` already exists.\n\
-                Another session may be running, end it with `koil end`, or remove it and try again.",
-                self.listing.display()
-            );
-        }
-        let mut koil = Koil::builder()
-            .ignore(&self.listing)
-            .ignore(&self.state)
-            .build();
-        koil.open(env::current_dir()?)?;
-        self.write_listing(&koil)?;
-        Ok(koil)
-    }
-
-    /// Continue the session started with `koil start`
-    fn load(&self) -> anyhow::Result<Koil> {
-        let state = fs::read_to_string(&self.state).with_context(|| {
-            format!(
-                "No session for `{}`, start one with `koil start`",
-                self.listing.display()
-            )
-        })?;
-        Koil::load_state(&state).context("The session file is corrupted")
-    }
-
-    fn write_listing(&self, koil: &Koil) -> io::Result<()> {
-        fs::write(&self.listing, koil.listing() + "\n")
-    }
-
-    fn save(&self, koil: &Koil) -> io::Result<()> {
-        fs::write(&self.state, koil.save_state())
-    }
-
-    /// Apply the edited listing to `koil`
-    /// If the listing is invalid, `koil` is left as it was
-    fn update(&self, koil: &mut Koil) -> anyhow::Result<()> {
-        let content = fs::read_to_string(&self.listing)
-            .with_context(|| format!("Can not read `{}`", self.listing.display()))?;
-        let mut updated = koil.clone();
-        if let Some(warning) = updated.update(&content)? {
-            eprintln!("Warning: {warning}");
-        }
-        *koil = updated;
-        Ok(())
-    }
-
-    /// Remove every file of this session
-    fn remove(&self) {
-        let _ = fs::remove_file(&self.listing);
-        let _ = fs::remove_file(&self.state);
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let session = Session::new(&cli.path)?;
@@ -171,48 +90,59 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         None => interactive(&session, cli.end, !cli.no_editor),
         Some(Command::Start) => {
-            let koil = session.start()?;
+            let koil = session.start(&env::current_dir()?)?;
             session.save(&koil)?;
             println!(
                 "Edit `{}`, then run `koil update` or `koil end`",
-                session.listing.display()
+                session.listing().display()
             );
             Ok(())
         }
         Some(Command::Update) => {
-            let mut koil = session.load()?;
-            session.update(&mut koil)?;
-            session.write_listing(&koil)?;
-            session.save(&koil).context("Can not save the session")
+            let koil = load(&session)?;
+            session.save(&koil)?;
+            Ok(())
         }
         Some(Command::Apply(args)) => {
-            let mut koil = session.load()?;
-            session.update(&mut koil)?;
+            let mut koil = load(&session)?;
             let result = apply(&mut koil, args);
             // a dry run changes nothing
             if !args.dry_run {
-                session.write_listing(&koil)?;
-                session.save(&koil).context("Can not save the session")?;
+                session.save(&koil)?;
+            }
+            result
+        }
+        Some(Command::Undo(args)) => {
+            let mut koil = load(&session)?;
+            let result = undo(&mut koil, args);
+            if !args.dry_run {
+                session.save(&koil)?;
             }
             result
         }
         Some(Command::End(args)) => {
-            let mut koil = session.load()?;
-            session.update(&mut koil)?;
+            let mut koil = load(&session)?;
             // a dry run changes nothing, so the session can go on
             if !args.dry_run {
                 session.remove();
             }
-            end(koil, args)
+            apply(&mut koil, args)
         }
     }
 }
 
-/// `defaults` are used by every `apply` and `end`, on top of their own args
+/// Continue the saved session, with the edits made in its listing
+fn load(session: &Session) -> anyhow::Result<Koil> {
+    let mut koil = session.load()?;
+    warn(session.update(&mut koil)?);
+    Ok(koil)
+}
+
+/// `defaults` are used by every `apply`, `undo` and `end`, on top of their own args
 fn interactive(session: &Session, defaults: EndArgs, editor: bool) -> anyhow::Result<()> {
-    let mut koil = session.start()?;
-    println!("Editing `{}`", session.listing.display());
-    if editor && let Err(err) = open_in_editor(&session.listing) {
+    let mut koil = session.start(&env::current_dir()?)?;
+    println!("Editing `{}`", session.listing().display());
+    if editor && let Err(err) = open_in_editor(session.listing()) {
         eprintln!("Warning: can not open an editor: {err:#}");
     }
     let with_defaults = |args: EndArgs| EndArgs {
@@ -244,93 +174,92 @@ fn interactive(session: &Session, defaults: EndArgs, editor: bool) -> anyhow::Re
             continue;
         }
 
-        if let Err(err) = session.update(&mut koil) {
-            eprintln!("Error: {err:#}");
-            continue;
-        }
-        match command {
-            Interactive::Update | Interactive::Help => {}
-            Interactive::Apply(args) => {
-                if let Err(err) = apply(&mut koil, with_defaults(args)) {
-                    eprintln!("Error: {err:#}");
-                }
+        match session.update(&mut koil) {
+            Ok(warning) => warn(warning),
+            Err(err) => {
+                eprintln!("Error: {:#}", anyhow::Error::from(err));
+                continue;
             }
+        }
+        let result = match command {
+            Interactive::Update | Interactive::Help => Ok(()),
+            Interactive::Apply(args) => apply(&mut koil, with_defaults(args)),
+            Interactive::Undo(args) => undo(&mut koil, with_defaults(args)),
             Interactive::End(args) => {
                 session.remove();
-                return end(koil, with_defaults(args));
+                return apply(&mut koil, with_defaults(args));
             }
+        };
+        if let Err(err) = result {
+            eprintln!("Error: {err:#}");
         }
         session.write_listing(&koil)?;
     }
 }
 
-/// Show the actions, and run them if user agrees, `koil` keeps going with the new filesystem
+/// Show the changes, and apply them if user agrees
 fn apply(koil: &mut Koil, args: EndArgs) -> anyhow::Result<()> {
     let base = env::current_dir()?;
-    // the diff is only consumed if the actions run
-    let actions = koil.clone().compute_actions();
-    if !confirm(&actions, args, &base)? {
-        return Ok(());
-    }
-    let result = run(&actions, &base);
-    // even if some action failed, others changed the filesystem
-    if let Some(warning) = koil.refresh()? {
-        eprintln!("Warning: {warning}");
-    }
-    result
-}
-
-/// Show the actions, and run them if user agrees
-fn end(mut koil: Koil, args: EndArgs) -> anyhow::Result<()> {
-    let base = env::current_dir()?;
-    let actions = koil.compute_actions();
-    if confirm(&actions, args, &base)? {
-        run(&actions, &base)?;
+    let commands: Vec<String> = koil
+        .compute_actions()
+        .iter()
+        .map(|a| a.command(&base))
+        .collect();
+    if confirm(&commands, args, "Apply these changes?")? {
+        let report = koil.apply()?;
+        println!("Applied {} changes.", report.changes);
+        warn(report.warning);
     }
     Ok(())
 }
 
-/// Show the actions, and return true if user agrees to run them
-/// On a dry run, only prints the shell commands, and never agrees
-/// Paths in `base` are shown relative to it
-fn confirm(actions: &[Action], args: EndArgs, base: &Path) -> anyhow::Result<bool> {
+/// Show how the last apply would be reverted, and revert it if user agrees
+fn undo(koil: &mut Koil, args: EndArgs) -> anyhow::Result<()> {
+    let base = env::current_dir()?;
+    let Some(steps) = koil.undo_steps()? else {
+        println!("Nothing to undo.");
+        return Ok(());
+    };
+    let commands: Vec<String> = steps.iter().map(|s| s.command(&base)).collect();
+    if confirm(&commands, args, "Undo these changes?")? {
+        let report = koil.undo()?;
+        println!("Undid {} changes.", report.changes);
+        warn(report.warning);
+    }
+    Ok(())
+}
+
+fn warn(warning: Option<Warning>) {
+    if let Some(warning) = warning {
+        eprintln!("Warning: {warning}");
+    }
+}
+
+/// Show the shell commands of the changes, and return true if user agrees to run them
+/// On a dry run, only prints the commands, and never agrees
+fn confirm(commands: &[String], args: EndArgs, question: &str) -> anyhow::Result<bool> {
     if args.dry_run {
-        for action in actions {
-            println!("{}", action.command(base));
+        for command in commands {
+            println!("{command}");
         }
         return Ok(false);
     }
 
-    if actions.is_empty() {
+    if commands.is_empty() {
         println!("No changes.");
         return Ok(false);
     }
-    for action in actions {
-        println!("  {}", action.command(base));
+    for command in commands {
+        println!("  {command}");
     }
     if !args.yes {
-        let answer = input("Apply these changes? [y/N] ")?.unwrap_or_default();
+        let answer = input(&format!("{question} [y/N] "))?.unwrap_or_default();
         if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("Nothing was applied.");
+            println!("Nothing was changed.");
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn run(actions: &[Action], base: &Path) -> anyhow::Result<()> {
-    for (i, action) in actions.iter().enumerate() {
-        action.run().with_context(|| {
-            format!(
-                "Failed to run `{}`, {} of {} changes were applied",
-                action.command(base),
-                i,
-                actions.len()
-            )
-        })?;
-    }
-    println!("Applied {} changes.", actions.len());
-    Ok(())
 }
 
 /// Open `path` in `$VISUAL` or `$EDITOR`, or the system default app if neither is set

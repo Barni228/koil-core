@@ -1,3 +1,4 @@
+use crate::apply::Undo;
 use crate::diff::Diff;
 use serde::{Deserialize, Serialize};
 use sqids::Sqids;
@@ -10,6 +11,8 @@ pub mod apply;
 pub mod diff;
 pub mod parse;
 pub mod planner;
+pub mod session;
+pub mod trash;
 
 /// A single file or directory captured from a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,10 +131,45 @@ impl fmt::Display for Warning {
     }
 }
 
+/// What [`Koil::apply`] or [`Koil::undo`] did
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// How many changes were made on the filesystem
+    pub changes: usize,
+    /// Set if the open dir is gone now, and its closest parent was opened instead
+    pub warning: Option<Warning>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KoilError {
     #[error("IO Error")]
     IOError(#[from] io::Error),
+
+    #[error("Failed to run `{action}`, {done} of {total} changes were applied")]
+    ApplyFailed {
+        action: Action,
+        /// How many actions ran before this one, they can be undone
+        done: usize,
+        total: usize,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("Failed to run `{step}`, {done} of {total} changes were undone")]
+    UndoFailed {
+        step: Undo,
+        /// How many steps ran before this one, the rest can be undone again
+        done: usize,
+        total: usize,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("Some changes are not applied yet, apply them or remove them from the listing first")]
+    PendingChanges,
+
+    #[error("Nothing to undo")]
+    NothingToUndo,
 
     #[error("`{0}` appears more than once")]
     DuplicatePath(String),
@@ -190,6 +228,11 @@ pub struct Koil {
     #[builder(default, setter(skip))]
     /// Partial diff, which stores all changes made in other listings
     diff: Diff,
+
+    #[builder(default, setter(skip))]
+    #[serde(default)]
+    /// Steps that revert each apply of this session, the last apply is last
+    undo: Vec<Vec<Undo>>,
 }
 
 impl Default for Koil {
@@ -313,15 +356,86 @@ impl Koil {
 
     /// Update the internal diff based on modifications made in `modified_listing`
     /// Returns a warning, if something user asked for was ignored
+    /// If the listing is invalid, nothing is changed
     pub fn update(&mut self, modified_listing: &str) -> Result<Option<Warning>, KoilError> {
-        self.update_parsed(parse::parse_listing(modified_listing))
+        let mut updated = self.clone();
+        let warning = updated.update_parsed(parse::parse_listing(modified_listing))?;
+        *self = updated;
+        Ok(warning)
     }
 
-    /// This will consume the diff, and return the actions required to do what user did
-    pub fn compute_actions(&mut self) -> Vec<Action> {
-        // `take` will return an owned value, and replace the `&mut` to [`Default::default`]
-        let diff = std::mem::take(&mut self.diff);
-        diff.compute_actions()
+    /// The actions that [`Koil::apply`] would run to do what user did, in order
+    pub fn compute_actions(&self) -> Vec<Action> {
+        self.diff.clone().compute_actions()
+    }
+
+    /// Run every change made so far on the filesystem, deleted paths are moved to the trash
+    /// Then the listing is refreshed, and the changes can be reverted with [`Koil::undo`]
+    /// If an action fails, the rest are not run, and every change that was not applied is
+    /// forgotten, the ones that were applied can still be undone
+    pub fn apply(&mut self) -> Result<Report, KoilError> {
+        let actions = self.compute_actions();
+        let mut steps = Vec::new();
+        let mut result = Ok(());
+        for (i, action) in actions.iter().enumerate() {
+            match action.run() {
+                Ok(step) => steps.extend(step),
+                Err(source) => {
+                    result = Err(KoilError::ApplyFailed {
+                        action: action.clone(),
+                        done: i,
+                        total: actions.len(),
+                        source,
+                    });
+                    break;
+                }
+            }
+        }
+        // undo runs the steps backwards
+        steps.reverse();
+        self.push_undo(steps);
+        // even if some action failed, others changed the filesystem
+        let refreshed = self.refresh();
+        result?;
+        Ok(Report {
+            changes: actions.len(),
+            warning: refreshed?,
+        })
+    }
+
+    /// The steps that [`Koil::undo`] would run to revert the last apply, in order
+    /// `None` if there is nothing to undo
+    /// Fails if there are changes that are not applied, since undo would make them wrong
+    pub fn undo_steps(&self) -> Result<Option<&[Undo]>, KoilError> {
+        self.check_nothing_pending()?;
+        Ok(self.undo.last().map(Vec::as_slice))
+    }
+
+    /// Revert the last apply of this session, deleted paths come back from the trash,
+    /// and created paths are moved to the trash
+    /// If a step fails, the steps that were not run yet stay, so they can be undone later
+    pub fn undo(&mut self) -> Result<Report, KoilError> {
+        self.check_nothing_pending()?;
+        let steps = self.undo.pop().ok_or(KoilError::NothingToUndo)?;
+        let mut result = Ok(());
+        for (i, step) in steps.iter().enumerate() {
+            if let Err(source) = step.run() {
+                self.push_undo(steps[i..].to_vec());
+                result = Err(KoilError::UndoFailed {
+                    step: step.clone(),
+                    done: i,
+                    total: steps.len(),
+                    source,
+                });
+                break;
+            }
+        }
+        let refreshed = self.refresh();
+        result?;
+        Ok(Report {
+            changes: steps.len(),
+            warning: refreshed?,
+        })
     }
 
     /// Forget every change, and reopen [`Koil::current_dir`] from the filesystem
@@ -333,7 +447,7 @@ impl Koil {
         self.open(dir)
     }
 
-    /// Save the whole session (IDs, open dir, and diff), so it can be continued later
+    /// Save the whole session (IDs, open dir, diff, and undo steps), so it can be continued later
     /// with [`Koil::load_state`], even by a different process
     pub fn save_state(&self) -> String {
         serde_json::to_string(self).expect("koil state is always valid JSON")
@@ -380,6 +494,36 @@ impl Koil {
 
 // Private functions
 impl Koil {
+    /// Remember `steps` that revert an apply, so [`Koil::undo`] can run them later
+    /// `steps` must be in the order they should run, nothing is remembered if it is empty
+    fn push_undo(&mut self, mut steps: Vec<Undo>) {
+        // a path inside a trashed dir goes to the trash with it, not as a separate item
+        let trashed: Vec<PathBuf> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Undo::Trash(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        steps.retain(|s| match s {
+            Undo::Trash(p) => !trashed.iter().any(|dir| p != dir && p.starts_with(dir)),
+            _ => true,
+        });
+
+        if !steps.is_empty() {
+            self.undo.push(steps);
+        }
+    }
+
+    /// Fail if there are changes that are not applied yet
+    fn check_nothing_pending(&self) -> Result<(), KoilError> {
+        if self.compute_actions().is_empty() {
+            Ok(())
+        } else {
+            Err(KoilError::PendingChanges)
+        }
+    }
+
     /// See [`Koil::update`]
     fn update_parsed(
         &mut self,
