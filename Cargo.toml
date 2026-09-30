@@ -2,6 +2,21 @@
 name = "koil-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+authors = ["Andrii Pukhalyk <pukhalyk1@gmail.com>"]
+description = "Edit a directory as a list of entries, like oil.nvim"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Barni228/koil-core"
+keywords = ["filesystem", "rename", "oil", "file-manager", "bulk-rename"]
+categories = ["filesystem"]
+include = [
+    "/src",
+    "!/src/tests",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [dependencies]
 globset = "0.4"
@@ -16,7 +31,13 @@ typed-builder = "0.23.2"
 
 # `trash` can not restore on macOS, so koil trashes there itself, to know where the item went
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-foundation = { version = "0.3.2", features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", features = [
+    "std",
+    "NSError",
+    "NSFileManager",
+    "NSString",
+    "NSURL",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

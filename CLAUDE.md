@@ -1,0 +1,63 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+When implementing features, keep in mind how it would work with future features in TODO.md
+
+## What this is
+
+Koil is a Rust (edition 2024) library for editing directories as a list of entries, in the style of `vidir`/`oil.nvim`. A frontend gets the entries of the open dir (`Koil::listing`), lets the user edit them, and hands them back (`Koil::update`). Koil diffs the edit against the filesystem to produce a list of `Action`s (create, delete, rename, copy), which the frontend shows and then applies once the user confirms.
+
+This crate is **library only**, and it is never used by users directly. The CLI is the sibling project `../koil-cli`, and a GUI is planned. The text listing format, sqids IDs, the session files and shell commands all live in the CLI. The library takes and returns Rust data, so **all logic lives here**, and frontends only present it. The library works in two phases so a frontend can confirm in between: preview (`Koil::compute_actions`, `Koil::undo_steps`), then act (`Koil::apply`, `Koil::undo`, which return a `Report` or a typed `KoilError`).
+
+What the GUI expects, so keep the API fitting it:
+
+- It has a separate settings section (the open dir from `Koil::current_dir`, and later things like showing hidden files), and navigates with `Koil::open`.
+- It hides IDs, but shows names, and colors dirs differently (`Entry::is_dir`).
+- It highlights the line an error (and later, a warning) is about, so problems must point at an entry (`EntryError::entry` is the index into the entries given to `update`), not just say that something is wrong.
+- It shows the actions to confirm, like `MOVE a -> b` / `CREATE new` (it matches on `Action`, and `Display` gives `move a -> b`).
+- It needs the name of an entry from just its ID (`Koil::path_of`, and `Koil::id_of` the other way).
+
+## API
+
+- **`Entry { id: Option<Id>, name: PathBuf, is_dir: bool }`** is one line. `id: None` is a new entry to create. `name` is relative to the open dir and can be a nested path (`dir/A`) in `update`, but `listing` only gives plain names. `is_dir` only matters for new entries in `update`.
+- **`Id(pub u64)`** is an opaque, stable handle: an index into `Koil::ids`. It never starts pointing to a different path. Frontends can show it however they like (the CLI encodes it with sqids).
+- **`Koil::listing() -> Vec<Entry>`** merges the real directory contents with pending diff state, so entries renamed or moved into this dir show up there. Existing entries come first (dirs, then files, by name), then new ones (by name).
+- **`Settings { show_hidden, respect_gitignore, regex }`** (`Koil::settings`, `Koil::set_settings`, which reopens the dir, or the builder's `.settings(...)`) controls how the listing is shown, and is saved with the state. Hidden entries (names starting with `.`) are left out of `current_listing` by `open`, unless they have pending changes in the diff: `update` takes every entry of `current_listing` that is missing as deleted, so a changed entry must stay, or hiding it would turn a rename into a copy and forget a delete. Entries in the diff are always shown, even hidden ones. `respect_gitignore` (off by default) hides what git ignores and the `.git` dir, and works the same way: changed entries stay.
+- **Walking** (`Koil::walk`, with `ignore::WalkBuilder`) reads both views: depth 1 for a dir, for a glob unlimited with `**`, else the glob's part count, and always unlimited for a regex. It filters hidden entries (`.hidden(...)`), and with `respect_gitignore` reads `.gitignore`, `.git/info/exclude`, the global excludes, and `.gitignore` files of parent dirs up to the repo root; like git, nothing is ignored outside a repo (`require_git` is left on). ripgrep's `.ignore` files are never read. The open dir itself is always read, even if it is hidden or ignored, and unreadable dirs inside it are skipped.
+- **`Entry::parent()`** is the `..` entry (`id: None`, name `..`). `listing` starts with it when `show_hidden` is on (not in `/`), and `update` always ignores it (`Entry::is_parent`), so it can only be opened.
+- **`Koil::update(&[Entry]) -> Result<Vec<EntryWarning>, UpdateError>`** changes nothing if any entry is invalid, and returns every problem as `EntryError { entry, kind }` (`UnknownId`, `InvalidName`, `Duplicate { path, first }`, `NotADirectory`, `AlreadyExists`, `NameTooLong`, `ControlCharacter`), sorted by entry. Names that work but are not recommended give `EntryWarning { entry, kind }` (Windows characters, shell characters, Windows reserved names, emoji, invisible or look-alike characters, a space at an edge, a trailing `.`, a leading `-`, not UTF-8); they are returned when it works, and in `UpdateError::warnings` when it does not. `Koil::check` returns the same without changing anything, so a GUI can show problems while user types.
+- **Name checks** (`names.rs`, `names::check` for one part of a path) only run on parts of written paths that do not exist on disk yet (`Koil::new_names`), so existing weird names never warn, and an unchanged entry is never checked. `AlreadyExists` (`Koil::taken`) catches a create or rename onto something on disk that is not deleted or moved away in the diff, like a hidden or ignored file, a file outside a glob, or a name that only differs in case on a case-insensitive filesystem (`apply::same_file`); a rename that only changes case, and `dir/` over an existing dir (`mkdir -p` does nothing), are fine. It never navigates. Frontends call `open` afterwards (the CLI does it for `>` and the header).
+- **`Koil::open(location)`** navigates, and never changes the diff. `location` is a dir or a pattern (`Pattern::Glob`, or `Pattern::Regex` when `Settings::regex` is on). It can open a new dir that is pending in the diff (`Diff::creates_dir`). If the path (or the glob's base dir) is neither on disk nor pending, it opens the closest ancestor that is, as a plain dir, and returns `Warning::DirNotFound`. It fails with `OpenError` (`Io`, `InvalidGlob` or `InvalidRegex`). `open` parses the location, and `open_at(base, pattern)` does the rest; `reopen` (used by `refresh` and `set_settings`) calls `open_at` with the stored `Pattern`, so turning `regex` on or off never reinterprets what is already open, only the next `open`.
+- **Patterns** (`globset` and `regex`, compiled by `Pattern::matcher` into a `Matcher`): `split_pattern` takes the longest ancestor that is a dir (so an existing dir named `a[1]` or `v1.0` is never a pattern), then the base dir is everything before the first part with a special character (`*?[{` for globs, `.,*+?()[]{}|^$\` for regexes), and the rest is `Koil::pattern`, relative to `current_dir` (the base). A glob's `*` never matches `/` (`literal_separator`). A regex must match the whole relative path (wrapped in `^(?:…)$`), and `.*` does match `/`. As a convenience, `expand_commas` turns an unescaped `,` into `[^/]` (any character within one dir level), except inside `[...]` classes and `{...}` repetitions; `\,` is a literal comma. Errors are reported for the regex as written, before the expansion. A pattern view only shows files, never dirs, and names are paths relative to the base (`src/main.rs`). `Koil::location()` is the base joined with the pattern, for frontends to show. A path renamed to something that does not match the pattern leaves the view, but the rename is kept.
+- **Views** (`View`, from `Koil::view()`): what the listing shows, a plain dir (direct children) or a pattern (matching files under the base). `listing`, the diff clearing in `update_entries`, and `read_listing` all go through `View::contains(path, is_dir)`. `read_listing` also adds every changed entry of the diff whose `before` is in the view to `current_listing` (even if hidden), because `update` takes a missing entry of `current_listing` as deleted, and otherwise a rename would become a copy.
+- **Apply and undo** (`Koil::apply`/`Koil::undo`, steps in `apply.rs`): `Action::run` moves deletes to the system trash (`trash.rs`; on macOS via `NSFileManager`, since the `trash` crate can not restore there) and returns the `Undo` step that reverts it. `Koil` keeps a stack of these steps per apply in its state, and refreshes afterwards (`Koil::refresh` clears the diff and reopens the dir, IDs are kept). On a failure the steps that ran can still be undone, and a failed undo keeps the steps it did not run. Undo fails with `KoilError::PendingChanges` while there are unapplied changes.
+- **`Koil::save_state`/`load_state`** save the whole session as JSON, so another process can continue it.
+
+## Commands
+
+```sh
+cargo build
+cargo test                     # all tests (unit tests live in src/tests/)
+cargo test test_swap_ab        # a single test, matched by name substring
+cargo test tests::test_diff    # one test module
+cargo clippy --all-targets
+cargo fmt
+```
+
+## Architecture
+
+The pipeline is `Koil::update` → the `Diff` accumulator → `Diff::compute_actions` → `planner::plan_actions`.
+
+- **`lib.rs` / `Koil`** is built with `typed-builder` (`Koil::builder().ignore(path).build()`). It keeps a stable, append-only `ids: Vec<PathBuf>` table, so every path seen in any opened directory keeps its ID across navigation. `current_listing` holds the ID indexes shown for `current_dir`.
+- **Entry names** are checked by `relative_path`: empty and absolute names, and names with a `.` or `..` part, are rejected. Missing parents of nested names are **not** stored in the diff: `Diff::missing_parents` derives them (dirs that are not on disk, not created, and not a rename/copy target, with something new inside), `compute_actions` creates them, and `listing` shows them as new dirs. So removing the last thing inside a new dir also removes the dir. `check_parents` only rejects a parent that is a file.
+- **Edits**: duplicating an ID means copy. Removing it means delete. Changing its name means rename. Writing an ID in a different directory's listing means a move.
+- **Cross-directory edits**: `Diff` builds up across several listings. `update_entries` first drops the diff entries that belong to the current directory and rebuilds them from the new edit. It leaves entries from other directories alone.
+- **`diff.rs`**: `with_id` maps an ID index to `(before_path, after_paths)`, and `without_id` maps a path to `is_dir` for creates. `compute_actions` handles it like this: no afters means delete; if `before` is still among the afters, the other afters are copies; otherwise one after becomes the rename target and the rest become copies.
+- **`planner.rs`** orders the actions using the `Action::removes/creates/depends_on` relations. It groups actions into SCCs (`pathfinding`), topologically sorts the groups, and breaks each rename cycle through a temp path next to the first renamed file (`.name.koil0`, `.name.koil1`, …). `plan_actions` takes an `exists` closure to skip names already on disk; tests pass `|_| false` via a local `plan_actions` wrapper in `test_planner.rs`. Both helpers sort their output so results are **deterministic**, and the tests depend on exact ordering.
+
+## Tests
+
+- `src/tests/mod.rs` holds the shared helpers: `add`, `delete`, `rename` and `copy` for building `Action`s, and `with_id(id, name)`, `without_id(name)`, `id(koil, name)` and `keep(koil, name)` for building `Entry`s (a trailing `/` in `name` marks a dir). The tests compare against exact `Vec<Action>` ordering.
+- Each test file covers one module: `test_diff.rs` (`diff.rs` only, with a hand-built `Diff`), `test_planner.rs` (`planner.rs`), `test_names.rs` (`names::check`), `test_koil.rs` (everything through `Koil`: `open`, `update`, `listing`, errors), and `test_apply.rs` (`apply.rs`/`trash.rs`: runs the actions on a real `tempfile` dir, then undoes them and compares snapshots of the dir; these move files to the real system trash).
+- `test_koil.rs` has the shared helpers `test_path`, `test_koil()`, `test_dir_listing(koil)`, `update_test_dir(extra)`, `diff(koil, ...)` and `errors(result)`, all based on `$CARGO_MANIFEST_DIR/test_dir`. That fixture directory is real (`dir/inside`, `.hidden`, `file`, `file2`, `qwerty`; `.hidden` is only in the listing of `hidden_koil()`) because `compute_actions` calls `is_dir()` on the filesystem, so don't delete or rename it.
+- Tests build `Entry`s directly, never listing text. Multi-line strings in tests (if any) are written one line per source line, as `"\` followed by `line\n\` rows.

@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use crate::apply::{Undo, same_file};
 use crate::diff::Diff;
 use globset::{GlobBuilder, GlobMatcher};
@@ -137,17 +139,17 @@ impl Pattern {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// Represent a filesystem operation
 pub enum Action {
-    /// rm -rf <name>
+    /// `rm -rf <name>`
     DeleteDir(PathBuf),
-    /// rm -f <name>
+    /// `rm -f <name>`
     DeleteFile(PathBuf),
-    /// mv <src> <dst>
+    /// `mv <src> <dst>`
     Rename(PathBuf, PathBuf),
-    /// cp <src> <dst>
+    /// `cp <src> <dst>`
     Copy(PathBuf, PathBuf),
-    /// touch <name>
+    /// `touch <name>`
     CreateFile(PathBuf),
-    /// mkdir -p <name>
+    /// `mkdir -p <name>`
     CreateDir(PathBuf),
 }
 
@@ -445,7 +447,7 @@ impl Koil {
     /// Open `location`, which is either a dir, or a pattern like `src/**/*.rs`, read as a glob,
     /// or as a regex if [`Settings::regex`] is on
     /// If it is relative, it will be opened relative to [`Koil::current_dir`]
-    /// A dir can also be a new dir from [`Koil::diff`] that does not exist yet,
+    /// A dir can also be a new dir that was written in a listing, but does not exist yet,
     /// then it is opened with an empty listing
     /// A pattern shows every file (not dir) whose path matches it, relative to its base dir:
     /// the dirs before the first part with a special character (`*?[{` for a glob, and
@@ -454,7 +456,7 @@ impl Koil {
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
     /// If the dir (or the base dir of the pattern) is neither on disk nor in the diff, the
     /// closest parent that is gets opened as a dir
-    /// This never changes [`Koil::diff`], new dirs must be written in the listing
+    /// This never adds changes, new dirs must be written in the listing
     /// Returns a warning, if the dir was not found and a parent was opened instead
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<Option<Warning>, OpenError> {
         let path = resolve(&self.current_dir.join(location))?;

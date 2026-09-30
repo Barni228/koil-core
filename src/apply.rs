@@ -62,7 +62,7 @@ pub enum Undo {
     Trash(PathBuf),
     /// Move a trashed path back from the trash
     Restore(Trashed),
-    /// mv <src> <dst>
+    /// `mv <src> <dst>`
     Rename(PathBuf, PathBuf),
 }
 
