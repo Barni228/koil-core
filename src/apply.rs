@@ -5,20 +5,6 @@ use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
 
 impl Action {
-    /// A shell command that does the same thing as [`Action::run`]
-    /// Paths inside `base` are written relative to it
-    pub fn command(&self, base: &Path) -> String {
-        let q = |path: &Path| shell_path(path, base);
-        match self {
-            Action::CreateFile(n) => format!("touch {}", q(n)),
-            Action::CreateDir(n) => format!("mkdir -p {}", q(n)),
-            Action::DeleteFile(n) | Action::DeleteDir(n) => format!("trash {}", q(n)),
-            Action::Rename(s, d) => format!("mv {} {}", q(s), q(d)),
-            Action::Copy(s, d) if s.is_dir() => format!("cp -R {} {}", q(s), q(d)),
-            Action::Copy(s, d) => format!("cp {} {}", q(s), q(d)),
-        }
-    }
-
     /// Run this action on the filesystem, deleted paths are moved to the trash
     /// Never overwrites an existing path, the planner makes sure it was removed first
     /// Returns the step that reverts it, or `None` if it changed nothing
@@ -54,11 +40,17 @@ impl Action {
     }
 }
 
-/// The shell command, with full paths
+/// What the action does, with full paths, like `move a -> b`
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // every path starts with the empty path, so nothing is made relative
-        f.write_str(&self.command(Path::new("")))
+        match self {
+            Action::CreateFile(n) => write!(f, "create {}", n.display()),
+            Action::CreateDir(n) => write!(f, "create {}/", n.display()),
+            Action::DeleteFile(n) => write!(f, "delete {}", n.display()),
+            Action::DeleteDir(n) => write!(f, "delete {}/", n.display()),
+            Action::Rename(s, d) => write!(f, "move {} -> {}", s.display(), d.display()),
+            Action::Copy(s, d) => write!(f, "copy {} -> {}", s.display(), d.display()),
+        }
     }
 }
 
@@ -75,18 +67,6 @@ pub enum Undo {
 }
 
 impl Undo {
-    /// A shell command that does the same thing as [`Undo::run`]
-    /// Restoring from the trash has no standard command, so it is shown as `restore <path>`
-    /// Paths inside `base` are written relative to it
-    pub fn command(&self, base: &Path) -> String {
-        let q = |path: &Path| shell_path(path, base);
-        match self {
-            Undo::Trash(n) => format!("trash {}", q(n)),
-            Undo::Restore(t) => format!("restore {}", q(&t.original)),
-            Undo::Rename(s, d) => format!("mv {} {}", q(s), q(d)),
-        }
-    }
-
     /// Run this step on the filesystem, never overwrites an existing path
     pub fn run(&self) -> io::Result<()> {
         match self {
@@ -100,22 +80,14 @@ impl Undo {
     }
 }
 
-/// The shell command, with full paths
+/// What the step does, with full paths, like `move a -> b`
 impl fmt::Display for Undo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // every path starts with the empty path, so nothing is made relative
-        f.write_str(&self.command(Path::new("")))
-    }
-}
-
-/// `path` for a shell command, relative to `base` if it is inside it
-fn shell_path(path: &Path, base: &Path) -> String {
-    match path.strip_prefix(base) {
-        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        // so a name like `-rf` is not read as a flag
-        Ok(rel) if rel.to_string_lossy().starts_with('-') => quote(&Path::new(".").join(rel)),
-        Ok(rel) => quote(rel),
-        Err(_) => quote(path),
+        match self {
+            Undo::Trash(n) => write!(f, "trash {}", n.display()),
+            Undo::Restore(t) => write!(f, "restore {}", t.original.display()),
+            Undo::Rename(s, d) => write!(f, "move {} -> {}", s.display(), d.display()),
+        }
     }
 }
 
@@ -171,15 +143,4 @@ fn already_exists(path: &Path) -> io::Error {
         io::ErrorKind::AlreadyExists,
         format!("`{}` already exists", path.display()),
     )
-}
-
-/// Quote `path` for a POSIX shell, only if it needs it
-fn quote(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_-./,:@%+=".contains(c);
-    if !s.is_empty() && s.chars().all(safe) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
 }

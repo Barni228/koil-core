@@ -1,50 +1,41 @@
 use crate::apply::Undo;
 use crate::diff::Diff;
 use serde::{Deserialize, Serialize};
-use sqids::Sqids;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
 pub mod apply;
 pub mod diff;
-pub mod parse;
 pub mod planner;
-pub mod session;
 pub mod trash;
 
-/// A single file or directory captured from a directory listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// ID encoded with [`Sqids`]
-    pub id: String,
-    /// Display name, without trailing `/`.
-    pub name: String,
-    /// Whether this entry is a directory.
-    pub is_dir: bool,
-}
+/// A stable handle of a path that koil has seen
+/// It never starts pointing to a different path, even after navigating or applying
+/// A frontend can show it however it likes, or hide it and keep it next to its entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Id(pub u64);
 
-impl fmt::Display for Entry {
+impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entry_type = if self.is_dir { "/" } else { "" };
-        write!(f, ":{} {}{}", self.id, self.name, entry_type)
+        write!(f, "{}", self.0)
     }
 }
 
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .is_dir
-            .cmp(&self.is_dir)
-            .then(self.name.cmp(&other.name))
-    }
+/// A single file or directory in a listing
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    /// The path this entry was before, `None` if it is new and should be created
+    pub id: Option<Id>,
+    /// Path relative to the open dir
+    /// [`Koil::listing`] only gives plain names, but [`Koil::update`] also takes nested paths
+    /// like `dir/A`
+    pub name: PathBuf,
+    /// Whether this entry is a directory
+    /// [`Koil::update`] only uses it for new entries, an existing entry keeps its type
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -145,7 +136,7 @@ pub enum KoilError {
     #[error("IO Error")]
     IOError(#[from] io::Error),
 
-    #[error("Failed to run `{action}`, {done} of {total} changes were applied")]
+    #[error("Failed to {action}, {done} of {total} changes were applied")]
     ApplyFailed {
         action: Action,
         /// How many actions ran before this one, they can be undone
@@ -155,7 +146,7 @@ pub enum KoilError {
         source: io::Error,
     },
 
-    #[error("Failed to run `{step}`, {done} of {total} changes were undone")]
+    #[error("Failed to {step}, {done} of {total} changes were undone")]
     UndoFailed {
         step: Undo,
         /// How many steps ran before this one, the rest can be undone again
@@ -170,18 +161,51 @@ pub enum KoilError {
 
     #[error("Nothing to undo")]
     NothingToUndo,
+}
 
-    #[error("`{0}` appears more than once")]
-    DuplicatePath(String),
+/// Why [`Koil::update`] rejected the entries, nothing was changed
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", join_lines(errors))]
+pub struct UpdateError {
+    /// Every problem that was found, in the order of the entries
+    pub errors: Vec<EntryError>,
+}
 
-    #[error("Invalid ID: `{0}`, this ID is not recognized")]
-    InvalidID(String),
+/// A problem with one of the entries given to [`Koil::update`]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Entry {entry}: {kind}")]
+pub struct EntryError {
+    /// Index of the entry in the entries given to [`Koil::update`]
+    pub entry: usize,
+    pub kind: EntryErrorKind,
+}
 
-    #[error("`{0}` is not a directory")]
-    NotADirectory(String),
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EntryErrorKind {
+    #[error("ID `{0}` is not recognized")]
+    UnknownId(Id),
 
-    #[error("`{0}` is not a valid name, it can not be empty, absolute, or contain `.` or `..`")]
-    InvalidName(String),
+    #[error(
+        "`{}` is not a valid name, it can not be empty, absolute, or contain `.` or `..`",
+        .0.display()
+    )]
+    InvalidName(PathBuf),
+
+    #[error("`{}` appears more than once", path.display())]
+    Duplicate {
+        path: PathBuf,
+        /// Index of the entry where this path appears first
+        first: usize,
+    },
+
+    /// A parent of the entry is a file, so nothing can be inside it
+    #[error("`{}` is not a directory", .0.display())]
+    NotADirectory(PathBuf),
+}
+
+fn join_lines(errors: &[EntryError]) -> String {
+    let lines: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, TypedBuilder, Serialize, Deserialize)]
@@ -194,25 +218,11 @@ pub enum KoilError {
     }
 ))]
 pub struct Koil {
-    #[builder(default = true)]
-    /// If true, the settings label will be shown in the listing
-    show_settings: bool,
-
-    #[builder(default = 6)]
-    /// The minimum length to use for IDs, IDs can be longer than this but never shorter
-    #[allow(dead_code)] // Only used to build `sqids`
-    min_id_len: u8,
-
     #[builder(via_mutators)]
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
 
     // Private fields
-    #[builder(default = new_sqids(min_id_len), setter(skip))]
-    #[serde(skip)] // rebuilt from `min_id_len` in [`Koil::load_state`]
-    /// Encodes indexes into random looking IDs, so they don't look sequential
-    sqids: Sqids,
-
     #[builder(default, setter(skip))]
     /// All IDs, pointing to their corresponding path
     ids: Vec<PathBuf>,
@@ -288,34 +298,34 @@ impl Koil {
         Ok(warning)
     }
 
-    /// The currently open listing, which user should modify
-    pub fn listing(&self) -> String {
-        let mut lines = Vec::new();
+    /// The currently open directory, as an absolute path
+    pub fn current_dir(&self) -> &Path {
+        &self.current_dir
+    }
 
-        if self.show_settings {
-            let glob = self.current_dir.to_string_lossy();
-            let sep = "=".repeat(glob.len().max(42));
-            lines.push(sep.clone());
-            lines.push(glob.to_string());
-            lines.push(sep);
-        }
-
-        let mut entries = Vec::new();
+    /// The entries of the open dir, with every change made so far, which user should modify
+    /// Existing entries come first (dirs, then files, each sorted by name), then new entries
+    pub fn listing(&self) -> Vec<Entry> {
         // returns true if this path should be shown in the current listing
         let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
+        let entry = |index: usize, path: &Path| Entry {
+            id: Some(to_id(index)),
+            name: path.file_name().unwrap().into(),
+            is_dir: self.ids[index].is_dir(),
+        };
+
+        let mut entries = Vec::new();
 
         // IDs from current listing
         for &index in &self.current_listing {
-            if let Some((_before, afters)) = self.diff.with_id.get(&index) {
-                for path in afters.iter().filter(|p| in_this_listing(p)) {
-                    entries.push(Entry {
-                        id: self.to_id(index),
-                        name: path.file_name().unwrap().to_string_lossy().to_string(),
-                        is_dir: self.ids[index].is_dir(),
-                    });
-                }
-            } else {
-                entries.push(self.get_entry(index).unwrap())
+            match self.diff.with_id.get(&index) {
+                Some((_before, afters)) => entries.extend(
+                    afters
+                        .iter()
+                        .filter(|p| in_this_listing(p))
+                        .map(|p| entry(index, p)),
+                ),
+                None => entries.push(entry(index, &self.ids[index])),
             }
         }
 
@@ -325,43 +335,49 @@ impl Koil {
             if self.current_listing.contains(&index) {
                 continue;
             }
-            for path in afters.iter().filter(|p| in_this_listing(p)) {
-                entries.push(Entry {
-                    id: self.to_id(index),
-                    name: path.file_name().unwrap().to_string_lossy().to_string(),
-                    is_dir: self.ids[index].is_dir(),
-                });
-            }
+            entries.extend(
+                afters
+                    .iter()
+                    .filter(|p| in_this_listing(p))
+                    .map(|p| entry(index, p)),
+            );
         }
 
-        // Add the sorted entries
-        entries.sort();
-        lines.extend(entries.iter().map(ToString::to_string));
+        // dirs first, then by name
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
-        for (path, &is_dir) in self
+        let mut new: Vec<Entry> = self
             .diff
             .without_id
             .iter()
-            .filter(|(p, _)| p.parent().is_some_and(|p| p == self.current_dir))
-        {
-            let mut name = path.file_name().unwrap().to_string_lossy().to_string();
-            if is_dir {
-                name.push('/');
-            }
-            lines.push(name);
-        }
+            .filter(|(p, _)| in_this_listing(p))
+            .map(|(p, &is_dir)| Entry {
+                id: None,
+                name: p.file_name().unwrap().into(),
+                is_dir,
+            })
+            .collect();
+        new.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.extend(new);
 
-        lines.join("\n")
+        entries
     }
 
-    /// Update the internal diff based on modifications made in `modified_listing`
-    /// Returns a warning, if something user asked for was ignored
-    /// If the listing is invalid, nothing is changed
-    pub fn update(&mut self, modified_listing: &str) -> Result<Option<Warning>, KoilError> {
+    /// Update the internal diff with `entries`, the listing of the open dir as user edited it
+    /// An entry of the open dir that is missing is deleted, a changed name is a rename (or a
+    /// move, if it is a path in another dir), an ID written more than once is a copy, and an
+    /// entry without an ID is created, along with its parents that do not exist yet
+    /// Changes made in the listings of other dirs are kept
+    /// If any entry is invalid, nothing is changed, and every problem is returned
+    pub fn update(&mut self, entries: &[Entry]) -> Result<(), UpdateError> {
         let mut updated = self.clone();
-        let warning = updated.update_parsed(parse::parse_listing(modified_listing))?;
+        let mut errors = updated.update_entries(entries);
+        if !errors.is_empty() {
+            errors.sort_by_key(|e| e.entry);
+            return Err(UpdateError { errors });
+        }
         *self = updated;
-        Ok(warning)
+        Ok(())
     }
 
     /// The actions that [`Koil::apply`] would run to do what user did, in order
@@ -455,40 +471,18 @@ impl Koil {
 
     /// Continue a session saved with [`Koil::save_state`]
     pub fn load_state(state: &str) -> serde_json::Result<Koil> {
-        let mut koil: Koil = serde_json::from_str(state)?;
-        koil.sqids = new_sqids(&koil.min_id_len);
-        Ok(koil)
+        serde_json::from_str(state)
     }
 
-    pub fn get_entry(&self, index: usize) -> Option<Entry> {
-        let path = &self.ids.get(index)?;
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let id = self.to_id(index);
-
-        Some(Entry {
-            id,
-            name,
-            is_dir: path.is_dir(),
-        })
+    /// The path that `id` pointed to when koil first saw it, `None` if the ID is not known
+    /// It stays the same until the changes are applied, even if the entry was renamed
+    pub fn path_of(&self, id: Id) -> Option<&Path> {
+        self.ids.get(self.index_of(id)?).map(PathBuf::as_path)
     }
 
-    /// Convert an ID string to index
-    /// returned index is guaranteed to be in [`Koil::ids`]
-    pub fn id_to_index(&self, id: &str) -> Result<usize, KoilError> {
-        match self.sqids.decode(id)[..] {
-            // Many strings decode to the same number, only accept the canonical one
-            [index] if (index as usize) < self.ids.len() && self.to_id(index as usize) == id => {
-                Ok(index as usize)
-            }
-            _ => Err(KoilError::InvalidID(id.to_string())),
-        }
-    }
-
-    /// Convert an `index` to ID
-    pub fn to_id(&self, index: usize) -> String {
-        self.sqids
-            .encode(&[index as u64])
-            .expect("the blocklist can not block every ID")
+    /// The ID of `path`, `None` if koil has not seen it in any dir it opened
+    pub fn id_of(&self, path: &Path) -> Option<Id> {
+        self.ids.iter().position(|p| p == path).map(to_id)
     }
 }
 
@@ -524,12 +518,48 @@ impl Koil {
         }
     }
 
+    /// The index of `id` in [`Koil::ids`], `None` if it is not there
+    fn index_of(&self, id: Id) -> Option<usize> {
+        usize::try_from(id.0).ok().filter(|&i| i < self.ids.len())
+    }
+
     /// See [`Koil::update`]
-    fn update_parsed(
-        &mut self,
-        modified_listing: parse::ParsedFile,
-    ) -> Result<Option<Warning>, KoilError> {
-        self.validate(&modified_listing)?;
+    /// Returns every problem found, if there are any, `self` is left half updated
+    fn update_entries(&mut self, entries: &[Entry]) -> Vec<EntryError> {
+        let mut errors = Vec::new();
+        let mut error = |entry, kind| errors.push(EntryError { entry, kind });
+
+        // each written path, and the entry that has it first
+        let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+        // index of each ID, and every (entry, path) it is written as
+        let mut with_id: BTreeMap<usize, Vec<(usize, PathBuf)>> = BTreeMap::new();
+        // (entry, path, is_dir) of every new entry
+        let mut without_id = Vec::new();
+
+        for (i, entry) in entries.iter().enumerate() {
+            let index = match entry.id.map(|id| (id, self.index_of(id))) {
+                Some((_, Some(index))) => Some(index),
+                Some((id, None)) => {
+                    error(i, EntryErrorKind::UnknownId(id));
+                    continue;
+                }
+                None => None,
+            };
+            let Some(path) = relative_path(&entry.name) else {
+                error(i, EntryErrorKind::InvalidName(entry.name.clone()));
+                continue;
+            };
+            if let Some(&first) = seen.get(&path) {
+                error(i, EntryErrorKind::Duplicate { path, first });
+                continue;
+            }
+            seen.insert(path.clone(), i);
+            match index {
+                Some(index) => with_id.entry(index).or_default().push((i, path)),
+                None => without_id.push((i, path, entry.is_dir)),
+            }
+        }
+
         let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
 
         // clear the diff for the current listing, since it is outdated
@@ -544,26 +574,27 @@ impl Koil {
 
         // if something existed before, but does not exist now, tell the diff that it used to exist
         for &index in &self.current_listing {
-            if !modified_listing.with_id.contains_key(&self.to_id(index)) {
+            if !with_id.contains_key(&index) {
                 self.diff.add_before_from(index, &self.ids);
             }
         }
 
-        // every path written in this listing, to create its missing parents later
+        // every (entry, path) written in this listing, to create its missing parents later
         let mut written = Vec::new();
 
         // Creates
-        for name in &modified_listing.without_id {
-            written.push(self.add_create(name)?);
+        for (i, path, is_dir) in without_id {
+            let path = self.current_dir.join(path);
+            self.diff.without_id.insert(path.clone(), is_dir);
+            written.push((i, path));
         }
 
         // Renames / Copy
-        for (id, entries) in modified_listing.with_id {
-            let index = self.id_to_index(&id)?;
+        for (index, names) in with_id {
             // if this id only has 1 name, and that name is same as before, user did nothing
-            if entries.len() == 1
+            if let [(_, path)] = names.as_slice()
                 && self.current_listing.contains(&index)
-                && entries[0].name == self.get_entry(index).unwrap().name
+                && self.current_dir.join(path) == self.ids[index]
                 && !self.diff.with_id.contains_key(&index)
             {
                 continue;
@@ -586,49 +617,30 @@ impl Koil {
             }
 
             // Add what we see to `diff`
-            for entry in entries {
-                let path = self.current_dir.join(parse_name(&entry.name)?.0);
+            for (i, path) in names {
+                let path = self.current_dir.join(path);
                 self.diff.push_after(index, path.clone());
-                written.push(path);
+                written.push((i, path));
             }
         }
 
         // `dir/A` also means create `dir/`, if it does not exist yet
-        for path in written {
-            self.add_missing_parents(&path)?;
+        for (i, path) in written {
+            if let Err(parent) = self.add_missing_parents(&path) {
+                errors.push(EntryError {
+                    entry: i,
+                    kind: EntryErrorKind::NotADirectory(parent),
+                });
+            }
         }
 
-        let warning = match modified_listing.selected {
-            Some(parse::Selected::Id(id)) => {
-                let index = self.id_to_index(&id)?;
-                self.open(self.ids[index].clone())?
-            }
-            // a new dir, that is not created yet
-            Some(parse::Selected::New(name)) => match name.strip_suffix('/') {
-                Some(dir) => self.open(dir)?,
-                None => return Err(KoilError::NotADirectory(name)),
-            },
-            None => match modified_listing.settings {
-                Some(settings) => self.open(settings.glob)?,
-                None => None,
-            },
-        };
-
-        Ok(warning)
-    }
-
-    /// Add `name_to_create` to [`Koil::diff`], and return its path
-    /// If `name_to_create` ends with `/`, a dir will be created
-    fn add_create(&mut self, name_to_create: &str) -> Result<PathBuf, KoilError> {
-        let (path, is_dir) = parse_name(name_to_create)?;
-        let path = self.current_dir.join(path);
-        self.diff.without_id.insert(path.clone(), is_dir);
-        Ok(path)
+        errors
     }
 
     /// Add every parent of `path` (inside [`Koil::current_dir`]) that does not exist yet
     /// to [`Koil::diff`] as a new dir
-    fn add_missing_parents(&mut self, path: &Path) -> Result<(), KoilError> {
+    /// Fails with the parent (relative to [`Koil::current_dir`]) that is a file
+    fn add_missing_parents(&mut self, path: &Path) -> Result<(), PathBuf> {
         let parents: Vec<PathBuf> = path
             .ancestors()
             .skip(1)
@@ -638,8 +650,10 @@ impl Koil {
 
         for parent in parents {
             let not_a_dir = || {
-                let name = parent.strip_prefix(&self.current_dir).unwrap();
-                KoilError::NotADirectory(name.to_string_lossy().to_string())
+                parent
+                    .strip_prefix(&self.current_dir)
+                    .unwrap()
+                    .to_path_buf()
             };
             if parent.symlink_metadata().is_ok() {
                 if parent.is_dir() {
@@ -660,46 +674,22 @@ impl Koil {
         }
         Ok(())
     }
-
-    // TODO: don't validate, make parsed file never have duplicates
-    fn validate(&self, parsed: &parse::ParsedFile) -> Result<(), KoilError> {
-        let mut seen = HashSet::new();
-        for (id, entries) in &parsed.with_id {
-            // make sure that the ID is valid
-            self.id_to_index(id)?;
-            // detect duplicates
-            for entry in entries {
-                if !seen.insert(parse_name(&entry.name)?.0) {
-                    return Err(KoilError::DuplicatePath(entry.name.clone()));
-                }
-            }
-        }
-
-        for name in &parsed.without_id {
-            if !seen.insert(parse_name(name)?.0) {
-                return Err(KoilError::DuplicatePath(name.clone()));
-            }
-        }
-
-        Ok(())
-    }
 }
 
-/// Convert a name from the listing to a path relative to the listing's dir,
-/// and whether it is a dir (ends with `/`)
+fn to_id(index: usize) -> Id {
+    Id(index as u64)
+}
+
+/// `name` as a path relative to the listing's dir, `None` if it is empty, absolute,
+/// or has a `.` or `..` part
 /// Name can have `/` inside, like `dir/A`
-fn parse_name(name: &str) -> Result<(PathBuf, bool), KoilError> {
-    let (stripped, is_dir) = match name.strip_suffix('/') {
-        Some(stripped) => (stripped, true),
-        None => (name, false),
-    };
-    let path = Path::new(stripped);
+fn relative_path(name: &Path) -> Option<PathBuf> {
+    let raw = name.to_string_lossy();
     // `Path::components` ignores `.` in the middle of a path, so check the raw parts
-    if stripped.is_empty() || path.has_root() || stripped.split('/').any(|p| p == "." || p == "..")
-    {
-        return Err(KoilError::InvalidName(name.to_string()));
+    if raw.is_empty() || name.has_root() || raw.split('/').any(|p| p == "." || p == "..") {
+        return None;
     }
-    Ok((path.components().collect(), is_dir))
+    Some(name.components().collect())
 }
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist
@@ -726,13 +716,3 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests;
-
-/// Only lowercase letters and digits, so IDs are easy to type
-fn new_sqids(min_id_len: &u8) -> Sqids {
-    // default alphabet is every lowercase and uppercase letter, and digits
-    Sqids::builder()
-        .alphabet("abcdefghijklmnopqrstuvwxyz0123456789".chars().collect())
-        .min_length(*min_id_len)
-        .build()
-        .expect("the alphabet is valid")
-}

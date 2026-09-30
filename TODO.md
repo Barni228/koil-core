@@ -9,7 +9,6 @@
 - [ ] Allow creating many files with `file{1..3}` syntax
 - [ ] Warn user about creating files with weird names (like `:^&<here>`)
 - [ ] Allow different sorting
-- [ ] Separate cli and library code into 2 different projects
 - [ ] Allow updating listing on save
 - [ ] Add a way to open files from koil
 - [ ] Add file icons
@@ -19,6 +18,7 @@
 
 ## Done
 
+- [x] Separate cli and library code into 2 different projects (`koil-cli`)
 - [x] Create `koil undo`, which undoes the last apply (deletes go to the trash)
 - [x] Generate random looking IDs with `sqids`
 - [x] Allow nested paths in the listing (`dir/A`)

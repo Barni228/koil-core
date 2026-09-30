@@ -22,7 +22,7 @@ fn test_temp_dir() -> TempDir {
 
 /// Koil with `temp` opened
 fn temp_koil(temp: &TempDir) -> Koil {
-    let mut koil = Koil::builder().show_settings(false).build();
+    let mut koil = Koil::default();
     koil.open(temp.path()).unwrap();
     koil
 }
@@ -46,21 +46,15 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<String>> {
     result
 }
 
-/// The ID of `name` inside the open dir of `koil`
-fn id(koil: &Koil, name: &str) -> String {
-    let path = koil.current_dir.join(name);
-    let index = koil.ids.iter().position(|p| p == &path).unwrap();
-    koil.to_id(index)
-}
-
 /// Apply `listing` to a fresh [`test_temp_dir`], check it gives `after`, then undo it
 /// and check that everything is as it was
-fn check_undo(listing: impl Fn(&Koil) -> String, after: &[(&str, Option<&str>)]) {
+fn check_undo(listing: impl Fn(&Koil) -> Vec<Entry>, after: &[(&str, Option<&str>)]) {
     let temp = test_temp_dir();
     let before = snapshot(temp.path());
     let mut koil = temp_koil(&temp);
 
-    koil.update(&listing(&koil)).unwrap();
+    let entries = listing(&koil);
+    koil.update(&entries).unwrap();
     koil.apply().unwrap();
     let expected: BTreeMap<PathBuf, Option<String>> = after
         .iter()
@@ -75,31 +69,18 @@ fn check_undo(listing: impl Fn(&Koil) -> String, after: &[(&str, Option<&str>)])
 
 #[test]
 fn test_undo_delete() {
-    check_undo(
-        |k| {
-            format!(
-                "\
-                :{} b\n",
-                id(k, "b")
-            )
-        },
-        &[("b", Some("b"))],
-    );
+    check_undo(|k| vec![keep(k, "b")], &[("b", Some("b"))]);
 }
 
 #[test]
 fn test_undo_rename() {
     check_undo(
         |k| {
-            format!(
-                "\
-                :{} renamed\n\
-                :{} b\n\
-                :{} dir2/\n",
-                id(k, "a"),
-                id(k, "b"),
-                id(k, "dir")
-            )
+            vec![
+                with_id(id(k, "a"), "renamed"),
+                keep(k, "b"),
+                with_id(id(k, "dir"), "dir2/"),
+            ]
         },
         &[
             ("b", Some("b")),
@@ -116,15 +97,11 @@ fn test_undo_rename() {
 fn test_undo_swap() {
     check_undo(
         |k| {
-            format!(
-                "\
-                :{} b\n\
-                :{} a\n\
-                :{} dir/\n",
-                id(k, "a"),
-                id(k, "b"),
-                id(k, "dir")
-            )
+            vec![
+                with_id(id(k, "a"), "b"),
+                with_id(id(k, "b"), "a"),
+                keep(k, "dir/"),
+            ]
         },
         &[
             ("a", Some("b")),
@@ -141,21 +118,15 @@ fn test_undo_swap() {
 fn test_undo_copy_and_create() {
     check_undo(
         |k| {
-            format!(
-                "\
-                :{} a\n\
-                :{} a2\n\
-                :{} b\n\
-                :{} dir/\n\
-                :{} dir2/\n\
-                new\n\
-                new_dir/nested/file\n",
-                id(k, "a"),
-                id(k, "a"),
-                id(k, "b"),
-                id(k, "dir"),
-                id(k, "dir")
-            )
+            vec![
+                keep(k, "a"),
+                with_id(id(k, "a"), "a2"),
+                keep(k, "b"),
+                keep(k, "dir/"),
+                with_id(id(k, "dir"), "dir2/"),
+                without_id("new"),
+                without_id("new_dir/nested/file"),
+            ]
         },
         &[
             ("a", Some("a")),
@@ -185,23 +156,11 @@ fn test_undo_move_into_other_dir() {
 
     // remove `a` here, and write it in `dir`
     let a = id(&koil, "a");
-    koil.update(&format!(
-        "\
-        :{} b\n\
-        >:{} dir/\n",
-        id(&koil, "b"),
-        id(&koil, "dir")
-    ))
-    .unwrap();
-    koil.update(&format!(
-        "\
-        :{} sub/\n\
-        :{} x\n\
-        :{a} a\n",
-        id(&koil, "sub"),
-        id(&koil, "x")
-    ))
-    .unwrap();
+    let entries = [keep(&koil, "b"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
+    koil.open("dir").unwrap();
+    let entries = [keep(&koil, "sub/"), keep(&koil, "x"), with_id(a, "a")];
+    koil.update(&entries).unwrap();
     koil.apply().unwrap();
     assert!(temp.path().join("dir/a").exists());
     assert!(!temp.path().join("a").exists());
@@ -217,25 +176,13 @@ fn test_undo_last_apply_first() {
     let mut koil = temp_koil(&temp);
 
     // delete `a`
-    koil.update(&format!(
-        "\
-        :{} b\n\
-        :{} dir/\n",
-        id(&koil, "b"),
-        id(&koil, "dir")
-    ))
-    .unwrap();
+    let entries = [keep(&koil, "b"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
     koil.apply().unwrap();
     let deleted = snapshot(temp.path());
     // rename `b` to `a`, so the second apply depends on the first one
-    koil.update(&format!(
-        "\
-        :{} a\n\
-        :{} dir/\n",
-        id(&koil, "b"),
-        id(&koil, "dir")
-    ))
-    .unwrap();
+    let entries = [with_id(id(&koil, "b"), "a"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
     koil.apply().unwrap();
     assert_eq!(
         Some("b".to_string()),
@@ -256,14 +203,8 @@ fn test_undo_never_overwrites() {
     let mut koil = temp_koil(&temp);
 
     // rename `b` to `c`, delete `a`, then make a new `a` outside of koil
-    koil.update(&format!(
-        "\
-        :{} c\n\
-        :{} dir/\n",
-        id(&koil, "b"),
-        id(&koil, "dir")
-    ))
-    .unwrap();
+    let entries = [with_id(id(&koil, "b"), "c"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
     koil.apply().unwrap();
     fs::write(temp.path().join("a"), "new a").unwrap();
 
@@ -297,15 +238,8 @@ fn test_undo_failed_apply() {
     let mut koil = temp_koil(&temp);
 
     // delete `a` and create `new`, but `new` appears before it is applied
-    koil.update(&format!(
-        "\
-        :{} b\n\
-        :{} dir/\n\
-        new\n",
-        id(&koil, "b"),
-        id(&koil, "dir")
-    ))
-    .unwrap();
+    let entries = [keep(&koil, "b"), keep(&koil, "dir/"), without_id("new")];
+    koil.update(&entries).unwrap();
     fs::write(temp.path().join("new"), "new").unwrap();
     assert!(matches!(
         koil.apply(),

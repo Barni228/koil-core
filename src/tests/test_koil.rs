@@ -1,13 +1,5 @@
 use super::*;
 use diff::Diff;
-use std::collections::HashMap;
-
-/// The unchanged `test_dir` listing
-const TEST_DIR_LISTING: &str = "\
-    :d0n6oe dir/\n\
-    :52updl file\n\
-    :tdffoi file2\n\
-    :75ra32 qwerty\n";
 
 /// Path to `s` inside `test_dir`
 fn test_path(s: &str) -> PathBuf {
@@ -18,127 +10,152 @@ fn test_path(s: &str) -> PathBuf {
 
 /// Koil with `test_dir` opened
 fn test_koil() -> Koil {
-    let mut koil = Koil::builder().show_settings(false).build();
+    let mut koil = Koil::default();
     koil.open("test_dir").unwrap();
     koil
 }
 
-/// Open `test_dir`, and update it with the unchanged listing + `extra`
-fn update_test_dir(extra: &str) -> Result<Koil, KoilError> {
+/// The unchanged `test_dir` listing
+fn test_dir_listing(koil: &Koil) -> Vec<Entry> {
+    vec![
+        keep(koil, "dir/"),
+        keep(koil, "file"),
+        keep(koil, "file2"),
+        keep(koil, "qwerty"),
+    ]
+}
+
+/// Open `test_dir`, and update it with the unchanged listing + new entries `extra`
+fn update_test_dir(extra: &[&str]) -> Result<Koil, UpdateError> {
     let mut koil = test_koil();
-    koil.update(&format!("{TEST_DIR_LISTING}{extra}"))?;
+    let mut entries = test_dir_listing(&koil);
+    entries.extend(extra.iter().map(|name| without_id(name)));
+    koil.update(&entries)?;
     Ok(koil)
 }
 
+/// The ID of `s` inside `test_dir`
+fn test_id(koil: &Koil, s: &str) -> Id {
+    koil.id_of(&test_path(s)).unwrap()
+}
+
+/// A diff, with paths relative to `test_dir`
+/// `with_id` has the path before and the paths after, and in `without_id` a trailing `/`
+/// marks a dir
 fn diff<const A: usize, const B: usize>(
-    with_id: [(usize, &str, &[&str]); A],
+    koil: &Koil,
+    with_id: [(&str, &[&str]); A],
     without_id: [&str; B],
 ) -> Diff {
-    let with: HashMap<usize, (PathBuf, Vec<PathBuf>)> =
-        HashMap::from_iter(with_id.into_iter().map(|(id, before, afters)| {
-            (
-                id,
-                (
-                    test_path(before),
-                    afters.iter().map(|&p| test_path(p)).collect(),
-                ),
-            )
-        }));
-
-    let without: HashMap<PathBuf, bool> = HashMap::from_iter(without_id.into_iter().map(|s| {
-        if let Some(stripped) = s.strip_suffix('/') {
-            (test_path(stripped), true)
-        } else {
-            (test_path(s), false)
-        }
-    }));
-
     Diff {
-        with_id: with,
-        without_id: without,
+        with_id: with_id
+            .into_iter()
+            .map(|(before, afters)| {
+                (
+                    test_id(koil, before).0 as usize,
+                    (
+                        test_path(before),
+                        afters.iter().map(|&p| test_path(p)).collect(),
+                    ),
+                )
+            })
+            .collect(),
+        without_id: without_id
+            .into_iter()
+            .map(|s| {
+                let (name, is_dir) = split_dir(s);
+                (test_path(name.to_str().unwrap()), is_dir)
+            })
+            .collect(),
     }
+}
+
+/// The error of each entry, as (entry, kind)
+fn errors(result: Result<Koil, UpdateError>) -> Vec<(usize, EntryErrorKind)> {
+    let err = result.expect_err("the update should fail");
+    err.errors.into_iter().map(|e| (e.entry, e.kind)).collect()
 }
 
 #[test]
 fn test_generated_diff_no_change() {
-    let koil = update_test_dir("").unwrap();
+    let koil = update_test_dir(&[]).unwrap();
     assert_eq!(Diff::default(), koil.diff);
 }
 
 #[test]
 fn test_generated_diff_add() {
-    let koil = update_test_dir("new").unwrap();
-    assert_eq!(diff([], ["new"]), koil.diff);
+    let koil = update_test_dir(&["new"]).unwrap();
+    assert_eq!(diff(&koil, [], ["new"]), koil.diff);
 }
 
 #[test]
 fn test_generated_diff_delete() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        :d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n",
-    )
-    .unwrap();
-    assert_eq!(diff([(2, "qwerty", &[])], []), koil.diff);
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+    ];
+    koil.update(&entries).unwrap();
+    assert_eq!(diff(&koil, [("qwerty", &[])], []), koil.diff);
 }
 
 #[test]
 fn test_generated_diff_rename() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        :d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        :75ra32 qwerty1\n",
-    )
-    .unwrap();
-    assert_eq!(diff([(2, "qwerty", &["qwerty1"])], []), koil.diff);
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        with_id(id(&koil, "qwerty"), "qwerty1"),
+    ];
+    koil.update(&entries).unwrap();
+    assert_eq!(diff(&koil, [("qwerty", &["qwerty1"])], []), koil.diff);
 }
 
 #[test]
 fn test_generated_diff_copy() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        :d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        :75ra32 qwerty\n\
-        :75ra32 qwerty2\n",
-    )
-    .unwrap();
-    assert_eq!(diff([(2, "qwerty", &["qwerty", "qwerty2"])], []), koil.diff);
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+        with_id(id(&koil, "qwerty"), "qwerty2"),
+    ];
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        diff(&koil, [("qwerty", &["qwerty", "qwerty2"])], []),
+        koil.diff
+    );
 }
 
 #[test]
 fn test_generated_diff_undo() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        :d0n6oe dir/\n\
-        :tdffoi file3\n\
-        :75ra32 poppy\n\
-        :75ra32 another\n\
-        new",
-    )
-    .unwrap();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file2"), "file3"),
+        with_id(id(&koil, "qwerty"), "poppy"),
+        with_id(id(&koil, "qwerty"), "another"),
+        without_id("new"),
+    ];
+    koil.update(&entries).unwrap();
 
     assert_eq!(
         diff(
+            &koil,
             [
-                (0, "file2", &["file3"]),
-                (1, "file", &[]),
-                (2, "qwerty", &["poppy", "another"])
+                ("file2", &["file3"]),
+                ("file", &[]),
+                ("qwerty", &["poppy", "another"])
             ],
             ["new"]
         ),
         koil.diff
     );
     // undo what I just did, and diff clears
-    koil.update(TEST_DIR_LISTING).unwrap();
+    koil.update(&test_dir_listing(&koil)).unwrap();
     assert_eq!(Diff::default(), koil.diff);
 }
 
@@ -146,229 +163,158 @@ fn test_generated_diff_undo() {
 fn test_generated_diff_copy_cross_dir() {
     // open test_dir, to load all the IDs
     let mut koil = test_koil();
+    let qwerty = id(&koil, "qwerty");
     // open the dir, to also load all of its IDs
     koil.open("dir").unwrap();
-    // f0djx0 is ID that I loaded from `dir`
-    koil.update(
-        "\
-        :f0djx0 inside\n",
-    )
-    .unwrap();
+    koil.update(&[keep(&koil, "inside")]).unwrap();
     assert_eq!(Diff::default(), koil.diff);
 
-    koil.update(
-        "\
-        :f0djx0 inside\n\
-        :75ra32 qwerty\n",
-    )
-    .unwrap();
+    koil.update(&[keep(&koil, "inside"), with_id(qwerty, "qwerty")])
+        .unwrap();
     assert_eq!(
-        diff([(2, "qwerty", &["qwerty", "dir/qwerty"])], []),
+        diff(&koil, [("qwerty", &["qwerty", "dir/qwerty"])], []),
         koil.diff
     );
 
-    koil.update(
-        "\
-        :f0djx0 inside\n",
-    )
-    .unwrap();
+    koil.update(&[keep(&koil, "inside")]).unwrap();
     assert_eq!(Diff::default(), koil.diff);
 }
 
 #[test]
 fn test_copy_then_delete_original() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        >:d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        :75ra32 qwerty\n",
-    )
-    .unwrap();
-    assert_eq!(Diff::default(), koil.diff);
-
-    koil.update(
-        "\
-        :f0djx0 inside\n\
-        :75ra32 qwerty\n",
-    )
-    .unwrap();
-
+    let qwerty = id(&koil, "qwerty");
+    koil.open("dir").unwrap();
+    koil.update(&[keep(&koil, "inside"), with_id(qwerty, "qwerty")])
+        .unwrap();
     assert_eq!(
-        diff([(2, "qwerty", &["qwerty", "dir/qwerty"])], []),
+        diff(&koil, [("qwerty", &["qwerty", "dir/qwerty"])], []),
         koil.diff
     );
 
     koil.open("..").unwrap();
     // delete qwerty
-    koil.update(
-        "\
-        >:d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n",
-    )
-    .unwrap();
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+    ];
+    koil.update(&entries).unwrap();
 
-    assert_eq!(diff([(2, "qwerty", &["dir/qwerty"])], []), koil.diff);
+    assert_eq!(diff(&koil, [("qwerty", &["dir/qwerty"])], []), koil.diff);
 }
 
 #[test]
 fn test_enter_new_dir() {
-    let mut koil = update_test_dir(">newdir/\n").unwrap();
+    let mut koil = update_test_dir(&["newdir/"]).unwrap();
+    let qwerty = id(&koil, "qwerty");
+    assert_eq!(None, koil.open("newdir").unwrap());
     assert_eq!(test_path("newdir"), koil.current_dir);
-    assert_eq!("", koil.listing());
-    assert_eq!(diff([], ["newdir/"]), koil.diff);
+    assert_eq!(Vec::<Entry>::new(), koil.listing());
+    assert_eq!(diff(&koil, [], ["newdir/"]), koil.diff);
 
     // copy qwerty into the new dir
-    koil.update(":75ra32 qwerty\n").unwrap();
-    assert_eq!(":75ra32 qwerty", koil.listing());
+    koil.update(&[with_id(qwerty, "qwerty")]).unwrap();
+    assert_eq!(vec![with_id(qwerty, "qwerty")], koil.listing());
     assert_eq!(
-        diff([(2, "qwerty", &["qwerty", "newdir/qwerty"])], ["newdir/"]),
+        diff(
+            &koil,
+            [("qwerty", &["qwerty", "newdir/qwerty"])],
+            ["newdir/"]
+        ),
         koil.diff
     );
 
     // go back, and delete the original, so it becomes a move
     koil.open("..").unwrap();
-    assert_eq!(format!("{TEST_DIR_LISTING}newdir/"), koil.listing());
-    koil.update(
-        "\
-        :d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        newdir/\n",
-    )
-    .unwrap();
+    let mut listing = test_dir_listing(&koil);
+    listing.push(without_id("newdir/"));
+    assert_eq!(listing, koil.listing());
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        without_id("newdir/"),
+    ];
+    koil.update(&entries).unwrap();
     assert_eq!(
-        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        diff(&koil, [("qwerty", &["newdir/qwerty"])], ["newdir/"]),
         koil.diff
     );
 }
 
 #[test]
-fn test_settings_made_up_dir() {
+fn test_open_made_up_dir() {
     let mut koil = test_koil();
     // `made/up` does not exist, and is not in the listing, so go as far as possible
-    let warning = koil
-        .update(&format!(
-            "\
-            ===\n\
-            {}\n\
-            ===\n\
-            {TEST_DIR_LISTING}",
-            test_path("dir/made/up").display()
-        ))
-        .unwrap();
     assert_eq!(
         Some(Warning::DirNotFound {
             requested: test_path("dir/made/up"),
             opened: test_path("dir"),
         }),
-        warning
+        koil.open(test_path("dir/made/up")).unwrap()
     );
     assert_eq!(test_path("dir"), koil.current_dir);
     assert_eq!(Diff::default(), koil.diff);
 }
 
 #[test]
-fn test_settings_enter_new_dir() {
-    let listing = format!("{TEST_DIR_LISTING}newdir/\n");
-    let with_settings = |dir: &str| {
-        format!(
-            "\
-            ===\n\
-            {}\n\
-            ===\n\
-            {listing}",
-            test_path(dir).display()
-        )
-    };
-
-    // a new dir written in the same listing can be entered
-    let mut koil = test_koil();
-
-    assert_eq!(None, koil.update(&with_settings("newdir")).unwrap());
-    assert_eq!(test_path("newdir"), koil.current_dir);
-    assert_eq!(diff([], ["newdir/"]), koil.diff);
-
-    // a new dir written in an earlier listing can be entered too,
-    // but a made up dir inside it is not created
-    let mut koil = test_koil();
-    koil.update(&listing).unwrap();
+fn test_open_made_up_dir_in_new_dir() {
+    // a new dir can be entered, but a made up dir inside it is not created
+    let mut koil = update_test_dir(&["newdir/"]).unwrap();
     assert_eq!(
         Some(Warning::DirNotFound {
             requested: test_path("newdir/made/up"),
             opened: test_path("newdir"),
         }),
-        koil.update(&with_settings("newdir/made/up")).unwrap()
+        koil.open(test_path("newdir/made/up")).unwrap()
     );
     assert_eq!(test_path("newdir"), koil.current_dir);
-    assert_eq!(diff([], ["newdir/"]), koil.diff);
+    assert_eq!(diff(&koil, [], ["newdir/"]), koil.diff);
 }
 
 #[test]
-fn test_enter_new_dir_same_as_create_then_enter() {
-    // enter the new dir right away
-    let one_step = update_test_dir(">newdir/\n").unwrap();
-
-    // create the new dir first, then enter it
-    let mut two_steps = update_test_dir("newdir/\n").unwrap();
-    assert_eq!(format!("{TEST_DIR_LISTING}newdir/"), two_steps.listing());
-    assert_eq!(diff([], ["newdir/"]), two_steps.diff);
-    two_steps
-        .update(&format!("{TEST_DIR_LISTING}>newdir/\n"))
-        .unwrap();
-
-    assert_eq!(diff([], ["newdir/"]), one_step.diff);
-    assert_eq!(diff([], ["newdir/"]), two_steps.diff);
-    assert_eq!(one_step.current_dir, two_steps.current_dir);
-    assert_eq!(one_step.listing(), two_steps.listing());
-}
-
-#[test]
-fn test_enter_new_file_fails() {
-    assert!(matches!(
-        update_test_dir(">newfile\n"),
-        Err(KoilError::NotADirectory(_))
-    ));
+fn test_open_new_file() {
+    // a new file is not a dir, so the dir it is in is opened
+    let mut koil = update_test_dir(&["newfile"]).unwrap();
+    assert_eq!(
+        Some(Warning::DirNotFound {
+            requested: test_path("newfile"),
+            opened: test_path(""),
+        }),
+        koil.open("newfile").unwrap()
+    );
 }
 
 // ── nested paths ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_nested_create_with_parent() {
-    let koil = update_test_dir(
-        "\
-        newdir/\n\
-        newdir/A",
-    )
-    .unwrap();
-    assert_eq!(diff([], ["newdir/", "newdir/A"]), koil.diff);
+    let koil = update_test_dir(&["newdir/", "newdir/A"]).unwrap();
+    assert_eq!(diff(&koil, [], ["newdir/", "newdir/A"]), koil.diff);
 }
 
 #[test]
 fn test_nested_create_without_parent() {
     // same as writing `newdir/` too
-    let koil = update_test_dir("newdir/A").unwrap();
-    assert_eq!(diff([], ["newdir/", "newdir/A"]), koil.diff);
+    let koil = update_test_dir(&["newdir/A"]).unwrap();
+    assert_eq!(diff(&koil, [], ["newdir/", "newdir/A"]), koil.diff);
 }
 
 #[test]
 fn test_nested_create_many() {
-    let mut koil = update_test_dir(
-        "\
-        newdir/A\n\
-        newdir/B",
-    )
-    .unwrap();
-    assert_eq!(diff([], ["newdir/", "newdir/A", "newdir/B"]), koil.diff);
+    let mut koil = update_test_dir(&["newdir/A", "newdir/B"]).unwrap();
+    assert_eq!(
+        diff(&koil, [], ["newdir/", "newdir/A", "newdir/B"]),
+        koil.diff
+    );
 
     // `newdir/` is shown here, and its files are shown inside it
-    assert_eq!(format!("{TEST_DIR_LISTING}newdir/"), koil.listing());
+    let mut listing = test_dir_listing(&koil);
+    listing.push(without_id("newdir/"));
+    assert_eq!(listing, koil.listing());
     koil.open("newdir").unwrap();
-    let mut listing: Vec<_> = koil.listing().lines().map(str::to_string).collect();
-    listing.sort();
-    assert_eq!(vec!["A", "B"], listing);
+    assert_eq!(vec![without_id("A"), without_id("B")], koil.listing());
 
     assert_eq!(
         vec![
@@ -382,36 +328,37 @@ fn test_nested_create_many() {
 
 #[test]
 fn test_nested_create_deep() {
-    let koil = update_test_dir("a/b/c/").unwrap();
-    assert_eq!(diff([], ["a/", "a/b/", "a/b/c/"]), koil.diff);
+    let koil = update_test_dir(&["a/b/c/"]).unwrap();
+    assert_eq!(diff(&koil, [], ["a/", "a/b/", "a/b/c/"]), koil.diff);
 }
 
 #[test]
 fn test_nested_create_in_existing_dir() {
     // `dir/` already exists, so only the file is created
-    let koil = update_test_dir("dir/A").unwrap();
-    assert_eq!(diff([], ["dir/A"]), koil.diff);
+    let koil = update_test_dir(&["dir/A"]).unwrap();
+    assert_eq!(diff(&koil, [], ["dir/A"]), koil.diff);
 }
 
 #[test]
 fn test_nested_move() {
     let mut koil = test_koil();
     // move qwerty into newdir
-    let listing = "\
-        :d0n6oe dir/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        :75ra32 newdir/qwerty\n";
-    koil.update(listing).unwrap();
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        with_id(id(&koil, "qwerty"), "newdir/qwerty"),
+    ];
+    koil.update(&entries).unwrap();
     assert_eq!(
-        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        diff(&koil, [("qwerty", &["newdir/qwerty"])], ["newdir/"]),
         koil.diff
     );
 
-    // the same listing again does not change anything
-    koil.update(listing).unwrap();
+    // the same entries again do not change anything
+    koil.update(&entries).unwrap();
     assert_eq!(
-        diff([(2, "qwerty", &["newdir/qwerty"])], ["newdir/"]),
+        diff(&koil, [("qwerty", &["newdir/qwerty"])], ["newdir/"]),
         koil.diff
     );
 }
@@ -419,45 +366,38 @@ fn test_nested_move() {
 #[test]
 fn test_nested_create_in_renamed_dir() {
     let mut koil = test_koil();
-    koil.update(
-        "\
-        :d0n6oe dir2/\n\
-        :52updl file\n\
-        :tdffoi file2\n\
-        :75ra32 qwerty\n\
-        dir2/A\n",
-    )
-    .unwrap();
+    let entries = [
+        with_id(id(&koil, "dir"), "dir2/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+        without_id("dir2/A"),
+    ];
+    koil.update(&entries).unwrap();
     // `dir2/` comes from the rename, so it is not created
-    assert_eq!(diff([(3, "dir", &["dir2"])], ["dir2/A"]), koil.diff);
+    assert_eq!(diff(&koil, [("dir", &["dir2"])], ["dir2/A"]), koil.diff);
 }
 
 #[test]
 fn test_nested_create_inside_file_fails() {
     // `file` exists, and is not a dir
-    assert!(matches!(
-        update_test_dir("file/A"),
-        Err(KoilError::NotADirectory(name)) if name == "file"
-    ));
+    assert_eq!(
+        vec![(4, EntryErrorKind::NotADirectory("file".into()))],
+        errors(update_test_dir(&["file/A"]))
+    );
     // `new` is a new file, and is not a dir
-    assert!(matches!(
-        update_test_dir(
-            "\
-            new\n\
-            new/A"
-        ),
-        Err(KoilError::NotADirectory(name)) if name == "new"
-    ));
+    assert_eq!(
+        vec![(5, EntryErrorKind::NotADirectory("new".into()))],
+        errors(update_test_dir(&["new", "new/A"]))
+    );
 }
 
 #[test]
 fn test_invalid_names_fail() {
-    for name in ["../A", "/A", "./A", "a/../b", "a/./b"] {
-        assert!(
-            matches!(
-                update_test_dir(&format!("{name}\n")),
-                Err(KoilError::InvalidName(_))
-            ),
+    for name in ["../A", "/A", "./A", "a/../b", "a/./b", ""] {
+        assert_eq!(
+            vec![(4, EntryErrorKind::InvalidName(name.into()))],
+            errors(update_test_dir(&[name])),
             "{name} should be invalid"
         );
     }
@@ -465,52 +405,101 @@ fn test_invalid_names_fail() {
 
 #[test]
 fn test_nested_duplicates_fail() {
-    let duplicates = [
-        "\
-        new/\n\
-        new\n",
-        "\
-        new/A\n\
-        new/A\n",
-        // `dir/` is already in the listing
-        "dir\n",
+    let duplicate = |path: &str, first| EntryErrorKind::Duplicate {
+        path: path.into(),
+        first,
+    };
+    assert_eq!(
+        vec![(5, duplicate("new", 4))],
+        errors(update_test_dir(&["new/", "new"]))
+    );
+    assert_eq!(
+        vec![(5, duplicate("new/A", 4))],
+        errors(update_test_dir(&["new/A", "new/A"]))
+    );
+    // `dir/` is already the first entry
+    assert_eq!(
+        vec![(4, duplicate("dir", 0))],
+        errors(update_test_dir(&["dir"]))
+    );
+}
+
+#[test]
+fn test_unknown_ids_fail() {
+    // `dir/inside` has an ID only once `dir` is opened
+    for unknown in [Id(4), Id(999), Id(u64::MAX)] {
+        let mut koil = test_koil();
+        let mut entries = test_dir_listing(&koil);
+        entries.push(with_id(unknown, "new"));
+        assert_eq!(
+            vec![(4, EntryErrorKind::UnknownId(unknown))],
+            errors(koil.update(&entries).map(|()| koil.clone()))
+        );
+    }
+}
+
+#[test]
+fn test_every_error_is_reported() {
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(Id(999), "x"),
+        without_id("../a"),
+        without_id("dir"),
+        keep(&koil, "file"),
+        without_id("file/B"),
+        keep(&koil, "qwerty"),
     ];
-    for extra in duplicates {
-        assert!(
-            matches!(update_test_dir(extra), Err(KoilError::DuplicatePath(_))),
-            "{extra:?} should be a duplicate"
-        );
-    }
-}
-
-#[test]
-fn test_ids_round_trip() {
-    let koil = test_koil();
-    for index in 0..4 {
-        assert_eq!(index, koil.id_to_index(&koil.to_id(index)).unwrap());
-    }
-}
-
-#[test]
-fn test_invalid_ids_fail() {
-    // Typos of `d0n6oe`, an ID not in the listing, and the old hex format
-    for id in ["d0n6of", "d0n6o", "d0n6oee", "D0N6OE", "f0djx0", "000003"] {
-        assert!(
-            matches!(
-                update_test_dir(&format!(":{id} new\n")),
-                Err(KoilError::InvalidID(_))
+    assert_eq!(
+        vec![
+            (1, EntryErrorKind::UnknownId(Id(999))),
+            (2, EntryErrorKind::InvalidName("../a".into())),
+            (
+                3,
+                EntryErrorKind::Duplicate {
+                    path: "dir".into(),
+                    first: 0
+                }
             ),
-            "{id} should be invalid"
-        );
+            (5, EntryErrorKind::NotADirectory("file".into())),
+        ],
+        errors(koil.update(&entries).map(|()| koil.clone()))
+    );
+}
+
+#[test]
+fn test_listing_ids_point_to_paths() {
+    let koil = test_koil();
+    for entry in koil.listing() {
+        let path = koil.path_of(entry.id.unwrap()).unwrap();
+        assert_eq!(test_path(entry.name.to_str().unwrap()), path);
+        assert_eq!(entry.id, koil.id_of(path));
     }
+    assert_eq!(None, koil.path_of(Id(999)));
+    assert_eq!(None, koil.id_of(&test_path("made/up")));
+}
+
+#[test]
+fn test_path_of_renamed_is_the_original() {
+    let mut koil = test_koil();
+    let qwerty = id(&koil, "qwerty");
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        with_id(qwerty, "renamed"),
+    ];
+    koil.update(&entries).unwrap();
+    assert!(koil.listing().contains(&with_id(qwerty, "renamed")));
+    assert_eq!(Some(test_path("qwerty").as_path()), koil.path_of(qwerty));
 }
 
 #[test]
 fn test_refresh() {
-    let mut koil = update_test_dir("new").unwrap();
+    let mut koil = update_test_dir(&["new"]).unwrap();
     koil.refresh().unwrap();
     assert_eq!(Diff::default(), koil.diff);
-    assert_eq!(TEST_DIR_LISTING.trim_end(), koil.listing());
+    assert_eq!(test_dir_listing(&koil), koil.listing());
 }
 
 #[test]
@@ -560,7 +549,7 @@ fn test_undo_is_saved() {
 
 #[test]
 fn test_undo_with_pending_changes_fails() {
-    let mut koil = update_test_dir("new").unwrap();
+    let mut koil = update_test_dir(&["new"]).unwrap();
     koil.push_undo(vec![Undo::Trash("a".into())]);
     assert!(matches!(koil.undo_steps(), Err(KoilError::PendingChanges)));
     assert!(matches!(koil.undo(), Err(KoilError::PendingChanges)));
@@ -578,6 +567,7 @@ fn test_invalid_update_changes_nothing() {
     let mut koil = test_koil();
     let before = koil.save_state();
     // `file` is deleted, before the invalid ID is found
-    assert!(koil.update(":d0n6oe dir/\n:zzzzzz new\n").is_err());
+    let entries = [keep(&koil, "dir/"), with_id(Id(999), "new")];
+    assert!(koil.update(&entries).is_err());
     assert_eq!(before, koil.save_state());
 }
