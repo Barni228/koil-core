@@ -122,14 +122,14 @@ fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let (a, b) = (a.symlink_metadata()?, b.symlink_metadata()?);
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
 #[cfg(not(unix))]
-fn same_file(_a: &Path, _b: &Path) -> io::Result<bool> {
+pub(crate) fn same_file(_a: &Path, _b: &Path) -> io::Result<bool> {
     Ok(false)
 }
 

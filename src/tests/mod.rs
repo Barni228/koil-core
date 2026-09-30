@@ -61,4 +61,5 @@ fn keep(koil: &Koil, name: &str) -> Entry {
 mod test_apply;
 mod test_diff;
 mod test_koil;
+mod test_names;
 mod test_planner;

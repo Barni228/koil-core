@@ -460,7 +460,7 @@ fn test_unknown_ids_fail() {
         entries.push(with_id(unknown, "new"));
         assert_eq!(
             vec![(4, EntryErrorKind::UnknownId(unknown))],
-            errors(koil.update(&entries).map(|()| koil.clone()))
+            errors(koil.update(&entries).map(|_| koil.clone()))
         );
     }
 }
@@ -490,7 +490,7 @@ fn test_every_error_is_reported() {
             ),
             (5, EntryErrorKind::NotADirectory("file".into())),
         ],
-        errors(koil.update(&entries).map(|()| koil.clone()))
+        errors(koil.update(&entries).map(|_| koil.clone()))
     );
 }
 
@@ -519,6 +519,219 @@ fn test_path_of_renamed_is_the_original() {
     koil.update(&entries).unwrap();
     assert!(koil.listing().contains(&with_id(qwerty, "renamed")));
     assert_eq!(Some(test_path("qwerty").as_path()), koil.path_of(qwerty));
+}
+
+// ── name warnings and errors ─────────────────────────────────────────────────
+
+/// Update `test_dir` with its unchanged listing + new entries `extra`, and return what it gives
+fn update_with(extra: &[&str]) -> Result<Vec<EntryWarning>, UpdateError> {
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries.extend(extra.iter().map(|name| without_id(name)));
+    koil.update(&entries)
+}
+
+fn entry_warning(entry: usize, kind: EntryWarningKind) -> EntryWarning {
+    EntryWarning { entry, kind }
+}
+
+#[test]
+fn test_name_warnings() {
+    assert_eq!(
+        vec![
+            entry_warning(
+                4,
+                EntryWarningKind::WindowsCharacter {
+                    name: "a:b".into(),
+                    chars: ":".into()
+                }
+            ),
+            entry_warning(6, EntryWarningKind::LeadingDash { name: "-x".into() }),
+        ],
+        update_with(&["a:b", "fine", "-x"]).unwrap()
+    );
+}
+
+#[test]
+fn test_name_warnings_for_new_dirs() {
+    // every part that does not exist yet is checked, but `dir` exists
+    assert_eq!(
+        vec![entry_warning(
+            4,
+            EntryWarningKind::LeadingDash { name: "-x".into() }
+        )],
+        update_with(&["dir/-x"]).unwrap()
+    );
+    assert_eq!(
+        vec![
+            entry_warning(4, EntryWarningKind::LeadingDash { name: "-y".into() }),
+            entry_warning(4, EntryWarningKind::LeadingDash { name: "-x".into() }),
+        ],
+        update_with(&["-x/-y"]).unwrap()
+    );
+}
+
+#[test]
+fn test_rename_warnings() {
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        with_id(id(&koil, "file2"), "dir/file2"),
+        with_id(id(&koil, "qwerty"), "q$"),
+    ];
+    assert_eq!(
+        vec![entry_warning(
+            3,
+            EntryWarningKind::ShellCharacter {
+                name: "q$".into(),
+                chars: "$".into()
+            }
+        )],
+        koil.update(&entries).unwrap()
+    );
+}
+
+#[test]
+fn test_existing_names_do_not_warn() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("-a:b"), "").unwrap();
+    let mut koil = Koil::default();
+    koil.open(temp.path()).unwrap();
+    assert_eq!(
+        Vec::<EntryWarning>::new(),
+        koil.update(&koil.listing()).unwrap()
+    );
+    // a copy has a new name, but its name is fine
+    let mut entries = koil.listing();
+    entries.push(with_id(id(&koil, "-a:b"), "fine"));
+    assert_eq!(Vec::<EntryWarning>::new(), koil.update(&entries).unwrap());
+}
+
+#[test]
+fn test_name_errors() {
+    let errors = |result: Result<Vec<EntryWarning>, UpdateError>| {
+        let err = result.expect_err("the update should fail");
+        err.errors
+            .into_iter()
+            .map(|e| (e.entry, e.kind))
+            .collect::<Vec<_>>()
+    };
+    let control = |name: &str| EntryErrorKind::ControlCharacter {
+        name: name.into(),
+        char: '\t',
+    };
+    assert_eq!(vec![(4, control("a\tb"))], errors(update_with(&["a\tb"])));
+    assert_eq!(vec![(4, control("a\tb"))], errors(update_with(&["a\tb/x"])));
+}
+
+#[test]
+fn test_update_error_has_warnings() {
+    let err = update_with(&["-x", "a\tb"]).unwrap_err();
+    assert_eq!(1, err.errors.len());
+    assert_eq!(
+        vec![entry_warning(
+            4,
+            EntryWarningKind::LeadingDash { name: "-x".into() }
+        )],
+        err.warnings
+    );
+}
+
+#[test]
+fn test_check_changes_nothing() {
+    let koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries.push(without_id("-x"));
+    assert_eq!(1, koil.check(&entries).unwrap().len());
+    assert_eq!(Diff::default(), koil.diff);
+
+    entries.push(without_id("a\tb"));
+    assert!(koil.check(&entries).is_err());
+}
+
+#[test]
+fn test_already_exists() {
+    let exists = |name: &str| EntryErrorKind::AlreadyExists(name.into());
+    // `.hidden` is not shown, but it is there
+    assert_eq!(
+        vec![(4, exists(".hidden"))],
+        errors(update_test_dir(&[".hidden"]))
+    );
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        with_id(id(&koil, "qwerty"), ".hidden"),
+    ];
+    assert_eq!(
+        vec![(3, exists(".hidden"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // a glob only shows some files, but the others are still there
+    let mut koil = glob_koil("file*");
+    let entries = [keep(&koil, "file"), with_id(id(&koil, "file2"), "qwerty")];
+    assert_eq!(
+        vec![(1, exists("qwerty"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+}
+
+#[test]
+fn test_not_already_exists() {
+    // deleted, then created again
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+        without_id("file"),
+    ];
+    koil.update(&entries).unwrap();
+
+    // swapped
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file"), "file2"),
+        with_id(id(&koil, "file2"), "file"),
+        keep(&koil, "qwerty"),
+    ];
+    koil.update(&entries).unwrap();
+
+    // a dir that is already there (but hidden), since `mkdir -p` does nothing to it
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join(".cache")).unwrap();
+    let mut koil = Koil::default();
+    koil.open(temp.path()).unwrap();
+    koil.update(&[without_id(".cache/")]).unwrap();
+    // but not a file
+    assert_eq!(
+        vec![(0, EntryErrorKind::AlreadyExists(".cache".into()))],
+        errors(koil.update(&[without_id(".cache")]).map(|_| koil.clone()))
+    );
+}
+
+#[test]
+fn test_already_exists_ignoring_case() {
+    // only on filesystems that ignore case, like the default one on macOS
+    if !test_path("FILE").exists() {
+        return;
+    }
+    let exists = EntryErrorKind::AlreadyExists("FILE".into());
+    assert_eq!(vec![(4, exists)], errors(update_test_dir(&["FILE"])));
+
+    // but a rename that only changes the case is fine
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file"), "FILE"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    koil.update(&entries).unwrap();
 }
 
 // ── hidden entries ───────────────────────────────────────────────────────────

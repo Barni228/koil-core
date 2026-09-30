@@ -2,10 +2,8 @@
 
 - [ ] Allow commands to be entered in the settings box
 - [ ] Allow rejecting some actions while keeping others (in confirm dialog)
-- [ ] Allow having BOTH glob AND regex in one expression
 - [ ] Allow creating many files with `file{1,2,3}` syntax
 - [ ] Allow creating many files with `file{1..3}` syntax
-- [ ] Warn user about creating files with weird names (like `:^&<here>`)
 - [ ] Allow different sorting
 - [ ] Allow updating listing on save
 - [ ] Add a way to open files from koil
@@ -14,8 +12,13 @@
 - [ ] Handle cases where file system changes while this is still running (open koil, then create new file)
 - [ ] Publish to crates.io
 
+## Not Planned
+
+- [ ] Allow having BOTH glob AND regex in one expression
+
 ## Done
 
+- [x] Warn user about creating files with weird names (like `:^&<here>`)
 - [x] Allow entering a regex pattern, so like glob but its regex (`regex=true` in the CLI header)
 - [x] Optionally respect `.gitignore` (`gitignore=true` in the CLI header), so `**/*.rs` skips `target/`
 - [x] Allow entering a glob pattern, to see every file with matching path (`**/*.rs`)

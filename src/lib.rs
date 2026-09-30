@@ -1,4 +1,4 @@
-use crate::apply::Undo;
+use crate::apply::{Undo, same_file};
 use crate::diff::Diff;
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
@@ -11,6 +11,7 @@ use typed_builder::TypedBuilder;
 
 pub mod apply;
 pub mod diff;
+mod names;
 pub mod planner;
 pub mod trash;
 
@@ -285,6 +286,9 @@ pub enum OpenError {
 pub struct UpdateError {
     /// Every problem that was found, in the order of the entries
     pub errors: Vec<EntryError>,
+    /// Every warning that was found, in the order of the entries, like [`Koil::update`] returns
+    /// when it works
+    pub warnings: Vec<EntryWarning>,
 }
 
 /// A problem with one of the entries given to [`Koil::update`]
@@ -317,6 +321,65 @@ pub enum EntryErrorKind {
     /// A parent of the entry is a file, so nothing can be inside it
     #[error("`{}` is not a directory", .0.display())]
     NotADirectory(PathBuf),
+
+    /// Something that is not deleted or moved away is already at this path, maybe hidden or
+    /// ignored, or with a name that only differs in case on a filesystem that ignores case
+    #[error("`{}` already exists", .0.display())]
+    AlreadyExists(PathBuf),
+
+    /// A part of the name is longer than most filesystems allow
+    #[error("`{name}` is {len} bytes long, but a name can be at most 255")]
+    NameTooLong { name: String, len: usize },
+
+    /// A part of the name has a control character, which breaks terminals and scripts
+    #[error("`{}` has the control character {char:?}", name.escape_debug())]
+    ControlCharacter { name: String, char: char },
+}
+
+/// Something about one of the entries given to [`Koil::update`] that is not recommended, but
+/// does not stop the update
+/// Only names that do not exist yet are checked
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Entry {entry}: {kind}")]
+pub struct EntryWarning {
+    /// Index of the entry in the entries given to [`Koil::update`]
+    pub entry: usize,
+    pub kind: EntryWarningKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EntryWarningKind {
+    #[error("`{name}` has `{chars}`, which can not be used in names on Windows")]
+    WindowsCharacter { name: String, chars: String },
+
+    #[error("`{name}` has `{chars}`, which must be quoted in a shell")]
+    ShellCharacter { name: String, chars: String },
+
+    /// Like `CON` or `nul.txt`
+    #[error("`{name}` is a reserved name on Windows")]
+    WindowsReservedName { name: String },
+
+    #[error("`{name}` has emoji, which some programs and terminals do not show well")]
+    Emoji { name: String },
+
+    /// An invisible character, or one that looks like a different one, like a no-break space
+    #[error(
+        "`{}` has {char:?}, which is invisible, or looks like a different character",
+        name.escape_debug()
+    )]
+    UnusualCharacter { name: String, char: char },
+
+    #[error("`{name}` starts or ends with a space, which is easy to miss")]
+    SpaceAtEdge { name: String },
+
+    #[error("`{name}` ends with `.`, which Windows removes")]
+    TrailingDot { name: String },
+
+    #[error("`{name}` starts with `-`, so commands can read it as an option")]
+    LeadingDash { name: String },
+
+    #[error("`{name}` is not valid UTF-8")]
+    NotUtf8 { name: String },
 }
 
 fn join_lines(errors: &[EntryError]) -> String {
@@ -514,15 +577,23 @@ impl Koil {
     /// [`Entry::parent`] is ignored, it can only be opened
     /// Changes made in the listings of other dirs are kept
     /// If any entry is invalid, nothing is changed, and every problem is returned
-    pub fn update(&mut self, entries: &[Entry]) -> Result<(), UpdateError> {
+    /// Returns warnings about names that can be used, but are not recommended
+    pub fn update(&mut self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
         let mut updated = self.clone();
-        let mut errors = updated.update_entries(entries);
+        let (mut errors, mut warnings) = updated.update_entries(entries);
+        errors.sort_by_key(|e| e.entry);
+        warnings.sort_by_key(|w| w.entry);
         if !errors.is_empty() {
-            errors.sort_by_key(|e| e.entry);
-            return Err(UpdateError { errors });
+            return Err(UpdateError { errors, warnings });
         }
         *self = updated;
-        Ok(())
+        Ok(warnings)
+    }
+
+    /// What [`Koil::update`] would return for `entries`, without changing anything
+    /// A frontend can use it to show problems while user is still editing
+    pub fn check(&self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
+        self.clone().update(entries)
     }
 
     /// The actions that [`Koil::apply`] would run to do what user did, in order
@@ -814,8 +885,8 @@ impl Koil {
     }
 
     /// See [`Koil::update`]
-    /// Returns every problem found, if there are any, `self` is left half updated
-    fn update_entries(&mut self, entries: &[Entry]) -> Vec<EntryError> {
+    /// Returns every error and warning found, if there are errors, `self` is left half updated
+    fn update_entries(&mut self, entries: &[Entry]) -> (Vec<EntryError>, Vec<EntryWarning>) {
         let mut errors = Vec::new();
         let mut error = |entry, kind| errors.push(EntryError { entry, kind });
 
@@ -876,14 +947,14 @@ impl Koil {
             }
         }
 
-        // every (entry, path) written in this listing, to check its parents later
+        // every (entry, path, index of its ID) written in this listing, to check them later
         let mut written = Vec::new();
 
         // Creates
         for (i, path, is_dir) in without_id {
             let path = self.current_dir.join(path);
             self.diff.without_id.insert(path.clone(), is_dir);
-            written.push((i, path));
+            written.push((i, path, None));
         }
 
         // Renames / Copy
@@ -917,21 +988,64 @@ impl Koil {
             for (i, path) in names {
                 let path = self.current_dir.join(path);
                 self.diff.push_after(index, path.clone());
-                written.push((i, path));
+                written.push((i, path, Some(index)));
             }
         }
 
-        // `dir/A` also means create `dir/`, if it does not exist yet, so it can not be a file
-        for (i, path) in written {
+        let mut warnings = Vec::new();
+        for (i, path, index) in written {
+            let mut error = |kind| errors.push(EntryError { entry: i, kind });
+            // `dir/A` also means create `dir/`, if it does not exist yet, so it can not be a file
             if let Err(parent) = self.check_parents(&path) {
-                errors.push(EntryError {
-                    entry: i,
-                    kind: EntryErrorKind::NotADirectory(parent),
-                });
+                error(EntryErrorKind::NotADirectory(parent));
+            }
+            // the name did not change
+            if index.is_some_and(|index| self.ids[index] == path) {
+                continue;
+            }
+            if self.taken(&path, index) {
+                error(EntryErrorKind::AlreadyExists(self.name(&path)));
+            }
+            for problem in self.new_names(&path).flat_map(names::check) {
+                match problem {
+                    names::Problem::Error(kind) => error(kind),
+                    names::Problem::Warning(kind) => {
+                        warnings.push(EntryWarning { entry: i, kind });
+                    }
+                }
             }
         }
 
-        errors
+        (errors, warnings)
+    }
+
+    /// Whether something is at `path` on disk, which is not deleted or moved away in
+    /// [`Koil::diff`], so `path` can not be created there
+    /// `index` is the ID of the entry that is written at `path`, if it has one
+    fn taken(&self, path: &Path, index: Option<usize>) -> bool {
+        if path.symlink_metadata().is_err() {
+            return false;
+        }
+        let same = |a: &Path| a == path || same_file(a, path).unwrap_or(false);
+        // `mkdir -p` does nothing to a dir that is already there
+        let new_dir = self.diff.without_id.get(path) == Some(&true);
+        // a rename that only changes the case, on a filesystem that ignores case
+        let renamed = index.is_some_and(|index| same(&self.ids[index]));
+        let moved_away = self
+            .diff
+            .with_id
+            .values()
+            .any(|(before, afters)| same(before) && !afters.iter().any(|a| a == path));
+        !(renamed || moved_away || new_dir && path.is_dir())
+    }
+
+    /// Every part of `path` (inside [`Koil::current_dir`]) that is not on disk yet, so it is a
+    /// new name
+    fn new_names<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a std::ffi::OsStr> {
+        path.ancestors()
+            .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir)
+            .filter(|p| p.symlink_metadata().is_err())
+            .filter_map(Path::file_name)
     }
 
     /// Check that no parent of `path` (inside [`Koil::current_dir`]) is a file, on disk or
