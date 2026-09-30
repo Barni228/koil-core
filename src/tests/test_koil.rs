@@ -526,7 +526,10 @@ fn test_path_of_renamed_is_the_original() {
 /// Koil with `test_dir` opened, and hidden entries shown
 fn hidden_koil() -> Koil {
     let mut koil = Koil::builder()
-        .settings(Settings { show_hidden: true })
+        .settings(Settings {
+            show_hidden: true,
+            ..Settings::default()
+        })
         .build();
     koil.open("test_dir").unwrap();
     koil
@@ -566,7 +569,11 @@ fn test_set_show_hidden() {
     let mut koil = test_koil();
     assert_eq!(
         None,
-        koil.set_settings(Settings { show_hidden: true }).unwrap()
+        koil.set_settings(Settings {
+            show_hidden: true,
+            ..Settings::default()
+        })
+        .unwrap()
     );
     assert_eq!(hidden_listing(&koil), koil.listing());
     koil.set_settings(Settings::default()).unwrap();
@@ -637,7 +644,13 @@ fn test_new_hidden_is_shown() {
 fn test_settings_are_saved() {
     let koil = hidden_koil();
     let loaded = Koil::load_state(&koil.save_state()).unwrap();
-    assert_eq!(&Settings { show_hidden: true }, loaded.settings());
+    assert_eq!(
+        &Settings {
+            show_hidden: true,
+            ..Settings::default()
+        },
+        loaded.settings()
+    );
 }
 
 // ── globs ────────────────────────────────────────────────────────────────────
@@ -658,7 +671,7 @@ fn keep_all(koil: &Koil, names: &[&str]) -> Vec<Entry> {
 fn test_glob_open() {
     let koil = glob_koil("**/*");
     assert_eq!(test_path(""), koil.current_dir());
-    assert_eq!(Some("**/*"), koil.glob());
+    assert_eq!(Some("**/*"), koil.pattern().map(Pattern::as_str));
     assert_eq!(test_path("**/*"), koil.location());
     // only files, and names are relative to the base dir
     assert_eq!(
@@ -751,7 +764,7 @@ fn test_glob_edit_seen_in_dir() {
     koil.update(&entries).unwrap();
 
     koil.open(test_path("dir")).unwrap();
-    assert_eq!(None, koil.glob());
+    assert_eq!(None, koil.pattern().map(Pattern::as_str));
     assert_eq!(vec![with_id(inside, "renamed")], koil.listing());
 }
 
@@ -785,7 +798,7 @@ fn test_glob_missing_base() {
         }),
         koil.open("made/up/*").unwrap()
     );
-    assert_eq!(None, koil.glob());
+    assert_eq!(None, koil.pattern().map(Pattern::as_str));
     assert_eq!(test_dir_listing(&koil), koil.listing());
 }
 
@@ -811,9 +824,9 @@ fn test_glob_like_dir_name() {
 
     // an existing dir is never a glob
     koil.open(temp.path().join("a[1]")).unwrap();
-    assert_eq!(None, koil.glob());
+    assert_eq!(None, koil.pattern().map(Pattern::as_str));
     koil.open(temp.path().join("a[1]/*")).unwrap();
-    assert_eq!(Some("*"), koil.glob());
+    assert_eq!(Some("*"), koil.pattern().map(Pattern::as_str));
     assert_eq!(keep_all(&koil, &["x"]), koil.listing());
 }
 
@@ -821,9 +834,310 @@ fn test_glob_like_dir_name() {
 fn test_glob_kept_on_refresh() {
     let mut koil = glob_koil("*");
     koil.refresh().unwrap();
-    assert_eq!(Some("*"), koil.glob());
+    assert_eq!(Some("*"), koil.pattern().map(Pattern::as_str));
     let loaded = Koil::load_state(&koil.save_state()).unwrap();
-    assert_eq!(Some("*"), loaded.glob());
+    assert_eq!(Some("*"), loaded.pattern().map(Pattern::as_str));
+}
+
+// ── regex ────────────────────────────────────────────────────────────────────
+
+fn regex() -> Settings {
+    Settings {
+        regex: true,
+        ..Settings::default()
+    }
+}
+
+/// Koil with the regex `pattern` opened inside `test_dir`
+fn regex_koil(pattern: &str) -> Koil {
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open("test_dir").unwrap();
+    assert_eq!(None, koil.open(pattern).unwrap());
+    koil
+}
+
+#[test]
+fn test_regex_open() {
+    let koil = regex_koil(".*");
+    assert_eq!(test_path(""), koil.current_dir());
+    assert_eq!(Some(&Pattern::Regex(".*".into())), koil.pattern());
+    assert_eq!(test_path(".*"), koil.location());
+    // `.*` matches `/` too, but still only files are shown
+    assert_eq!(
+        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        koil.listing()
+    );
+}
+
+#[test]
+fn test_regex_patterns() {
+    let regex_names = |regex: &str| -> Vec<PathBuf> {
+        let koil = regex_koil(regex);
+        koil.listing().into_iter().map(|e| e.name).collect()
+    };
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into(), "qwerty".into()],
+        regex_names("[^/]*")
+    );
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into()],
+        regex_names(r"file\d?")
+    );
+    assert_eq!(
+        vec![PathBuf::from("file"), "qwerty".into()],
+        regex_names("(file|qwerty)")
+    );
+    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d.*"));
+    // the whole path must match
+    assert_eq!(Vec::<PathBuf>::new(), regex_names("il."));
+}
+
+#[test]
+fn test_expand_commas() {
+    let cases = [
+        (r",*\.rs", r"[^/]*\.rs"),
+        // escaped
+        (r"a\,b", r"a\,b"),
+        (r"a\\,b", r"a\\[^/]b"),
+        // repetitions and classes keep their `,`
+        ("a{1,2},", "a{1,2}[^/]"),
+        ("[,a],", "[,a][^/]"),
+        ("[]],", "[]][^/]"),
+        ("[^],],", "[^],][^/]"),
+        ("[[:alpha:],],", "[[:alpha:],][^/]"),
+    ];
+    for (regex, expanded) in cases {
+        assert_eq!(expanded, expand_commas(regex), "{regex}");
+    }
+}
+
+#[test]
+fn test_regex_commas() {
+    let regex_names = |regex: &str| -> Vec<PathBuf> {
+        let koil = regex_koil(regex);
+        koil.listing().into_iter().map(|e| e.name).collect()
+    };
+    // `,` never matches `/`
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into(), "qwerty".into()],
+        regex_names(",*")
+    );
+    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d,*/,*"));
+    assert_eq!(Vec::<PathBuf>::new(), regex_names("d,*"));
+
+    // `\,` is a `,`
+    let temp = tempfile::tempdir().unwrap();
+    for file in ["a,b", "axb"] {
+        fs::write(temp.path().join(file), "").unwrap();
+    }
+    let mut koil = Koil::builder().settings(regex()).build();
+    let names =
+        |koil: &Koil| -> Vec<PathBuf> { koil.listing().into_iter().map(|e| e.name).collect() };
+    koil.open(temp.path().join(r"a\,b")).unwrap();
+    assert_eq!(vec![PathBuf::from("a,b")], names(&koil));
+    koil.open(temp.path().join("a,b")).unwrap();
+    assert_eq!(vec![PathBuf::from("a,b"), "axb".into()], names(&koil));
+}
+
+#[test]
+fn test_regex_edit() {
+    let mut koil = regex_koil("file.*");
+    let file2 = id(&koil, "file2");
+    koil.update(&[keep(&koil, "file"), with_id(file2, "dir/file2")])
+        .unwrap();
+    assert_eq!(diff(&koil, [("file2", &["dir/file2"])], []), koil.diff);
+}
+
+#[test]
+fn test_regex_invalid() {
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open("test_dir").unwrap();
+    assert!(matches!(
+        koil.open("(file"),
+        Err(OpenError::InvalidRegex { regex, .. }) if regex == "(file"
+    ));
+    // nothing changed
+    assert_eq!(None, koil.pattern());
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+}
+
+#[test]
+fn test_regex_dirs() {
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open("test_dir").unwrap();
+    // a path without special characters is a dir
+    assert_eq!(None, koil.open("dir").unwrap());
+    assert_eq!(None, koil.pattern());
+    assert_eq!(
+        Some(Warning::DirNotFound {
+            requested: test_path("dir/made/up"),
+            opened: test_path("dir"),
+        }),
+        koil.open("made/up").unwrap()
+    );
+
+    // an existing dir is never a regex, even with a `.` in its name
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("v1.0")).unwrap();
+    fs::write(temp.path().join("v1.0/x"), "").unwrap();
+    koil.open(temp.path().join("v1.0")).unwrap();
+    assert_eq!(None, koil.pattern());
+    koil.open(temp.path().join("v1.0/.*")).unwrap();
+    assert_eq!(keep_all(&koil, &["x"]), koil.listing());
+}
+
+#[test]
+fn test_regex_setting_keeps_open_pattern() {
+    let mut koil = glob_koil("**/*");
+    koil.set_settings(regex()).unwrap();
+    // the open glob stays a glob
+    assert_eq!(Some(&Pattern::Glob("**/*".into())), koil.pattern());
+    assert_eq!(
+        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        koil.listing()
+    );
+    // but opening it again reads it as a regex
+    assert!(matches!(
+        koil.open(koil.location()),
+        Err(OpenError::InvalidRegex { .. })
+    ));
+}
+
+// ── gitignore ────────────────────────────────────────────────────────────────
+
+/// A temp dir, with a `.gitignore` that ignores `target/` and `*.log`, and:
+/// `a.log`, `file`, `src/main.rs`, `src/debug.log`, `target/out`
+/// It is a git repo, only if `git` is true
+fn gitignore_temp_dir(git: bool) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    if git {
+        fs::create_dir(root.join(".git")).unwrap();
+    }
+    fs::create_dir(root.join("src")).unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        "\
+        target/\n\
+        *.log\n",
+    )
+    .unwrap();
+    for file in [
+        "a.log",
+        "file",
+        "src/main.rs",
+        "src/debug.log",
+        "target/out",
+    ] {
+        fs::write(root.join(file), "").unwrap();
+    }
+    temp
+}
+
+/// Koil with `location` opened inside `temp`
+fn temp_koil(temp: &tempfile::TempDir, settings: Settings, location: &str) -> Koil {
+    let mut koil = Koil::builder().settings(settings).build();
+    assert_eq!(None, koil.open(temp.path().join(location)).unwrap());
+    koil
+}
+
+/// The names in the listing, a trailing `/` marks a dir
+fn names(koil: &Koil) -> Vec<String> {
+    let name = |e: Entry| {
+        let slash = if e.is_dir { "/" } else { "" };
+        format!("{}{slash}", e.name.display())
+    };
+    koil.listing().into_iter().map(name).collect()
+}
+
+fn gitignore() -> Settings {
+    Settings {
+        respect_gitignore: true,
+        ..Settings::default()
+    }
+}
+
+#[test]
+fn test_gitignore_off_by_default() {
+    let temp = gitignore_temp_dir(true);
+    let koil = temp_koil(&temp, Settings::default(), "");
+    assert_eq!(vec!["src/", "target/", "a.log", "file"], names(&koil));
+    let koil = temp_koil(&temp, Settings::default(), "**/*");
+    assert_eq!(
+        vec![
+            "a.log",
+            "file",
+            "src/debug.log",
+            "src/main.rs",
+            "target/out"
+        ],
+        names(&koil)
+    );
+}
+
+#[test]
+fn test_gitignore() {
+    let temp = gitignore_temp_dir(true);
+    let koil = temp_koil(&temp, gitignore(), "");
+    assert_eq!(vec!["src/", "file"], names(&koil));
+    let koil = temp_koil(&temp, gitignore(), "**/*");
+    assert_eq!(vec!["file", "src/main.rs"], names(&koil));
+    // the `.gitignore` of the repo root is used in its subdirs too
+    let koil = temp_koil(&temp, gitignore(), "src");
+    assert_eq!(vec!["main.rs"], names(&koil));
+}
+
+#[test]
+fn test_gitignore_hides_git_dir() {
+    let temp = gitignore_temp_dir(true);
+    let settings = Settings {
+        show_hidden: true,
+        respect_gitignore: true,
+        ..Settings::default()
+    };
+    let koil = temp_koil(&temp, settings, "");
+    assert_eq!(vec!["../", "src/", ".gitignore", "file"], names(&koil));
+}
+
+#[test]
+fn test_gitignore_outside_repo() {
+    // like git, `.gitignore` does nothing outside a repo
+    let temp = gitignore_temp_dir(false);
+    let koil = temp_koil(&temp, gitignore(), "");
+    assert_eq!(vec!["src/", "target/", "a.log", "file"], names(&koil));
+}
+
+#[test]
+fn test_open_ignored_or_hidden_dir() {
+    // the open dir itself is shown, even if it is ignored or hidden
+    let temp = gitignore_temp_dir(true);
+    let koil = temp_koil(&temp, gitignore(), "target");
+    assert_eq!(vec!["out"], names(&koil));
+    fs::create_dir(temp.path().join(".dotdir")).unwrap();
+    fs::write(temp.path().join(".dotdir/x"), "").unwrap();
+    let koil = temp_koil(&temp, Settings::default(), ".dotdir");
+    assert_eq!(vec!["x"], names(&koil));
+}
+
+#[test]
+fn test_gitignore_keeps_changes() {
+    let temp = gitignore_temp_dir(true);
+    let mut koil = temp_koil(&temp, Settings::default(), "");
+    let log = id(&koil, "a.log");
+    let mut entries = koil.listing();
+    entries[2] = with_id(log, "b.log");
+    koil.update(&entries).unwrap();
+
+    // `b.log` is ignored, but it was renamed, so it is still shown and stays renamed
+    koil.set_settings(gitignore()).unwrap();
+    assert_eq!(vec!["src/", "b.log", "file"], names(&koil));
+    koil.update(&koil.listing()).unwrap();
+    let root = koil.current_dir().to_path_buf();
+    assert_eq!(
+        vec![Action::Rename(root.join("a.log"), root.join("b.log"))],
+        koil.compute_actions()
+    );
 }
 
 #[test]

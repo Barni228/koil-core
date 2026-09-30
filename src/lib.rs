@@ -1,12 +1,13 @@
 use crate::apply::Undo;
 use crate::diff::Diff;
 use globset::{GlobBuilder, GlobMatcher};
+use ignore::WalkBuilder;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
-use walkdir::WalkDir;
 
 pub mod apply;
 pub mod diff;
@@ -66,6 +67,70 @@ pub struct Settings {
     /// parent dir
     /// Hidden entries that were changed are always shown, so the change is not lost
     pub show_hidden: bool,
+
+    /// Hide paths that git ignores (`.gitignore` files, `.git/info/exclude`, and the global
+    /// excludes file), and the `.git` dir
+    /// Like git, it only works inside a git repo, and reads `.gitignore` files up to its root
+    /// Ignored entries that were changed are always shown, so the change is not lost
+    pub respect_gitignore: bool,
+
+    /// [`Koil::open`] reads patterns as regexes, instead of globs
+    /// A pattern that is already open stays as it is until something else is opened
+    pub regex: bool,
+}
+
+/// A pattern of the paths to show, relative to [`Koil::current_dir`]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pattern {
+    /// Like `**/*.rs`, where `*` never matches `/`
+    Glob(String),
+    /// Like `src/.*\.rs`, which must match the whole path
+    /// `,` means any character except `/` (like `.`, but within one dir), and `\,` is a `,`
+    Regex(String),
+}
+
+impl Pattern {
+    /// The pattern, as it was written
+    pub fn as_str(&self) -> &str {
+        match self {
+            Pattern::Glob(p) | Pattern::Regex(p) => p,
+        }
+    }
+
+    /// Whether `part` of a path has a special character of this kind of pattern
+    fn is_pattern(syntax_regex: bool, part: &str) -> bool {
+        match syntax_regex {
+            false => part.contains(['*', '?', '[', '{']),
+            true => part.contains([
+                '.', ',', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\',
+            ]),
+        }
+    }
+
+    fn matcher(&self) -> Result<Matcher, OpenError> {
+        match self {
+            Pattern::Glob(glob) => GlobBuilder::new(glob)
+                .literal_separator(true)
+                .build()
+                .map(|g| Matcher::Glob(g.compile_matcher()))
+                .map_err(|source| OpenError::InvalidGlob {
+                    glob: glob.clone(),
+                    source,
+                }),
+            Pattern::Regex(regex) => {
+                let invalid = |source| OpenError::InvalidRegex {
+                    regex: regex.clone(),
+                    source,
+                };
+                // checked as it was written first, so errors point at what user wrote
+                Regex::new(regex).map_err(invalid)?;
+                // the whole path must match
+                let whole = format!("^(?:{})$", expand_commas(regex));
+                let whole = Regex::new(&whole).map_err(invalid)?;
+                Ok(Matcher::Regex(whole))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -205,6 +270,13 @@ pub enum OpenError {
         #[source]
         source: globset::Error,
     },
+
+    #[error("`{regex}` is not a valid regex")]
+    InvalidRegex {
+        regex: String,
+        #[source]
+        source: regex::Error,
+    },
 }
 
 /// Why [`Koil::update`] rejected the entries, nothing was changed
@@ -281,13 +353,13 @@ pub struct Koil {
     current_listing: HashSet<usize>,
 
     #[builder(default, setter(skip))]
-    /// The currently open directory, or the base dir of [`Koil::glob`]
+    /// The currently open directory, or the base dir of [`Koil::pattern`]
     current_dir: PathBuf,
 
     #[builder(default, setter(skip))]
     #[serde(default)]
-    /// The open glob pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
-    glob: Option<String>,
+    /// The open pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
+    pattern: Option<Pattern>,
 
     #[builder(default, setter(skip))]
     /// Partial diff, which stores all changes made in other listings
@@ -307,64 +379,48 @@ impl Default for Koil {
 
 // Public functions
 impl Koil {
-    /// Open `location`, which is either a dir, or a glob pattern like `src/**/*.rs`
+    /// Open `location`, which is either a dir, or a pattern like `src/**/*.rs`, read as a glob,
+    /// or as a regex if [`Settings::regex`] is on
     /// If it is relative, it will be opened relative to [`Koil::current_dir`]
     /// A dir can also be a new dir from [`Koil::diff`] that does not exist yet,
     /// then it is opened with an empty listing
-    /// A glob shows every file (not dir) whose path matches it, relative to its base dir (the
-    /// dirs before the first part with `*`, `?`, `[` or `{`), and `*` never matches `/`
-    /// A path that is a dir is always opened as a dir, even if its name looks like a glob
-    /// If the dir (or the base dir of the glob) is neither on disk nor in the diff, the closest
-    /// parent that is gets opened as a dir
+    /// A pattern shows every file (not dir) whose path matches it, relative to its base dir:
+    /// the dirs before the first part with a special character (`*?[{` for a glob, and
+    /// `.,*+?()[]{}|^$\` for a regex). A glob's `*` never matches `/`, and a regex must match the
+    /// whole path, where `,` is any character except `/`
+    /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
+    /// If the dir (or the base dir of the pattern) is neither on disk nor in the diff, the
+    /// closest parent that is gets opened as a dir
     /// This never changes [`Koil::diff`], new dirs must be written in the listing
     /// Returns a warning, if the dir was not found and a parent was opened instead
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<Option<Warning>, OpenError> {
         let path = resolve(&self.current_dir.join(location))?;
-        let (base, glob) = match self.split_glob(&path) {
-            Some((base, glob)) => {
-                compile(&glob).map_err(|source| OpenError::InvalidGlob {
-                    glob: glob.clone(),
-                    source,
-                })?;
-                (base, Some(glob))
+        let (base, pattern) = match self.split_pattern(&path) {
+            Some((base, pattern)) => {
+                pattern.matcher()?;
+                (base, Some(pattern))
             }
             None => (path, None),
         };
-
-        let dir = base
-            .ancestors()
-            .find(|p| self.is_dir(p))
-            .ok_or(io::Error::from(io::ErrorKind::NotFound))?
-            .to_path_buf();
-        let found = dir == base;
-        let warning = (!found).then(|| Warning::DirNotFound {
-            requested: base,
-            opened: dir.clone(),
-        });
-
-        self.current_dir = dir;
-        // the glob is relative to its base dir, so it can not be used in another dir
-        self.glob = glob.filter(|_| found);
-        self.read_listing()?;
-        Ok(warning)
+        Ok(self.open_at(base, pattern)?)
     }
 
-    /// The currently open directory as an absolute path, or the base dir of [`Koil::glob`]
+    /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
     /// Names of entries are relative to it
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
     }
 
-    /// The open glob pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
-    pub fn glob(&self) -> Option<&str> {
-        self.glob.as_deref()
+    /// The open pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
+    pub fn pattern(&self) -> Option<&Pattern> {
+        self.pattern.as_ref()
     }
 
     /// What is open, as it can be given to [`Koil::open`] again:
-    /// [`Koil::current_dir`], joined with [`Koil::glob`] if there is one
+    /// [`Koil::current_dir`], joined with [`Koil::pattern`] if there is one
     pub fn location(&self) -> PathBuf {
-        match &self.glob {
-            Some(glob) => self.current_dir.join(glob),
+        match &self.pattern {
+            Some(pattern) => self.current_dir.join(pattern.as_str()),
             None => self.current_dir.clone(),
         }
     }
@@ -603,32 +659,43 @@ impl Koil {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(None);
         }
-        match self.open(self.location()) {
-            Ok(warning) => Ok(warning),
-            Err(OpenError::Io(err)) => Err(err),
-            Err(OpenError::InvalidGlob { .. }) => unreachable!("the glob was valid when opened"),
-        }
+        // not parsed again, so a pattern stays a glob or a regex, even if the settings changed
+        self.open_at(self.current_dir.clone(), self.pattern.clone())
     }
 
-    /// Read [`Koil::current_listing`] for the open dir or glob from the filesystem
+    /// Open `pattern` (a valid one) inside `base`, or just `base` if there is no pattern
+    /// See [`Koil::open`]
+    fn open_at(&mut self, base: PathBuf, pattern: Option<Pattern>) -> io::Result<Option<Warning>> {
+        let dir = base
+            .ancestors()
+            .find(|p| self.is_dir(p))
+            .ok_or(io::ErrorKind::NotFound)?
+            .to_path_buf();
+        let found = dir == base;
+        let warning = (!found).then(|| Warning::DirNotFound {
+            requested: base,
+            opened: dir.clone(),
+        });
+
+        self.current_dir = dir;
+        // the pattern is relative to its base dir, so it can not be used in another dir
+        self.pattern = pattern.filter(|_| found);
+        self.read_listing()?;
+        Ok(warning)
+    }
+
+    /// Read [`Koil::current_listing`] for the open dir or pattern from the filesystem
     fn read_listing(&mut self) -> io::Result<()> {
         self.current_listing.clear();
         let view = self.view();
 
-        let mut paths = Vec::new();
-        if self.current_dir.is_dir() {
-            match &view.glob {
-                None => {
-                    for item in fs::read_dir(&self.current_dir)? {
-                        paths.push(item?.path());
-                    }
-                }
-                Some(glob) => paths = self.walk_glob(glob)?,
-            }
-        }
-
+        let paths = match self.current_dir.is_dir() {
+            true => self.walk(&view)?,
+            // a new dir that is not created yet
+            false => Vec::new(),
+        };
         for path in paths {
-            if self.ignore.contains(&path) || (is_hidden(&path) && !self.settings.show_hidden) {
+            if self.ignore.contains(&path) {
                 continue;
             }
             let index = self.ids.iter().position(|p| p == &path);
@@ -650,35 +717,39 @@ impl Koil {
         Ok(())
     }
 
-    /// Every file inside [`Koil::current_dir`] that matches `glob`
-    /// Hidden dirs are skipped if hidden entries are not shown, and so are dirs that can not
-    /// be read
-    fn walk_glob(&self, glob: &GlobMatcher) -> io::Result<Vec<PathBuf>> {
-        let pattern = glob.glob().glob();
-        // without `**`, a glob can only match paths with as many parts as it has
-        let max_depth = match pattern.contains("**") {
-            true => usize::MAX,
-            false => Path::new(pattern).components().count(),
+    /// Every path on disk that `view` shows, without hidden entries if they are not shown,
+    /// and without ignored paths if [`Settings::respect_gitignore`] is on
+    /// Fails if [`Koil::current_dir`] can not be read, but dirs inside it that can not be read
+    /// are skipped
+    fn walk(&self, view: &View) -> io::Result<Vec<PathBuf>> {
+        fs::read_dir(&self.current_dir)?;
+        let max_depth = match &self.pattern {
+            None => Some(1),
+            // without `**`, a glob can only match paths with as many parts as it has
+            Some(Pattern::Glob(glob)) if !glob.contains("**") => {
+                Some(Path::new(glob).components().count())
+            }
+            Some(_) => None,
         };
-        let show_hidden = self.settings.show_hidden;
-        let walk = WalkDir::new(&self.current_dir)
-            .min_depth(1)
+        let gitignore = self.settings.respect_gitignore;
+        let walk = WalkBuilder::new(&self.current_dir)
             .max_depth(max_depth)
-            .into_iter()
-            .filter_entry(|item| show_hidden || !is_hidden(item.path()));
+            .hidden(!self.settings.show_hidden)
+            // only what git ignores, not the `.ignore` files of ripgrep
+            .ignore(false)
+            .git_ignore(gitignore)
+            .git_global(gitignore)
+            .git_exclude(gitignore)
+            .parents(gitignore)
+            // git never shows its own dir
+            .filter_entry(move |item| !(gitignore && item.file_name() == ".git"))
+            .build();
 
         let mut paths = Vec::new();
-        for item in walk {
-            let item = match item {
-                Ok(item) => item,
-                // only fail if the base dir itself can not be read
-                Err(err) if err.depth() == 0 => return Err(err.into()),
-                Err(_) => continue,
-            };
-            let path = item.path();
-            if !item.file_type().is_dir()
-                && glob.is_match(path.strip_prefix(&self.current_dir).unwrap())
-            {
+        for item in walk.flatten() {
+            let is_dir = item.file_type().is_some_and(|t| t.is_dir());
+            // the walk starts with the dir itself
+            if item.depth() > 0 && view.contains(item.path(), is_dir) {
                 paths.push(item.into_path());
             }
         }
@@ -689,8 +760,8 @@ impl Koil {
     fn view(&self) -> View {
         View {
             base: self.current_dir.clone(),
-            glob: (self.glob.as_deref())
-                .map(|g| compile(g).expect("the glob was valid when opened")),
+            matcher: (self.pattern.as_ref())
+                .map(|p| p.matcher().expect("the pattern was valid when opened")),
         }
     }
 
@@ -704,11 +775,12 @@ impl Koil {
         path.is_dir() || self.diff.creates_dir(path)
     }
 
-    /// Split `path` into its base dir, and the glob relative to it
-    /// `None` if it is not a glob, because no part of it after the longest part that is a dir
-    /// has `*`, `?`, `[` or `{`
-    fn split_glob(&self, path: &Path) -> Option<(PathBuf, String)> {
-        // so a dir with a name like `a[1]` is not taken for a glob
+    /// Split `path` into its base dir, and the pattern relative to it, which is a glob, or a
+    /// regex if [`Settings::regex`] is on
+    /// `None` if it is not a pattern, because no part of it after the longest part that is a
+    /// dir has a special character
+    fn split_pattern(&self, path: &Path) -> Option<(PathBuf, Pattern)> {
+        // so a dir with a name like `a[1]` is not taken for a pattern
         let dir = path.ancestors().find(|p| self.is_dir(p))?;
         let parts: Vec<String> = path
             .strip_prefix(dir)
@@ -716,11 +788,15 @@ impl Koil {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .collect();
-        let first = parts
-            .iter()
-            .position(|p| p.contains(['*', '?', '[', '{']))?;
+        let regex = self.settings.regex;
+        let first = parts.iter().position(|p| Pattern::is_pattern(regex, p))?;
         let base = dir.join(parts[..first].iter().collect::<PathBuf>());
-        Some((base, parts[first..].join("/")))
+        let pattern = parts[first..].join("/");
+        let pattern = match regex {
+            true => Pattern::Regex(pattern),
+            false => Pattern::Glob(pattern),
+        };
+        Some((base, pattern))
     }
 
     /// Fail if there are changes that are not applied yet
@@ -885,37 +961,41 @@ impl Koil {
 
 /// Which paths a listing shows
 struct View {
-    /// The open dir, or the base dir of the glob
+    /// The open dir, or the base dir of the pattern
     base: PathBuf,
-    glob: Option<GlobMatcher>,
+    matcher: Option<Matcher>,
 }
 
 impl View {
     /// Whether `path` is shown in the listing
     fn contains(&self, path: &Path, is_dir: bool) -> bool {
-        match &self.glob {
+        match &self.matcher {
             None => path.parent() == Some(&self.base),
-            // a glob only shows files
-            Some(glob) => {
+            // a pattern only shows files
+            Some(matcher) => {
                 !is_dir
                     && path
                         .strip_prefix(&self.base)
-                        .is_ok_and(|p| glob.is_match(p))
+                        .is_ok_and(|p| matcher.is_match(p))
             }
         }
     }
 }
 
-/// A glob pattern, where `*` never matches `/`
-fn compile(glob: &str) -> Result<GlobMatcher, globset::Error> {
-    let glob = GlobBuilder::new(glob).literal_separator(true).build()?;
-    Ok(glob.compile_matcher())
+/// A compiled [`Pattern`]
+enum Matcher {
+    Glob(GlobMatcher),
+    Regex(Regex),
 }
 
-/// Whether the name of `path` starts with `.`
-fn is_hidden(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+impl Matcher {
+    /// Whether `path`, relative to the base dir, matches
+    fn is_match(&self, path: &Path) -> bool {
+        match self {
+            Matcher::Glob(glob) => glob.is_match(path),
+            Matcher::Regex(regex) => regex.is_match(&path.to_string_lossy()),
+        }
+    }
 }
 
 fn to_id(index: usize) -> Id {
@@ -932,6 +1012,43 @@ fn relative_path(name: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(name.components().collect())
+}
+
+/// `regex` with every `,` replaced by `[^/]` (any character except `/`), except an escaped `\,`,
+/// and a `,` inside a `[...]` class or a `{...}` repetition, which keeps its usual meaning
+fn expand_commas(regex: &str) -> String {
+    let mut expanded = String::with_capacity(regex.len());
+    let mut chars = regex.chars().peekable();
+    // how many classes are open, they can be nested like `[a[bc]]`
+    let mut classes = 0;
+    let mut in_repetition = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                expanded.push(c);
+                expanded.extend(chars.next());
+                continue;
+            }
+            '[' => {
+                expanded.push(c);
+                classes += 1;
+                // `]` right after `[` or `[^` is a literal `]`, not the end of the class
+                expanded.extend(chars.next_if_eq(&'^'));
+                expanded.extend(chars.next_if_eq(&']'));
+                continue;
+            }
+            ']' if classes > 0 => classes -= 1,
+            '{' if classes == 0 => in_repetition = true,
+            '}' if classes == 0 => in_repetition = false,
+            ',' if classes == 0 && !in_repetition => {
+                expanded.push_str("[^/]");
+                continue;
+            }
+            _ => {}
+        }
+        expanded.push(c);
+    }
+    expanded
 }
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist
