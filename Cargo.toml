@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+globset = "0.4"
 pathfinding = "4.16"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 trash = "5.2.9"
 typed-builder = "0.23.2"
+walkdir = "2.5"
 
 # `trash` can not restore on macOS, so koil trashes there itself, to know where the item went
 [target.'cfg(target_os = "macos")'.dependencies]

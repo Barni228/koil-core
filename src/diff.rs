@@ -1,7 +1,7 @@
 use crate::Action;
 use crate::planner;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,9 +40,34 @@ impl Diff {
             || (self.without_id.keys().chain(afters)).any(|p| p != path && p.starts_with(path))
     }
 
+    /// Dirs that are neither on disk nor created in this diff, but something new is placed
+    /// inside them, so they must be created too
+    pub fn missing_parents(&self) -> BTreeSet<PathBuf> {
+        let afters: Vec<&PathBuf> = self.with_id.values().flat_map(|(_, a)| a).collect();
+        let mut missing = BTreeSet::new();
+        for path in self.without_id.keys().chain(afters.iter().copied()) {
+            for parent in path.ancestors().skip(1) {
+                let exists = parent.as_os_str().is_empty()
+                    || parent.symlink_metadata().is_ok()
+                    || self.without_id.contains_key(parent)
+                    // a dir that was renamed or copied to this path
+                    || afters.contains(&&parent.to_path_buf());
+                // if it was added already, so were its parents
+                if exists || !missing.insert(parent.to_path_buf()) {
+                    break;
+                }
+            }
+        }
+        missing
+    }
+
     /// Compute actions required to resolve this diff
     pub fn compute_actions(self) -> Vec<Action> {
-        let mut actions = Vec::new();
+        let mut actions: Vec<Action> = self
+            .missing_parents()
+            .into_iter()
+            .map(Action::CreateDir)
+            .collect();
 
         // Creates
         for (path, is_dir) in self.without_id {

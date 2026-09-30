@@ -296,18 +296,36 @@ fn test_nested_create_with_parent() {
 
 #[test]
 fn test_nested_create_without_parent() {
-    // same as writing `newdir/` too
+    // `newdir/` is created too, and shown, but it is not written in the diff
     let koil = update_test_dir(&["newdir/A"]).unwrap();
-    assert_eq!(diff(&koil, [], ["newdir/", "newdir/A"]), koil.diff);
+    assert_eq!(diff(&koil, [], ["newdir/A"]), koil.diff);
+    let mut listing = test_dir_listing(&koil);
+    listing.push(without_id("newdir/"));
+    assert_eq!(listing, koil.listing());
+    assert_eq!(
+        vec![
+            Action::CreateDir(test_path("newdir")),
+            Action::CreateFile(test_path("newdir/A")),
+        ],
+        koil.compute_actions()
+    );
+}
+
+#[test]
+fn test_nested_create_removed_with_parent() {
+    let mut koil = update_test_dir(&["newdir/A"]).unwrap();
+    koil.open("newdir").unwrap();
+    // without `A`, nothing is inside `newdir`, so it is not created
+    koil.update(&[]).unwrap();
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+    koil.open("..").unwrap();
+    assert_eq!(test_dir_listing(&koil), koil.listing());
 }
 
 #[test]
 fn test_nested_create_many() {
     let mut koil = update_test_dir(&["newdir/A", "newdir/B"]).unwrap();
-    assert_eq!(
-        diff(&koil, [], ["newdir/", "newdir/A", "newdir/B"]),
-        koil.diff
-    );
+    assert_eq!(diff(&koil, [], ["newdir/A", "newdir/B"]), koil.diff);
 
     // `newdir/` is shown here, and its files are shown inside it
     let mut listing = test_dir_listing(&koil);
@@ -329,7 +347,15 @@ fn test_nested_create_many() {
 #[test]
 fn test_nested_create_deep() {
     let koil = update_test_dir(&["a/b/c/"]).unwrap();
-    assert_eq!(diff(&koil, [], ["a/", "a/b/", "a/b/c/"]), koil.diff);
+    assert_eq!(diff(&koil, [], ["a/b/c/"]), koil.diff);
+    assert_eq!(
+        vec![
+            Action::CreateDir(test_path("a")),
+            Action::CreateDir(test_path("a/b")),
+            Action::CreateDir(test_path("a/b/c")),
+        ],
+        koil.compute_actions()
+    );
 }
 
 #[test]
@@ -350,17 +376,18 @@ fn test_nested_move() {
         with_id(id(&koil, "qwerty"), "newdir/qwerty"),
     ];
     koil.update(&entries).unwrap();
+    assert_eq!(diff(&koil, [("qwerty", &["newdir/qwerty"])], []), koil.diff);
     assert_eq!(
-        diff(&koil, [("qwerty", &["newdir/qwerty"])], ["newdir/"]),
-        koil.diff
+        vec![
+            Action::CreateDir(test_path("newdir")),
+            Action::Rename(test_path("qwerty"), test_path("newdir/qwerty")),
+        ],
+        koil.compute_actions()
     );
 
     // the same entries again do not change anything
     koil.update(&entries).unwrap();
-    assert_eq!(
-        diff(&koil, [("qwerty", &["newdir/qwerty"])], ["newdir/"]),
-        koil.diff
-    );
+    assert_eq!(diff(&koil, [("qwerty", &["newdir/qwerty"])], []), koil.diff);
 }
 
 #[test]
@@ -611,6 +638,192 @@ fn test_settings_are_saved() {
     let koil = hidden_koil();
     let loaded = Koil::load_state(&koil.save_state()).unwrap();
     assert_eq!(&Settings { show_hidden: true }, loaded.settings());
+}
+
+// ── globs ────────────────────────────────────────────────────────────────────
+
+/// Koil with the glob `glob` opened inside `test_dir`
+fn glob_koil(glob: &str) -> Koil {
+    let mut koil = test_koil();
+    assert_eq!(None, koil.open(glob).unwrap());
+    koil
+}
+
+/// Every entry of `names` in the open dir, unchanged
+fn keep_all(koil: &Koil, names: &[&str]) -> Vec<Entry> {
+    names.iter().map(|name| keep(koil, name)).collect()
+}
+
+#[test]
+fn test_glob_open() {
+    let koil = glob_koil("**/*");
+    assert_eq!(test_path(""), koil.current_dir());
+    assert_eq!(Some("**/*"), koil.glob());
+    assert_eq!(test_path("**/*"), koil.location());
+    // only files, and names are relative to the base dir
+    assert_eq!(
+        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        koil.listing()
+    );
+}
+
+#[test]
+fn test_glob_patterns() {
+    let glob_names = |glob: &str| -> Vec<PathBuf> {
+        let koil = glob_koil(glob);
+        koil.listing().into_iter().map(|e| e.name).collect()
+    };
+    // `*` does not match `/`
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into(), "qwerty".into()],
+        glob_names("*")
+    );
+    assert_eq!(vec![PathBuf::from("dir/inside")], glob_names("d*/*"));
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into()],
+        glob_names("{file,file2}")
+    );
+    assert_eq!(vec![PathBuf::from("file2")], glob_names("file?"));
+    assert_eq!(Vec::<PathBuf>::new(), glob_names("*.rs"));
+}
+
+#[test]
+fn test_glob_absolute() {
+    let mut koil = Koil::default();
+    koil.open(test_path("*2")).unwrap();
+    assert_eq!(test_path(""), koil.current_dir());
+    assert_eq!(keep_all(&koil, &["file2"]), koil.listing());
+}
+
+#[test]
+fn test_glob_unchanged() {
+    let mut koil = glob_koil("**/*");
+    koil.update(&koil.listing()).unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+}
+
+#[test]
+fn test_glob_edit() {
+    let mut koil = glob_koil("**/*");
+    let entries = [
+        with_id(id(&koil, "dir/inside"), "dir/inside2"),
+        with_id(id(&koil, "file"), "dir/file"),
+        keep(&koil, "file2"),
+        without_id("new/x"),
+    ];
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        diff(
+            &koil,
+            [
+                ("dir/inside", &["dir/inside2"]),
+                ("file", &["dir/file"]),
+                ("qwerty", &[])
+            ],
+            ["new/x"]
+        ),
+        koil.diff
+    );
+    // every file is still shown where it was written, and `new/` is not, since it is a dir
+    let mut listing = entries.to_vec();
+    listing.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(listing, koil.listing());
+}
+
+#[test]
+fn test_glob_rename_out_of_view() {
+    let mut koil = glob_koil("file*");
+    let file2 = id(&koil, "file2");
+    koil.update(&[keep(&koil, "file"), with_id(file2, "other")])
+        .unwrap();
+    // `other` does not match, so it is not shown, but it is still renamed
+    assert_eq!(keep_all(&koil, &["file"]), koil.listing());
+    koil.update(&koil.listing()).unwrap();
+    assert_eq!(diff(&koil, [("file2", &["other"])], []), koil.diff);
+}
+
+#[test]
+fn test_glob_edit_seen_in_dir() {
+    let mut koil = glob_koil("**/*");
+    let inside = id(&koil, "dir/inside");
+    let mut entries = koil.listing();
+    entries[0] = with_id(inside, "dir/renamed");
+    koil.update(&entries).unwrap();
+
+    koil.open(test_path("dir")).unwrap();
+    assert_eq!(None, koil.glob());
+    assert_eq!(vec![with_id(inside, "renamed")], koil.listing());
+}
+
+#[test]
+fn test_glob_hidden() {
+    let mut koil = hidden_koil();
+    koil.open("**/*").unwrap();
+    let mut listing = vec![Entry::parent()];
+    listing.extend(keep_all(
+        &koil,
+        &[".hidden", "dir/inside", "file", "file2", "qwerty"],
+    ));
+    assert_eq!(listing, koil.listing());
+}
+
+#[test]
+fn test_glob_in_new_dir() {
+    let mut koil = update_test_dir(&["newdir/A", "newdir/B/"]).unwrap();
+    koil.open("newdir/*").unwrap();
+    assert_eq!(test_path("newdir"), koil.current_dir());
+    assert_eq!(vec![without_id("A")], koil.listing());
+}
+
+#[test]
+fn test_glob_missing_base() {
+    let mut koil = test_koil();
+    assert_eq!(
+        Some(Warning::DirNotFound {
+            requested: test_path("made/up"),
+            opened: test_path(""),
+        }),
+        koil.open("made/up/*").unwrap()
+    );
+    assert_eq!(None, koil.glob());
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+}
+
+#[test]
+fn test_glob_invalid() {
+    let mut koil = test_koil();
+    for glob in ["[", "{a"] {
+        assert!(
+            matches!(koil.open(glob), Err(OpenError::InvalidGlob { glob: g, .. }) if g == glob),
+            "{glob} should be invalid"
+        );
+    }
+    // nothing changed
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+}
+
+#[test]
+fn test_glob_like_dir_name() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("a[1]")).unwrap();
+    fs::write(temp.path().join("a[1]/x"), "").unwrap();
+    let mut koil = Koil::default();
+
+    // an existing dir is never a glob
+    koil.open(temp.path().join("a[1]")).unwrap();
+    assert_eq!(None, koil.glob());
+    koil.open(temp.path().join("a[1]/*")).unwrap();
+    assert_eq!(Some("*"), koil.glob());
+    assert_eq!(keep_all(&koil, &["x"]), koil.listing());
+}
+
+#[test]
+fn test_glob_kept_on_refresh() {
+    let mut koil = glob_koil("*");
+    koil.refresh().unwrap();
+    assert_eq!(Some("*"), koil.glob());
+    let loaded = Koil::load_state(&koil.save_state()).unwrap();
+    assert_eq!(Some("*"), loaded.glob());
 }
 
 #[test]

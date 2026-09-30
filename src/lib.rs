@@ -1,10 +1,12 @@
 use crate::apply::Undo;
 use crate::diff::Diff;
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
+use walkdir::WalkDir;
 
 pub mod apply;
 pub mod diff;
@@ -191,6 +193,20 @@ pub enum KoilError {
     NothingToUndo,
 }
 
+/// Why [`Koil::open`] failed, nothing was changed
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("Can not read the dir")]
+    Io(#[from] io::Error),
+
+    #[error("`{glob}` is not a valid glob pattern")]
+    InvalidGlob {
+        glob: String,
+        #[source]
+        source: globset::Error,
+    },
+}
+
 /// Why [`Koil::update`] rejected the entries, nothing was changed
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{}", join_lines(errors))]
@@ -265,8 +281,13 @@ pub struct Koil {
     current_listing: HashSet<usize>,
 
     #[builder(default, setter(skip))]
-    /// The currently open directory
+    /// The currently open directory, or the base dir of [`Koil::glob`]
     current_dir: PathBuf,
+
+    #[builder(default, setter(skip))]
+    #[serde(default)]
+    /// The open glob pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
+    glob: Option<String>,
 
     #[builder(default, setter(skip))]
     /// Partial diff, which stores all changes made in other listings
@@ -286,56 +307,66 @@ impl Default for Koil {
 
 // Public functions
 impl Koil {
-    /// Open the dir given
-    /// If it is a relative path, it will be opened relative to [`Koil::current_dir`]
-    /// It can also be a new dir from [`Koil::diff`] that does not exist yet,
+    /// Open `location`, which is either a dir, or a glob pattern like `src/**/*.rs`
+    /// If it is relative, it will be opened relative to [`Koil::current_dir`]
+    /// A dir can also be a new dir from [`Koil::diff`] that does not exist yet,
     /// then it is opened with an empty listing
-    /// If the dir is neither on disk nor in the diff, the closest parent that is gets opened
+    /// A glob shows every file (not dir) whose path matches it, relative to its base dir (the
+    /// dirs before the first part with `*`, `?`, `[` or `{`), and `*` never matches `/`
+    /// A path that is a dir is always opened as a dir, even if its name looks like a glob
+    /// If the dir (or the base dir of the glob) is neither on disk nor in the diff, the closest
+    /// parent that is gets opened as a dir
     /// This never changes [`Koil::diff`], new dirs must be written in the listing
     /// Returns a warning, if the dir was not found and a parent was opened instead
-    pub fn open<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<Option<Warning>> {
-        let path = resolve(&self.current_dir.join(dir))?;
-        let dir = path
+    pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<Option<Warning>, OpenError> {
+        let path = resolve(&self.current_dir.join(location))?;
+        let (base, glob) = match self.split_glob(&path) {
+            Some((base, glob)) => {
+                compile(&glob).map_err(|source| OpenError::InvalidGlob {
+                    glob: glob.clone(),
+                    source,
+                })?;
+                (base, Some(glob))
+            }
+            None => (path, None),
+        };
+
+        let dir = base
             .ancestors()
-            .find(|p| p.is_dir() || self.diff.creates_dir(p))
-            .ok_or(io::ErrorKind::NotFound)?
+            .find(|p| self.is_dir(p))
+            .ok_or(io::Error::from(io::ErrorKind::NotFound))?
             .to_path_buf();
-        let warning = (dir != path).then(|| Warning::DirNotFound {
-            requested: path,
+        let found = dir == base;
+        let warning = (!found).then(|| Warning::DirNotFound {
+            requested: base,
             opened: dir.clone(),
         });
 
-        self.current_listing.clear();
-        let on_disk = dir.is_dir();
         self.current_dir = dir;
-        if !on_disk {
-            return Ok(warning);
-        }
-
-        for item in fs::read_dir(&self.current_dir)? {
-            let path = item?.path();
-            if self.ignore.contains(&path) {
-                continue;
-            }
-            let index = self.ids.iter().position(|p| p == &path);
-            // a changed entry stays, so it is not taken for deleted in the next update
-            let changed = index.is_some_and(|i| self.diff.with_id.contains_key(&i));
-            if is_hidden(&path) && !self.settings.show_hidden && !changed {
-                continue;
-            }
-            let index = index.unwrap_or_else(|| {
-                self.ids.push(path);
-                self.ids.len() - 1
-            });
-            self.current_listing.insert(index);
-        }
-
+        // the glob is relative to its base dir, so it can not be used in another dir
+        self.glob = glob.filter(|_| found);
+        self.read_listing()?;
         Ok(warning)
     }
 
-    /// The currently open directory, as an absolute path
+    /// The currently open directory as an absolute path, or the base dir of [`Koil::glob`]
+    /// Names of entries are relative to it
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
+    }
+
+    /// The open glob pattern, relative to [`Koil::current_dir`], `None` if a plain dir is open
+    pub fn glob(&self) -> Option<&str> {
+        self.glob.as_deref()
+    }
+
+    /// What is open, as it can be given to [`Koil::open`] again:
+    /// [`Koil::current_dir`], joined with [`Koil::glob`] if there is one
+    pub fn location(&self) -> PathBuf {
+        match &self.glob {
+            Some(glob) => self.current_dir.join(glob),
+            None => self.current_dir.clone(),
+        }
     }
 
     /// How the listing is shown
@@ -350,15 +381,16 @@ impl Koil {
         self.reopen()
     }
 
-    /// The entries of the open dir, with every change made so far, which user should modify
+    /// The entries of the open dir or glob, with every change made so far, which user should
+    /// modify
     /// Starts with [`Entry::parent`] if [`Settings::show_hidden`] is on, then existing entries
     /// (dirs, then files, each sorted by name), then new entries
     pub fn listing(&self) -> Vec<Entry> {
-        // returns true if this path should be shown in the current listing
-        let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
+        let view = self.view();
+        let in_view = |index: usize, path: &Path| view.contains(path, self.ids[index].is_dir());
         let entry = |index: usize, path: &Path| Entry {
             id: Some(to_id(index)),
-            name: path.file_name().unwrap().into(),
+            name: self.name(path),
             is_dir: self.ids[index].is_dir(),
         };
 
@@ -370,7 +402,7 @@ impl Koil {
                 Some((_before, afters)) => entries.extend(
                     afters
                         .iter()
-                        .filter(|p| in_this_listing(p))
+                        .filter(|p| in_view(index, p))
                         .map(|p| entry(index, p)),
                 ),
                 None => entries.push(entry(index, &self.ids[index])),
@@ -386,7 +418,7 @@ impl Koil {
             entries.extend(
                 afters
                     .iter()
-                    .filter(|p| in_this_listing(p))
+                    .filter(|p| in_view(index, p))
                     .map(|p| entry(index, p)),
             );
         }
@@ -394,14 +426,19 @@ impl Koil {
         // dirs first, then by name
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
-        let mut new: Vec<Entry> = self
+        // dirs that are created because something new is inside them are shown too
+        let parents = self.diff.missing_parents().into_iter().map(|p| (p, true));
+        let created = self
             .diff
             .without_id
             .iter()
-            .filter(|(p, _)| in_this_listing(p))
-            .map(|(p, &is_dir)| Entry {
+            .map(|(p, &is_dir)| (p.clone(), is_dir));
+        let mut new: Vec<Entry> = created
+            .chain(parents)
+            .filter(|(p, is_dir)| view.contains(p, *is_dir))
+            .map(|(p, is_dir)| Entry {
                 id: None,
-                name: p.file_name().unwrap().into(),
+                name: self.name(&p),
                 is_dir,
             })
             .collect();
@@ -560,14 +597,130 @@ impl Koil {
         }
     }
 
-    /// Open [`Koil::current_dir`] again, so it shows what is on disk now
-    /// Does nothing if no dir was opened yet
+    /// Open [`Koil::location`] again, so it shows what is on disk now
+    /// Does nothing if nothing was opened yet
     fn reopen(&mut self) -> io::Result<Option<Warning>> {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(None);
         }
-        let dir = std::mem::take(&mut self.current_dir);
-        self.open(dir)
+        match self.open(self.location()) {
+            Ok(warning) => Ok(warning),
+            Err(OpenError::Io(err)) => Err(err),
+            Err(OpenError::InvalidGlob { .. }) => unreachable!("the glob was valid when opened"),
+        }
+    }
+
+    /// Read [`Koil::current_listing`] for the open dir or glob from the filesystem
+    fn read_listing(&mut self) -> io::Result<()> {
+        self.current_listing.clear();
+        let view = self.view();
+
+        let mut paths = Vec::new();
+        if self.current_dir.is_dir() {
+            match &view.glob {
+                None => {
+                    for item in fs::read_dir(&self.current_dir)? {
+                        paths.push(item?.path());
+                    }
+                }
+                Some(glob) => paths = self.walk_glob(glob)?,
+            }
+        }
+
+        for path in paths {
+            if self.ignore.contains(&path) || (is_hidden(&path) && !self.settings.show_hidden) {
+                continue;
+            }
+            let index = self.ids.iter().position(|p| p == &path);
+            let index = index.unwrap_or_else(|| {
+                self.ids.push(path);
+                self.ids.len() - 1
+            });
+            self.current_listing.insert(index);
+        }
+
+        // a changed entry stays, even if it is hidden, so it is not taken for deleted in
+        // the next update
+        for (&index, (before, _afters)) in &self.diff.with_id {
+            if view.contains(before, self.ids[index].is_dir()) {
+                self.current_listing.insert(index);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Every file inside [`Koil::current_dir`] that matches `glob`
+    /// Hidden dirs are skipped if hidden entries are not shown, and so are dirs that can not
+    /// be read
+    fn walk_glob(&self, glob: &GlobMatcher) -> io::Result<Vec<PathBuf>> {
+        let pattern = glob.glob().glob();
+        // without `**`, a glob can only match paths with as many parts as it has
+        let max_depth = match pattern.contains("**") {
+            true => usize::MAX,
+            false => Path::new(pattern).components().count(),
+        };
+        let show_hidden = self.settings.show_hidden;
+        let walk = WalkDir::new(&self.current_dir)
+            .min_depth(1)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_entry(|item| show_hidden || !is_hidden(item.path()));
+
+        let mut paths = Vec::new();
+        for item in walk {
+            let item = match item {
+                Ok(item) => item,
+                // only fail if the base dir itself can not be read
+                Err(err) if err.depth() == 0 => return Err(err.into()),
+                Err(_) => continue,
+            };
+            let path = item.path();
+            if !item.file_type().is_dir()
+                && glob.is_match(path.strip_prefix(&self.current_dir).unwrap())
+            {
+                paths.push(item.into_path());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Which paths the listing shows
+    fn view(&self) -> View {
+        View {
+            base: self.current_dir.clone(),
+            glob: (self.glob.as_deref())
+                .map(|g| compile(g).expect("the glob was valid when opened")),
+        }
+    }
+
+    /// The name of `path` in the listing, relative to [`Koil::current_dir`]
+    fn name(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.current_dir).unwrap().to_path_buf()
+    }
+
+    /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`]
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir() || self.diff.creates_dir(path)
+    }
+
+    /// Split `path` into its base dir, and the glob relative to it
+    /// `None` if it is not a glob, because no part of it after the longest part that is a dir
+    /// has `*`, `?`, `[` or `{`
+    fn split_glob(&self, path: &Path) -> Option<(PathBuf, String)> {
+        // so a dir with a name like `a[1]` is not taken for a glob
+        let dir = path.ancestors().find(|p| self.is_dir(p))?;
+        let parts: Vec<String> = path
+            .strip_prefix(dir)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let first = parts
+            .iter()
+            .position(|p| p.contains(['*', '?', '[', '{']))?;
+        let base = dir.join(parts[..first].iter().collect::<PathBuf>());
+        Some((base, parts[first..].join("/")))
     }
 
     /// Fail if there are changes that are not applied yet
@@ -624,17 +777,21 @@ impl Koil {
             }
         }
 
-        let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
+        let view = self.view();
+        let ids = &self.ids;
 
         // clear the diff for the current listing, since it is outdated
-        self.diff.with_id.retain(|_index, (before, afters)| {
-            afters.retain(|p| !in_this_listing(p));
+        self.diff.with_id.retain(|&index, (before, afters)| {
+            let is_dir = ids[index].is_dir();
+            afters.retain(|p| !view.contains(p, is_dir));
             // if before and after are from this listing, remove this from diff
             // or if before and after are exactly the same, then also remove it
-            (!afters.is_empty() || !in_this_listing(before))
+            (!afters.is_empty() || !view.contains(before, is_dir))
                 && afters.as_slice() != [before.as_path()]
         });
-        self.diff.without_id.retain(|p, _| !in_this_listing(p));
+        self.diff
+            .without_id
+            .retain(|p, &mut is_dir| !view.contains(p, is_dir));
 
         // if something existed before, but does not exist now, tell the diff that it used to exist
         for &index in &self.current_listing {
@@ -643,7 +800,7 @@ impl Koil {
             }
         }
 
-        // every (entry, path) written in this listing, to create its missing parents later
+        // every (entry, path) written in this listing, to check its parents later
         let mut written = Vec::new();
 
         // Creates
@@ -688,9 +845,9 @@ impl Koil {
             }
         }
 
-        // `dir/A` also means create `dir/`, if it does not exist yet
+        // `dir/A` also means create `dir/`, if it does not exist yet, so it can not be a file
         for (i, path) in written {
-            if let Err(parent) = self.add_missing_parents(&path) {
+            if let Err(parent) = self.check_parents(&path) {
                 errors.push(EntryError {
                     entry: i,
                     kind: EntryErrorKind::NotADirectory(parent),
@@ -701,43 +858,58 @@ impl Koil {
         errors
     }
 
-    /// Add every parent of `path` (inside [`Koil::current_dir`]) that does not exist yet
-    /// to [`Koil::diff`] as a new dir
+    /// Check that no parent of `path` (inside [`Koil::current_dir`]) is a file, on disk or
+    /// created in [`Koil::diff`]
     /// Fails with the parent (relative to [`Koil::current_dir`]) that is a file
-    fn add_missing_parents(&mut self, path: &Path) -> Result<(), PathBuf> {
-        let parents: Vec<PathBuf> = path
+    /// Parents that do not exist yet are created by [`Diff::compute_actions`]
+    fn check_parents(&self, path: &Path) -> Result<(), PathBuf> {
+        let parents = path
             .ancestors()
             .skip(1)
-            .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir)
-            .map(Path::to_path_buf)
-            .collect();
+            .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir);
 
         for parent in parents {
-            let not_a_dir = || {
-                parent
-                    .strip_prefix(&self.current_dir)
-                    .unwrap()
-                    .to_path_buf()
-            };
             if parent.symlink_metadata().is_ok() {
                 if parent.is_dir() {
                     break;
                 }
-                return Err(not_a_dir());
+                return Err(self.name(parent));
             }
-            // a dir that was renamed or copied to this path
-            let is_after = |(_, afters): &(PathBuf, Vec<PathBuf>)| afters.contains(&parent);
-            match self.diff.without_id.get(&parent) {
-                Some(true) => {}
-                Some(false) => return Err(not_a_dir()),
-                None if self.diff.with_id.values().any(is_after) => {}
-                None => {
-                    self.diff.without_id.insert(parent, true);
-                }
+            if self.diff.without_id.get(parent) == Some(&false) {
+                return Err(self.name(parent));
             }
         }
         Ok(())
     }
+}
+
+/// Which paths a listing shows
+struct View {
+    /// The open dir, or the base dir of the glob
+    base: PathBuf,
+    glob: Option<GlobMatcher>,
+}
+
+impl View {
+    /// Whether `path` is shown in the listing
+    fn contains(&self, path: &Path, is_dir: bool) -> bool {
+        match &self.glob {
+            None => path.parent() == Some(&self.base),
+            // a glob only shows files
+            Some(glob) => {
+                !is_dir
+                    && path
+                        .strip_prefix(&self.base)
+                        .is_ok_and(|p| glob.is_match(p))
+            }
+        }
+    }
+}
+
+/// A glob pattern, where `*` never matches `/`
+fn compile(glob: &str) -> Result<GlobMatcher, globset::Error> {
+    let glob = GlobBuilder::new(glob).literal_separator(true).build()?;
+    Ok(glob.compile_matcher())
 }
 
 /// Whether the name of `path` starts with `.`

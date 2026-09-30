@@ -1,7 +1,6 @@
 ## Features
 
 - [ ] Allow commands to be entered in the settings box
-- [ ] Allow entering a glob pattern, to see every file with matching path
 - [ ] Allow entering a regex pattern, so like glob but its regex
 - [ ] Allow having BOTH glob AND regex in one expression
 - [ ] Allow creating many files with `file{1,2,3}` syntax
@@ -13,10 +12,12 @@
 - [ ] Add file icons
 - [ ] Parse file with `chumsky`
 - [ ] Handle cases where file system changes while this is still running (open koil, then create new file)
+- [ ] Respect `.gitignore` in globs, so `**/*.rs` skips `target/`
 - [ ] Publish to crates.io
 
 ## Done
 
+- [x] Allow entering a glob pattern, to see every file with matching path (`**/*.rs`)
 - [x] Allow showing hidden paths (including `../`), with `hidden=true` in the CLI header
 - [x] Separate cli and library code into 2 different projects (`koil-cli`)
 - [x] Create `koil undo`, which undoes the last apply (deletes go to the trash)
