@@ -1,6 +1,5 @@
 ## Features
 
-- [ ] Allow showing hidden paths (including `../`)
 - [ ] Allow commands to be entered in the settings box
 - [ ] Allow entering a glob pattern, to see every file with matching path
 - [ ] Allow entering a regex pattern, so like glob but its regex
@@ -18,6 +17,7 @@
 
 ## Done
 
+- [x] Allow showing hidden paths (including `../`), with `hidden=true` in the CLI header
 - [x] Separate cli and library code into 2 different projects (`koil-cli`)
 - [x] Create `koil undo`, which undoes the last apply (deletes go to the trash)
 - [x] Generate random looking IDs with `sqids`

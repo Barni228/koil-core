@@ -494,6 +494,125 @@ fn test_path_of_renamed_is_the_original() {
     assert_eq!(Some(test_path("qwerty").as_path()), koil.path_of(qwerty));
 }
 
+// ── hidden entries ───────────────────────────────────────────────────────────
+
+/// Koil with `test_dir` opened, and hidden entries shown
+fn hidden_koil() -> Koil {
+    let mut koil = Koil::builder()
+        .settings(Settings { show_hidden: true })
+        .build();
+    koil.open("test_dir").unwrap();
+    koil
+}
+
+/// The unchanged `test_dir` listing, with hidden entries shown
+fn hidden_listing(koil: &Koil) -> Vec<Entry> {
+    vec![
+        Entry::parent(),
+        keep(koil, "dir/"),
+        keep(koil, ".hidden"),
+        keep(koil, "file"),
+        keep(koil, "file2"),
+        keep(koil, "qwerty"),
+    ]
+}
+
+#[test]
+fn test_hidden_not_shown() {
+    // `test_dir/.hidden` is not in the listing, so it is not deleted either
+    let koil = update_test_dir(&[]).unwrap();
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+    assert_eq!(None, koil.id_of(&test_path(".hidden")));
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+}
+
+#[test]
+fn test_show_hidden() {
+    let mut koil = hidden_koil();
+    assert_eq!(hidden_listing(&koil), koil.listing());
+    koil.update(&hidden_listing(&koil)).unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+}
+
+#[test]
+fn test_set_show_hidden() {
+    let mut koil = test_koil();
+    assert_eq!(
+        None,
+        koil.set_settings(Settings { show_hidden: true }).unwrap()
+    );
+    assert_eq!(hidden_listing(&koil), koil.listing());
+    koil.set_settings(Settings::default()).unwrap();
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+}
+
+#[test]
+fn test_parent_entry_is_ignored() {
+    let mut koil = hidden_koil();
+    // without `..`
+    koil.update(&hidden_listing(&koil)[1..]).unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+    // with `..` written twice
+    let mut entries = hidden_listing(&koil);
+    entries.push(Entry::parent());
+    koil.update(&entries).unwrap();
+    assert_eq!(Diff::default(), koil.diff);
+}
+
+#[test]
+fn test_no_parent_entry_in_root() {
+    let mut koil = hidden_koil();
+    koil.open("/").unwrap();
+    assert!(!koil.listing().contains(&Entry::parent()));
+}
+
+#[test]
+fn test_hide_renamed_hidden() {
+    let mut koil = hidden_koil();
+    let hidden = id(&koil, ".hidden");
+    let mut entries = hidden_listing(&koil);
+    entries[2] = with_id(hidden, ".renamed");
+    koil.update(&entries).unwrap();
+
+    // the renamed entry is still shown, so updating keeps it a rename
+    koil.set_settings(Settings::default()).unwrap();
+    let mut listing = test_dir_listing(&koil);
+    listing.insert(1, with_id(hidden, ".renamed"));
+    assert_eq!(listing, koil.listing());
+    koil.update(&listing).unwrap();
+    assert_eq!(diff(&koil, [(".hidden", &[".renamed"])], []), koil.diff);
+}
+
+#[test]
+fn test_hide_deleted_hidden() {
+    let mut koil = hidden_koil();
+    let mut entries = hidden_listing(&koil);
+    entries.remove(2);
+    koil.update(&entries).unwrap();
+
+    // the deleted entry is not shown, and updating keeps it deleted
+    koil.set_settings(Settings::default()).unwrap();
+    assert_eq!(test_dir_listing(&koil), koil.listing());
+    koil.update(&test_dir_listing(&koil)).unwrap();
+    assert_eq!(diff(&koil, [(".hidden", &[])], []), koil.diff);
+}
+
+#[test]
+fn test_new_hidden_is_shown() {
+    // user wrote it, so it is shown even if hidden entries are not
+    let koil = update_test_dir(&[".new"]).unwrap();
+    let mut listing = test_dir_listing(&koil);
+    listing.push(without_id(".new"));
+    assert_eq!(listing, koil.listing());
+}
+
+#[test]
+fn test_settings_are_saved() {
+    let koil = hidden_koil();
+    let loaded = Koil::load_state(&koil.save_state()).unwrap();
+    assert_eq!(&Settings { show_hidden: true }, loaded.settings());
+}
+
 #[test]
 fn test_refresh() {
     let mut koil = update_test_dir(&["new"]).unwrap();

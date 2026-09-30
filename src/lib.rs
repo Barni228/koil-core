@@ -38,6 +38,34 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+impl Entry {
+    /// The `..` entry, which only opens the parent dir
+    /// [`Koil::listing`] starts with it when [`Settings::show_hidden`] is on, and
+    /// [`Koil::update`] ignores it, so it can never be changed
+    pub fn parent() -> Entry {
+        Entry {
+            id: None,
+            name: "..".into(),
+            is_dir: true,
+        }
+    }
+
+    /// Whether this is the [`Entry::parent`] entry
+    pub fn is_parent(&self) -> bool {
+        self.id.is_none() && self.name == Path::new("..")
+    }
+}
+
+/// How the listing is shown, a frontend usually lets user change these
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Show hidden entries (names starting with `.`), and [`Entry::parent`] to open the
+    /// parent dir
+    /// Hidden entries that were changed are always shown, so the change is not lost
+    pub show_hidden: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// Represent a filesystem operation
 pub enum Action {
@@ -218,6 +246,11 @@ fn join_lines(errors: &[EntryError]) -> String {
     }
 ))]
 pub struct Koil {
+    #[builder(default)]
+    #[serde(default)]
+    /// How the listing is shown
+    settings: Settings,
+
     #[builder(via_mutators)]
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
@@ -280,19 +313,21 @@ impl Koil {
         }
 
         for item in fs::read_dir(&self.current_dir)? {
-            let item = item?;
-            if self.ignore.contains(&item.path()) {
+            let path = item?.path();
+            if self.ignore.contains(&path) {
                 continue;
             }
-            let id = self
-                .ids
-                .iter()
-                .position(|p| p == &item.path())
-                .unwrap_or_else(|| {
-                    self.ids.push(item.path());
-                    self.ids.len() - 1
-                });
-            self.current_listing.insert(id);
+            let index = self.ids.iter().position(|p| p == &path);
+            // a changed entry stays, so it is not taken for deleted in the next update
+            let changed = index.is_some_and(|i| self.diff.with_id.contains_key(&i));
+            if is_hidden(&path) && !self.settings.show_hidden && !changed {
+                continue;
+            }
+            let index = index.unwrap_or_else(|| {
+                self.ids.push(path);
+                self.ids.len() - 1
+            });
+            self.current_listing.insert(index);
         }
 
         Ok(warning)
@@ -303,8 +338,21 @@ impl Koil {
         &self.current_dir
     }
 
+    /// How the listing is shown
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Change how the listing is shown, and reopen [`Koil::current_dir`] with the new settings
+    /// Returns a warning, if the open dir is gone and its closest parent was opened instead
+    pub fn set_settings(&mut self, settings: Settings) -> io::Result<Option<Warning>> {
+        self.settings = settings;
+        self.reopen()
+    }
+
     /// The entries of the open dir, with every change made so far, which user should modify
-    /// Existing entries come first (dirs, then files, each sorted by name), then new entries
+    /// Starts with [`Entry::parent`] if [`Settings::show_hidden`] is on, then existing entries
+    /// (dirs, then files, each sorted by name), then new entries
     pub fn listing(&self) -> Vec<Entry> {
         // returns true if this path should be shown in the current listing
         let in_this_listing = |path: &Path| path.parent().is_some_and(|p| p == self.current_dir);
@@ -360,6 +408,9 @@ impl Koil {
         new.sort_by(|a, b| a.name.cmp(&b.name));
         entries.extend(new);
 
+        if self.settings.show_hidden && self.current_dir.parent().is_some() {
+            entries.insert(0, Entry::parent());
+        }
         entries
     }
 
@@ -367,6 +418,7 @@ impl Koil {
     /// An entry of the open dir that is missing is deleted, a changed name is a rename (or a
     /// move, if it is a path in another dir), an ID written more than once is a copy, and an
     /// entry without an ID is created, along with its parents that do not exist yet
+    /// [`Entry::parent`] is ignored, it can only be opened
     /// Changes made in the listings of other dirs are kept
     /// If any entry is invalid, nothing is changed, and every problem is returned
     pub fn update(&mut self, entries: &[Entry]) -> Result<(), UpdateError> {
@@ -459,8 +511,7 @@ impl Koil {
     /// IDs are kept, so an ID never starts pointing to a different path
     pub fn refresh(&mut self) -> io::Result<Option<Warning>> {
         self.diff = Diff::default();
-        let dir = std::mem::take(&mut self.current_dir);
-        self.open(dir)
+        self.reopen()
     }
 
     /// Save the whole session (IDs, open dir, diff, and undo steps), so it can be continued later
@@ -509,6 +560,16 @@ impl Koil {
         }
     }
 
+    /// Open [`Koil::current_dir`] again, so it shows what is on disk now
+    /// Does nothing if no dir was opened yet
+    fn reopen(&mut self) -> io::Result<Option<Warning>> {
+        if self.current_dir.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let dir = std::mem::take(&mut self.current_dir);
+        self.open(dir)
+    }
+
     /// Fail if there are changes that are not applied yet
     fn check_nothing_pending(&self) -> Result<(), KoilError> {
         if self.compute_actions().is_empty() {
@@ -537,6 +598,9 @@ impl Koil {
         let mut without_id = Vec::new();
 
         for (i, entry) in entries.iter().enumerate() {
+            if entry.is_parent() {
+                continue;
+            }
             let index = match entry.id.map(|id| (id, self.index_of(id))) {
                 Some((_, Some(index))) => Some(index),
                 Some((id, None)) => {
@@ -674,6 +738,12 @@ impl Koil {
         }
         Ok(())
     }
+}
+
+/// Whether the name of `path` starts with `.`
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
 }
 
 fn to_id(index: usize) -> Id {
