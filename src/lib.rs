@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use crate::apply::{Undo, same_file};
+use crate::apply::{Undo, inside, same_file};
 use crate::diff::Diff;
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::{WalkBuilder, WalkState};
@@ -415,6 +415,11 @@ pub enum EntryErrorKind {
     /// ignored, or with a name that only differs in case on a filesystem that ignores case
     #[error("`{}` already exists", .0.display())]
     AlreadyExists(PathBuf),
+
+    /// The entry is a dir copied or moved to a path inside it: the move would fail, and the
+    /// copy would copy itself again, until the path is too long
+    #[error("`{}` would copy or move a dir into itself", .0.display())]
+    IntoItself(PathBuf),
 
     /// A part of the name is longer than most filesystems allow
     #[error("`{name}` is {len} bytes long, but a name can be at most 255")]
@@ -1187,6 +1192,9 @@ impl Koil {
             }
             if self.taken(&path, index) {
                 error(EntryErrorKind::AlreadyExists(self.name(&path)));
+            }
+            if index.is_some_and(|index| inside(&self.ids[index], &path)) {
+                error(EntryErrorKind::IntoItself(self.name(&path)));
             }
             for problem in self.new_names(&path).flat_map(names::check) {
                 match problem {

@@ -741,6 +741,59 @@ fn test_already_exists_ignoring_case() {
     koil.update(&entries).unwrap();
 }
 
+#[test]
+fn test_into_itself() {
+    let into_itself = |name: &str| EntryErrorKind::IntoItself(name.into());
+    // a copy of `dir` inside it
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries.push(with_id(id(&koil, "dir"), "dir/copy/"));
+    assert_eq!(
+        vec![(4, into_itself("dir/copy"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // a move deeper inside it
+    let mut koil = test_koil();
+    let entries = [
+        with_id(id(&koil, "dir"), "dir/new/moved/"),
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    assert_eq!(
+        vec![(0, into_itself("dir/new/moved"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // written in its own listing, with its ID from the listing above
+    let mut koil = test_koil();
+    let dir = id(&koil, "dir");
+    koil.open("dir").unwrap();
+    let entries = [keep(&koil, "inside"), with_id(dir, "copy/")];
+    assert_eq!(
+        vec![(1, into_itself("copy"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // on a filesystem that ignores case, `DIR` is `dir`
+    if test_path("DIR").exists() {
+        let mut koil = test_koil();
+        let mut entries = test_dir_listing(&koil);
+        entries.push(with_id(id(&koil, "dir"), "DIR/copy/"));
+        assert_eq!(
+            vec![(4, into_itself("DIR/copy"))],
+            errors(koil.update(&entries).map(|_| koil.clone()))
+        );
+    }
+
+    // but a copy next to it is fine
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries.push(with_id(id(&koil, "dir"), "dir2/"));
+    koil.update(&entries).unwrap();
+}
+
 // ── hidden entries ───────────────────────────────────────────────────────────
 
 /// Koil with `test_dir` opened, and hidden entries shown

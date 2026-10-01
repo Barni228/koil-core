@@ -232,6 +232,32 @@ fn test_undo_never_overwrites() {
 }
 
 #[test]
+fn test_never_into_itself() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let dir = temp.path().join("dir");
+    // a copy would copy itself again, until the path is too long
+    let actions = [
+        Action::Copy(dir.clone(), dir.join("copy")),
+        Action::Rename(dir.clone(), dir.join("sub/moved")),
+    ];
+    for action in actions {
+        let error = action.run().unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind(), "{action}");
+    }
+    assert_eq!(before, snapshot(temp.path()));
+
+    // a symlink to a dir is copied as a link, so it can go in that dir
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        Action::Copy(link, dir.join("link")).run().unwrap();
+        assert!(dir.join("link").symlink_metadata().unwrap().is_symlink());
+    }
+}
+
+#[test]
 fn test_undo_failed_apply() {
     let temp = test_temp_dir();
     let before = snapshot(temp.path());

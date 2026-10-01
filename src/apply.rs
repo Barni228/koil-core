@@ -28,10 +28,17 @@ impl Action {
                 if taken(d) && !same_file(s, d)? {
                     return Err(already_exists(d));
                 }
+                if inside(s, d) {
+                    return Err(into_itself(s, d));
+                }
                 fs::rename(s, d)?;
                 Undo::Rename(d.clone(), s.clone())
             }
             Action::Copy(s, d) => {
+                // the copy would be copied again into itself, until the path is too long
+                if inside(s, d) {
+                    return Err(into_itself(s, d));
+                }
                 copy(s, d)?;
                 Undo::Trash(d.clone())
             }
@@ -136,6 +143,27 @@ pub(crate) fn same_file(_a: &Path, _b: &Path) -> io::Result<bool> {
 /// True if something (even a broken symlink) is at `path`
 fn taken(path: &Path) -> bool {
     path.symlink_metadata().is_ok()
+}
+
+/// True if `dst` is inside `src`, a dir (not a symlink to one), so copying or moving `src` to
+/// `dst` would put it into itself
+/// The parents of `dst` that exist are also compared as files, which catches a path that only
+/// differs in case on a filesystem that ignores case
+pub(crate) fn inside(src: &Path, dst: &Path) -> bool {
+    src.symlink_metadata().is_ok_and(|m| m.is_dir())
+        && (dst.ancestors().skip(1))
+            .any(|parent| parent == src || same_file(parent, src).unwrap_or(false))
+}
+
+fn into_itself(src: &Path, dst: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "`{}` can not go into itself, at `{}`",
+            src.display(),
+            dst.display()
+        ),
+    )
 }
 
 fn already_exists(path: &Path) -> io::Error {
