@@ -886,9 +886,10 @@ fn test_glob_open() {
     assert_eq!(test_path(""), koil.current_dir());
     assert_eq!(Some("**/*"), koil.pattern().map(Pattern::as_str));
     assert_eq!(test_path("**/*"), koil.location());
-    // only files, and names are relative to the base dir
+    // files and dirs (`dir/` matches, `*` matching nothing), and names are relative to the
+    // base dir
     assert_eq!(
-        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        keep_all(&koil, &["dir/", "dir/inside", "file", "file2", "qwerty"]),
         koil.listing()
     );
 }
@@ -904,7 +905,14 @@ fn test_glob_patterns() {
         vec![PathBuf::from("file"), "file2".into(), "qwerty".into()],
         glob_names("*")
     );
-    assert_eq!(vec![PathBuf::from("dir/inside")], glob_names("d*/*"));
+    // a dir is matched with a `/` after it
+    assert_eq!(vec![PathBuf::from("dir")], glob_names("*/"));
+    assert_eq!(vec![PathBuf::from("dir")], glob_names("**/"));
+    assert_eq!(
+        vec![PathBuf::from("dir"), "dir/inside".into()],
+        glob_names("d*/*")
+    );
+    assert_eq!(vec![PathBuf::from("dir/inside")], glob_names("d*/?*"));
     assert_eq!(
         vec![PathBuf::from("file"), "file2".into()],
         glob_names("{file,file2}")
@@ -932,6 +940,7 @@ fn test_glob_unchanged() {
 fn test_glob_edit() {
     let mut koil = glob_koil("**/*");
     let entries = [
+        keep(&koil, "dir/"),
         with_id(id(&koil, "dir/inside"), "dir/inside2"),
         with_id(id(&koil, "file"), "dir/file"),
         keep(&koil, "file2"),
@@ -950,10 +959,16 @@ fn test_glob_edit() {
         ),
         koil.diff
     );
-    // every file is still shown where it was written, and `new/` is not, since it is a dir
-    let mut listing = entries.to_vec();
-    listing.sort_by(|a, b| a.name.cmp(&b.name));
-    assert_eq!(listing, koil.listing());
+    // every entry is still shown where it was written, and so is `new/`, which `new/x` creates
+    let listing = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file"), "dir/file"),
+        with_id(id(&koil, "dir/inside"), "dir/inside2"),
+        keep(&koil, "file2"),
+        without_id("new/"),
+        without_id("new/x"),
+    ];
+    assert_eq!(listing.to_vec(), koil.listing());
 }
 
 #[test]
@@ -973,7 +988,8 @@ fn test_glob_edit_seen_in_dir() {
     let mut koil = glob_koil("**/*");
     let inside = id(&koil, "dir/inside");
     let mut entries = koil.listing();
-    entries[0] = with_id(inside, "dir/renamed");
+    let i = entries.iter().position(|e| e.id == Some(inside)).unwrap();
+    entries[i] = with_id(inside, "dir/renamed");
     koil.update(&entries).unwrap();
 
     koil.open(test_path("dir")).unwrap();
@@ -988,7 +1004,7 @@ fn test_glob_hidden() {
     let mut listing = vec![Entry::parent()];
     listing.extend(keep_all(
         &koil,
-        &[".hidden", "dir/inside", "file", "file2", "qwerty"],
+        &["dir/", ".hidden", "dir/inside", "file", "file2", "qwerty"],
     ));
     assert_eq!(listing, koil.listing());
 }
@@ -1052,6 +1068,31 @@ fn test_glob_kept_on_refresh() {
     assert_eq!(Some("*"), loaded.pattern().map(Pattern::as_str));
 }
 
+#[test]
+fn test_glob_dirs() {
+    // a trailing `/` is kept, so only dirs match
+    let koil = glob_koil("*/");
+    assert_eq!(Some("*/"), koil.pattern().map(Pattern::as_str));
+    assert_eq!(test_path("*/"), koil.location());
+    assert_eq!(keep_all(&koil, &["dir/"]), koil.listing());
+
+    // a dir is still opened as a dir
+    let mut koil = test_koil();
+    koil.open("dir/").unwrap();
+    assert_eq!(None, koil.pattern());
+    assert_eq!(test_path("dir"), koil.current_dir());
+}
+
+#[test]
+fn test_glob_dirs_edit() {
+    let mut koil = glob_koil("*/");
+    let entries = [keep(&koil, "dir/"), without_id("new/"), without_id("x")];
+    koil.update(&entries).unwrap();
+    assert_eq!(diff(&koil, [], ["new/", "x"]), koil.diff);
+    // the new file is not shown, since it is not a dir
+    assert_eq!(entries[..2].to_vec(), koil.listing());
+}
+
 // ── regex ────────────────────────────────────────────────────────────────────
 
 fn regex() -> Settings {
@@ -1075,9 +1116,9 @@ fn test_regex_open() {
     assert_eq!(test_path(""), koil.current_dir());
     assert_eq!(Some(&Pattern::Regex(".*".into())), koil.pattern());
     assert_eq!(test_path(".*"), koil.location());
-    // `.*` matches `/` too, but still only files are shown
+    // `.*` matches `/` too, and dirs are matched with a `/` after them
     assert_eq!(
-        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        keep_all(&koil, &["dir/", "dir/inside", "file", "file2", "qwerty"]),
         koil.listing()
     );
 }
@@ -1100,7 +1141,12 @@ fn test_regex_patterns() {
         vec![PathBuf::from("file"), "qwerty".into()],
         regex_names("(file|qwerty)")
     );
-    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d.*"));
+    assert_eq!(
+        vec![PathBuf::from("dir"), "dir/inside".into()],
+        regex_names("d.*")
+    );
+    assert_eq!(vec![PathBuf::from("dir")], regex_names(".*/"));
+    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d.*[^/]"));
     // the whole path must match
     assert_eq!(Vec::<PathBuf>::new(), regex_names("il."));
 }
@@ -1135,7 +1181,11 @@ fn test_regex_commas() {
         vec![PathBuf::from("file"), "file2".into(), "qwerty".into()],
         regex_names(",*")
     );
-    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d,*/,*"));
+    assert_eq!(
+        vec![PathBuf::from("dir"), "dir/inside".into()],
+        regex_names("d,*/,*")
+    );
+    assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d,*/,+"));
     assert_eq!(Vec::<PathBuf>::new(), regex_names("d,*"));
 
     // `\,` is a `,`
@@ -1150,6 +1200,31 @@ fn test_regex_commas() {
     assert_eq!(vec![PathBuf::from("a,b")], names(&koil));
     koil.open(temp.path().join("a,b")).unwrap();
     assert_eq!(vec![PathBuf::from("a,b"), "axb".into()], names(&koil));
+}
+
+#[test]
+fn test_regex_trailing_slash() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("a/b")).unwrap();
+    fs::write(temp.path().join("c"), "").unwrap();
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open(temp.path()).unwrap();
+
+    // a trailing `/` is kept, so only dirs match
+    koil.open(",*/").unwrap();
+    assert_eq!(Some(&Pattern::Regex(",*/".into())), koil.pattern());
+    assert_eq!(koil.current_dir().join(",*/"), koil.location());
+    assert_eq!(keep_all(&koil, &["a/"]), koil.listing());
+    koil.open(temp.path().join(".*/")).unwrap();
+    assert_eq!(keep_all(&koil, &["a/", "a/b/"]), koil.listing());
+    koil.open(temp.path().join("a/,*/")).unwrap();
+    assert_eq!(keep_all(&koil, &["b/"]), koil.listing());
+    // without it, everything that matches
+    koil.open(temp.path().join(".*")).unwrap();
+    assert_eq!(keep_all(&koil, &["a/", "a/b/", "c"]), koil.listing());
+    // and a path that does not end with `/` is not a dir
+    koil.open(temp.path().join(".*,")).unwrap();
+    assert_eq!(keep_all(&koil, &["c"]), koil.listing());
 }
 
 #[test]
@@ -1206,7 +1281,7 @@ fn test_regex_setting_keeps_open_pattern() {
     // the open glob stays a glob
     assert_eq!(Some(&Pattern::Glob("**/*".into())), koil.pattern());
     assert_eq!(
-        keep_all(&koil, &["dir/inside", "file", "file2", "qwerty"]),
+        keep_all(&koil, &["dir/", "dir/inside", "file", "file2", "qwerty"]),
         koil.listing()
     );
     // but opening it again reads it as a regex
@@ -1279,6 +1354,8 @@ fn test_gitignore_off_by_default() {
     let koil = temp_koil(&temp, Settings::default(), "**/*");
     assert_eq!(
         vec![
+            "src/",
+            "target/",
             "a.log",
             "file",
             "src/debug.log",
@@ -1295,7 +1372,7 @@ fn test_gitignore() {
     let koil = temp_koil(&temp, gitignore(), "");
     assert_eq!(vec!["src/", "file"], names(&koil));
     let koil = temp_koil(&temp, gitignore(), "**/*");
-    assert_eq!(vec!["file", "src/main.rs"], names(&koil));
+    assert_eq!(vec!["src/", "file", "src/main.rs"], names(&koil));
     // the `.gitignore` of the repo root is used in its subdirs too
     let koil = temp_koil(&temp, gitignore(), "src");
     assert_eq!(vec!["main.rs"], names(&koil));

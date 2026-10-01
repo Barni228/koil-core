@@ -7,7 +7,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, is_separator};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
@@ -83,6 +83,7 @@ pub struct Settings {
 }
 
 /// A pattern of the paths to show, relative to [`Koil::current_dir`]
+/// It shows every file and dir that matches it, a dir is matched with a `/` after its path
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pattern {
     /// Like `**/*.rs`, where `*` never matches `/`
@@ -112,14 +113,21 @@ impl Pattern {
 
     fn matcher(&self) -> Result<Matcher, OpenError> {
         match self {
-            Pattern::Glob(glob) => GlobBuilder::new(glob)
-                .literal_separator(true)
-                .build()
-                .map(|g| Matcher::Glob(g.compile_matcher()))
-                .map_err(|source| OpenError::InvalidGlob {
-                    glob: glob.clone(),
-                    source,
-                }),
+            Pattern::Glob(glob) => {
+                // globset reads `**/` as `**`, so a trailing `/` is matched apart
+                let (rest, slash) = match glob.strip_suffix('/') {
+                    Some(rest) => (rest, true),
+                    None => (glob.as_str(), false),
+                };
+                GlobBuilder::new(rest)
+                    .literal_separator(true)
+                    .build()
+                    .map(|g| Matcher::Glob(g.compile_matcher(), slash))
+                    .map_err(|source| OpenError::InvalidGlob {
+                        glob: glob.clone(),
+                        source,
+                    })
+            }
             Pattern::Regex(regex) => {
                 let invalid = |source| OpenError::InvalidRegex {
                     regex: regex.clone(),
@@ -449,9 +457,10 @@ impl Koil {
     /// If it is relative, it will be opened relative to [`Koil::current_dir`]
     /// A dir can also be a new dir that was written in a listing, but does not exist yet,
     /// then it is opened with an empty listing
-    /// A pattern shows every file (not dir) whose path matches it, relative to its base dir:
+    /// A pattern shows every file and dir whose path matches it, relative to its base dir:
     /// the dirs before the first part with a special character (`*?[{` for a glob, and
-    /// `.,*+?()[]{}|^$\` for a regex). A glob's `*` never matches `/`, and a regex must match the
+    /// `.,*+?()[]{}|^$\` for a regex). A dir's path has a `/` at its end, so `,*/` shows only
+    /// dirs, and `,*` only files. A glob's `*` never matches `/`, and a regex must match the
     /// whole path, where `,` is any character except `/`
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
     /// If the dir (or the base dir of the pattern) is neither on disk nor in the diff, the
@@ -459,8 +468,11 @@ impl Koil {
     /// This never adds changes, new dirs must be written in the listing
     /// Returns a warning, if the dir was not found and a parent was opened instead
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<Option<Warning>, OpenError> {
+        let location = location.as_ref();
+        // `resolve` drops a trailing `/`, which a pattern needs to match only dirs
+        let slash = location.to_string_lossy().ends_with(is_separator);
         let path = resolve(&self.current_dir.join(location))?;
-        let (base, pattern) = match self.split_pattern(&path) {
+        let (base, pattern) = match self.split_pattern(&path, slash) {
             Some((base, pattern)) => {
                 pattern.matcher()?;
                 (base, Some(pattern))
@@ -849,10 +861,10 @@ impl Koil {
     }
 
     /// Split `path` into its base dir, and the pattern relative to it, which is a glob, or a
-    /// regex if [`Settings::regex`] is on
+    /// regex if [`Settings::regex`] is on, with a `/` at its end if `slash`
     /// `None` if it is not a pattern, because no part of it after the longest part that is a
     /// dir has a special character
-    fn split_pattern(&self, path: &Path) -> Option<(PathBuf, Pattern)> {
+    fn split_pattern(&self, path: &Path, slash: bool) -> Option<(PathBuf, Pattern)> {
         // so a dir with a name like `a[1]` is not taken for a pattern
         let dir = path.ancestors().find(|p| self.is_dir(p))?;
         let parts: Vec<String> = path
@@ -864,7 +876,10 @@ impl Koil {
         let regex = self.settings.regex;
         let first = parts.iter().position(|p| Pattern::is_pattern(regex, p))?;
         let base = dir.join(parts[..first].iter().collect::<PathBuf>());
-        let pattern = parts[first..].join("/");
+        let mut pattern = parts[first..].join("/");
+        if slash {
+            pattern.push('/');
+        }
         let pattern = match regex {
             true => Pattern::Regex(pattern),
             false => Pattern::Glob(pattern),
@@ -1087,29 +1102,31 @@ impl View {
     fn contains(&self, path: &Path, is_dir: bool) -> bool {
         match &self.matcher {
             None => path.parent() == Some(&self.base),
-            // a pattern only shows files
-            Some(matcher) => {
-                !is_dir
-                    && path
-                        .strip_prefix(&self.base)
-                        .is_ok_and(|p| matcher.is_match(p))
-            }
+            Some(matcher) => path
+                .strip_prefix(&self.base)
+                .is_ok_and(|p| matcher.is_match(p, is_dir)),
         }
     }
 }
 
 /// A compiled [`Pattern`]
 enum Matcher {
-    Glob(GlobMatcher),
+    /// The glob without its trailing `/`, and whether it had one
+    Glob(GlobMatcher, bool),
     Regex(Regex),
 }
 
 impl Matcher {
-    /// Whether `path`, relative to the base dir, matches
-    fn is_match(&self, path: &Path) -> bool {
+    /// Whether `path`, relative to the base dir, matches, with a `/` after it if it is a dir
+    fn is_match(&self, path: &Path, is_dir: bool) -> bool {
+        let mut path = path.to_string_lossy().into_owned();
+        if is_dir {
+            path.push('/');
+        }
         match self {
-            Matcher::Glob(glob) => glob.is_match(path),
-            Matcher::Regex(regex) => regex.is_match(&path.to_string_lossy()),
+            Matcher::Glob(glob, true) => path.strip_suffix('/').is_some_and(|p| glob.is_match(p)),
+            Matcher::Glob(glob, false) => glob.is_match(&path),
+            Matcher::Regex(regex) => regex.is_match(&path),
         }
     }
 }
