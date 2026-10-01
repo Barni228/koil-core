@@ -79,8 +79,10 @@ temporary name.
   error. These include characters Windows does not allow, characters a shell needs quoted,
   reserved names like `CON`, emoji, invisible or look-alike characters, spaces at the edges,
   a trailing `.`, a leading `-`, and names that are not valid UTF-8.
-- **Patterns.** Open a glob like `src/**/*.rs`, or a regex, to edit every matching file at
-  once. Names are shown relative to the base dir.
+- **Patterns.** Open a glob like `src/**/*.rs`, or a regex, to edit every matching file and
+  dir at once. Names are shown relative to the base dir. Dirs that nothing inside can match
+  are never searched, and a pattern that matches or has to search too much (`Limits`) stops
+  early, instead of reading every path.
 - **Hidden and ignored files.** Hidden entries and entries ignored by git can be hidden or
   shown (`Settings`). A hidden entry is still shown while it has pending changes, so a
   change is never lost.

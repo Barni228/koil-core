@@ -304,6 +304,7 @@ dependencies = [
  "objc2-foundation",
  "pathfinding",
  "regex",
+ "regex-automata",
  "serde",
  "serde_json",
  "tempfile",

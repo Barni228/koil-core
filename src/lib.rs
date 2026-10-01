@@ -3,11 +3,16 @@
 use crate::apply::{Undo, same_file};
 use crate::diff::Diff;
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
+use regex_automata::dfa::{Automaton, StartKind, dense};
+use regex_automata::util::syntax;
+use regex_automata::{Anchored, Input};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf, is_separator};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
@@ -80,6 +85,47 @@ pub struct Settings {
     /// [`Koil::open`] reads patterns as regexes, instead of globs
     /// A pattern that is already open stays as it is until something else is opened
     pub regex: bool,
+}
+
+/// How much opening a pattern can read, so one that matches too much (like `.*` in a home dir)
+/// stops early, instead of reading every path, and the listing stays short enough to edit
+/// A plain dir has no limits
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    /// How many paths a pattern can match
+    pub matches: usize,
+    /// How many paths can be read to find them (dirs that nothing inside can match are skipped)
+    pub searched: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            matches: 10_000,
+            searched: 100_000,
+        }
+    }
+}
+
+impl Limits {
+    /// Fail if `pattern` went over a limit, with `matches` paths found in `searched` ones
+    fn check(&self, pattern: &Pattern, matches: usize, searched: usize) -> Result<(), OverLimit> {
+        let pattern = || pattern.as_str().to_string();
+        if matches > self.matches {
+            return Err(OverLimit::Matches {
+                pattern: pattern(),
+                limit: self.matches,
+            });
+        }
+        if searched > self.searched {
+            return Err(OverLimit::Searched {
+                pattern: pattern(),
+                limit: self.searched,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A pattern of the paths to show, relative to [`Koil::current_dir`]
@@ -213,6 +259,14 @@ pub enum Warning {
         /// The dir that was opened instead
         opened: PathBuf,
     },
+
+    /// The open pattern went over [`Limits`] when it was opened again (like after showing
+    /// hidden paths), so its base dir was opened instead
+    OverLimit {
+        error: OverLimit,
+        /// The dir that was opened instead
+        opened: PathBuf,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -224,6 +278,9 @@ impl fmt::Display for Warning {
                 requested.display(),
                 opened.display()
             ),
+            Warning::OverLimit { error, opened } => {
+                write!(f, "{error}, opened `{}` instead", opened.display())
+            }
         }
     }
 }
@@ -288,6 +345,19 @@ pub enum OpenError {
         #[source]
         source: regex::Error,
     },
+
+    #[error(transparent)]
+    OverLimit(#[from] OverLimit),
+}
+
+/// A pattern matched or searched more paths than [`Limits`] allow
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OverLimit {
+    #[error("`{pattern}` matches more than {limit} paths")]
+    Matches { pattern: String, limit: usize },
+
+    #[error("`{pattern}` has to search more than {limit} paths")]
+    Searched { pattern: String, limit: usize },
 }
 
 /// Why [`Koil::update`] rejected the entries, nothing was changed
@@ -416,6 +486,11 @@ pub struct Koil {
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
 
+    #[builder(default)]
+    #[serde(default)]
+    /// How much opening a pattern can read
+    limits: Limits,
+
     // Private fields
     #[builder(default, setter(skip))]
     /// All IDs, pointing to their corresponding path
@@ -462,6 +537,8 @@ impl Koil {
     /// `.,*+?()[]{}|^$\` for a regex). A dir's path has a `/` at its end, so `,*/` shows only
     /// dirs, and `,*` only files. A glob's `*` never matches `/`, and a regex must match the
     /// whole path, where `,` is any character except `/`
+    /// A pattern fails with [`OverLimit`] if it matches or has to search more paths than
+    /// [`Limits`] allow, dirs that nothing inside can match are never searched
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
     /// If the dir (or the base dir of the pattern) is neither on disk nor in the diff, the
     /// closest parent that is gets opened as a dir
@@ -479,7 +556,11 @@ impl Koil {
             }
             None => (path, None),
         };
-        Ok(self.open_at(base, pattern)?)
+        // in a copy, so nothing changes if it fails
+        let mut opened = self.clone();
+        let warning = opened.open_at(base, pattern)?;
+        *self = opened;
+        Ok(warning)
     }
 
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
@@ -508,7 +589,8 @@ impl Koil {
     }
 
     /// Change how the listing is shown, and reopen [`Koil::current_dir`] with the new settings
-    /// Returns a warning, if the open dir is gone and its closest parent was opened instead
+    /// Returns a warning, if the open dir is gone and its closest parent was opened instead, or
+    /// the open pattern goes over [`Limits`] now, and its base dir was opened instead
     pub fn set_settings(&mut self, settings: Settings) -> io::Result<Option<Warning>> {
         self.settings = settings;
         self.reopen()
@@ -740,21 +822,36 @@ impl Koil {
 
     /// Open [`Koil::location`] again, so it shows what is on disk now
     /// Does nothing if nothing was opened yet
+    /// If the open pattern goes over [`Limits`] now, its base dir is opened instead
     fn reopen(&mut self) -> io::Result<Option<Warning>> {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(None);
         }
         // not parsed again, so a pattern stays a glob or a regex, even if the settings changed
-        self.open_at(self.current_dir.clone(), self.pattern.clone())
+        match self.open_at(self.current_dir.clone(), self.pattern.clone()) {
+            Err(OpenError::OverLimit(error)) => {
+                self.pattern = None;
+                self.read_listing().map_err(io_error)?;
+                Ok(Some(Warning::OverLimit {
+                    error,
+                    opened: self.current_dir.clone(),
+                }))
+            }
+            result => result.map_err(io_error),
+        }
     }
 
     /// Open `pattern` (a valid one) inside `base`, or just `base` if there is no pattern
     /// See [`Koil::open`]
-    fn open_at(&mut self, base: PathBuf, pattern: Option<Pattern>) -> io::Result<Option<Warning>> {
+    fn open_at(
+        &mut self,
+        base: PathBuf,
+        pattern: Option<Pattern>,
+    ) -> Result<Option<Warning>, OpenError> {
         let dir = base
             .ancestors()
             .find(|p| self.is_dir(p))
-            .ok_or(io::ErrorKind::NotFound)?
+            .ok_or(io::Error::from(io::ErrorKind::NotFound))?
             .to_path_buf();
         let found = dir == base;
         let warning = (!found).then(|| Warning::DirNotFound {
@@ -770,7 +867,7 @@ impl Koil {
     }
 
     /// Read [`Koil::current_listing`] for the open dir or pattern from the filesystem
-    fn read_listing(&mut self) -> io::Result<()> {
+    fn read_listing(&mut self) -> Result<(), OpenError> {
         self.current_listing.clear();
         let view = self.view();
 
@@ -779,16 +876,25 @@ impl Koil {
             // a new dir that is not created yet
             false => Vec::new(),
         };
+        // a pattern can show thousands of paths, so they are not searched for in `ids` one by one
+        let known: HashMap<&Path, usize> = (self.ids.iter().enumerate())
+            .map(|(index, path)| (path.as_path(), index))
+            .collect();
+        let mut new = Vec::new();
         for path in paths {
             if self.ignore.contains(&path) {
                 continue;
             }
-            let index = self.ids.iter().position(|p| p == &path);
-            let index = index.unwrap_or_else(|| {
-                self.ids.push(path);
-                self.ids.len() - 1
-            });
-            self.current_listing.insert(index);
+            match known.get(path.as_path()) {
+                Some(&index) => {
+                    self.current_listing.insert(index);
+                }
+                None => new.push(path),
+            }
+        }
+        for path in new {
+            self.ids.push(path);
+            self.current_listing.insert(self.ids.len() - 1);
         }
 
         // a changed entry stays, even if it is hidden, so it is not taken for deleted in
@@ -805,8 +911,8 @@ impl Koil {
     /// Every path on disk that `view` shows, without hidden entries if they are not shown,
     /// and without ignored paths if [`Settings::respect_gitignore`] is on
     /// Fails if [`Koil::current_dir`] can not be read, but dirs inside it that can not be read
-    /// are skipped
-    fn walk(&self, view: &View) -> io::Result<Vec<PathBuf>> {
+    /// are skipped, or if a pattern goes over [`Limits`]
+    fn walk(&self, view: &View) -> Result<Vec<PathBuf>, OpenError> {
         fs::read_dir(&self.current_dir)?;
         let max_depth = match &self.pattern {
             None => Some(1),
@@ -828,16 +934,52 @@ impl Koil {
             .parents(gitignore)
             // git never shows its own dir
             .filter_entry(move |item| !(gitignore && item.file_name() == ".git"))
-            .build();
+            .build_parallel();
 
-        let mut paths = Vec::new();
-        for item in walk.flatten() {
-            let is_dir = item.file_type().is_some_and(|t| t.is_dir());
-            // the walk starts with the dir itself
-            if item.depth() > 0 && view.contains(item.path(), is_dir) {
-                paths.push(item.into_path());
-            }
+        let prune = Prune::new(view);
+        let (pattern, limits) = (self.pattern.as_ref(), self.limits);
+        let paths = Mutex::new(Vec::new());
+        let (searched, matched) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let over_limit = Mutex::new(None);
+        walk.run(|| {
+            Box::new(|item| {
+                // what can not be read is skipped
+                let Ok(item) = item else {
+                    return WalkState::Continue;
+                };
+                // the walk starts with the dir itself
+                if item.depth() == 0 {
+                    return WalkState::Continue;
+                }
+                let is_dir = item.file_type().is_some_and(|t| t.is_dir());
+                let skip_inside = is_dir && prune.as_ref().is_some_and(|p| p.skips_inside(&item));
+                let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
+                let matches = match view.contains(item.path(), is_dir) {
+                    true => {
+                        paths.lock().unwrap().push(item.into_path());
+                        matched.fetch_add(1, Ordering::Relaxed) + 1
+                    }
+                    false => matched.load(Ordering::Relaxed),
+                };
+                if let Some(pattern) = pattern
+                    && let Err(error) = limits.check(pattern, matches, searched)
+                {
+                    *over_limit.lock().unwrap() = Some(error);
+                    return WalkState::Quit;
+                }
+                match skip_inside {
+                    true => WalkState::Skip,
+                    false => WalkState::Continue,
+                }
+            })
+        });
+
+        if let Some(error) = over_limit.into_inner().unwrap() {
+            return Err(error.into());
         }
+        let mut paths = paths.into_inner().unwrap();
+        // the walk runs on many threads, in no order, and new IDs are given in this one
+        paths.sort();
         Ok(paths)
     }
 
@@ -1117,17 +1259,99 @@ enum Matcher {
 }
 
 impl Matcher {
-    /// Whether `path`, relative to the base dir, matches, with a `/` after it if it is a dir
+    /// Whether `path`, relative to the base dir, matches (see [`match_text`])
     fn is_match(&self, path: &Path, is_dir: bool) -> bool {
-        let mut path = path.to_string_lossy().into_owned();
-        if is_dir {
-            path.push('/');
-        }
+        let text = match_text(path, is_dir);
         match self {
-            Matcher::Glob(glob, true) => path.strip_suffix('/').is_some_and(|p| glob.is_match(p)),
-            Matcher::Glob(glob, false) => glob.is_match(&path),
-            Matcher::Regex(regex) => regex.is_match(&path),
+            Matcher::Glob(glob, true) => text.strip_suffix('/').is_some_and(|t| glob.is_match(t)),
+            Matcher::Glob(glob, false) => glob.is_match(&text),
+            Matcher::Regex(regex) => regex.is_match(&text),
         }
+    }
+
+    /// The regex that [`Matcher::is_match`] uses, as a DFA, `None` if it would be too big
+    fn dfa(&self) -> Option<dense::DFA<Vec<u32>>> {
+        // a glob is matched as bytes, where `.` also matches a new line, like globset does
+        let (regex, glob) = match self {
+            Matcher::Glob(glob, _) => (glob.glob().regex(), true),
+            Matcher::Regex(regex) => (regex.as_str(), false),
+        };
+        let size = Some(DFA_SIZE_LIMIT);
+        let config = dense::Config::new()
+            .start_kind(StartKind::Anchored)
+            .determinize_size_limit(size)
+            .dfa_size_limit(size);
+        dense::Builder::new()
+            .configure(config)
+            .syntax(syntax::Config::new().utf8(!glob).dot_matches_new_line(glob))
+            .build(regex)
+            .ok()
+    }
+}
+
+/// How many bytes a pattern's DFA can take, a bigger one skips no dirs
+const DFA_SIZE_LIMIT: usize = 1 << 20;
+
+/// The text a pattern is matched against: `path` (relative to the base dir) with a `/` between
+/// its parts, and after it if it is a dir
+fn match_text(path: &Path, is_dir: bool) -> String {
+    let parts: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    let mut text = parts.join("/");
+    if is_dir {
+        text.push('/');
+    }
+    text
+}
+
+/// Which dirs a walk of a pattern does not need to enter, since nothing inside them can match
+struct Prune {
+    /// The base dir of the pattern
+    base: PathBuf,
+    /// [`Matcher::dfa`], which tells when no text that starts with a dir's can match
+    dfa: dense::DFA<Vec<u32>>,
+}
+
+impl Prune {
+    /// `None` without a pattern, or if its DFA would be too big, then every dir is entered
+    fn new(view: &View) -> Option<Prune> {
+        Some(Prune {
+            base: view.base.clone(),
+            dfa: view.matcher.as_ref()?.dfa()?,
+        })
+    }
+
+    /// Whether nothing inside the dir `item` can match
+    fn skips_inside(&self, item: &ignore::DirEntry) -> bool {
+        let Ok(path) = item.path().strip_prefix(&self.base) else {
+            return false;
+        };
+        // the text of every path inside is the dir's (its `/` included), and then more
+        let text = match_text(path, true);
+        let input = Input::new(&text).anchored(Anchored::Yes);
+        let Ok(mut state) = self.dfa.start_state_forward(&input) else {
+            return false;
+        };
+        for &byte in text.as_bytes() {
+            state = self.dfa.next_state(state, byte);
+            if self.dfa.is_quit_state(state) {
+                return false;
+            }
+            if self.dfa.is_dead_state(state) {
+                return true;
+            }
+        }
+        (0..=u8::MAX).all(|byte| self.dfa.is_dead_state(self.dfa.next_state(state, byte)))
+    }
+}
+
+/// `error` as an [`io::Error`], for what can not fail any other way
+fn io_error(error: OpenError) -> io::Error {
+    match error {
+        OpenError::Io(error) => error,
+        error => io::Error::other(error),
     }
 }
 

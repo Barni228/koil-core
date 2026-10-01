@@ -1291,6 +1291,108 @@ fn test_regex_setting_keeps_open_pattern() {
     ));
 }
 
+// ── limits ───────────────────────────────────────────────────────────────────
+
+/// A temp dir with 30 files in `a/deep/`, `b/x`, `c`, and 10 hidden files
+fn limits_temp_dir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("a/deep")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    for i in 0..30 {
+        fs::write(root.join(format!("a/deep/f{i}")), "").unwrap();
+    }
+    for i in 0..10 {
+        fs::write(root.join(format!(".h{i}")), "").unwrap();
+    }
+    for file in ["b/x", "c"] {
+        fs::write(root.join(file), "").unwrap();
+    }
+    temp
+}
+
+/// Koil with regexes, at most 5 matches and 20 searched paths, and `temp` open
+fn limited_koil(temp: &tempfile::TempDir) -> Koil {
+    let limits = Limits {
+        matches: 5,
+        searched: 20,
+    };
+    let mut koil = Koil::builder().settings(regex()).limits(limits).build();
+    koil.open(temp.path()).unwrap();
+    koil
+}
+
+#[test]
+fn test_pattern_skips_dirs() {
+    let temp = limits_temp_dir();
+    let mut koil = limited_koil(&temp);
+    // `a/deep/` is never entered, or its 30 files would go over the limit
+    koil.open(",*/").unwrap();
+    assert_eq!(names(&koil), ["a/", "b/"]);
+    koil.open(temp.path().join(",*/x")).unwrap();
+    assert_eq!(names(&koil), ["b/x"]);
+    koil.open(temp.path().join("(a|b)/,+/?")).unwrap();
+    assert_eq!(names(&koil), ["a/deep/", "b/x"]);
+
+    // the same with globs
+    let mut koil = Koil::builder().limits(koil.limits).build();
+    koil.open(temp.path().join("*/x")).unwrap();
+    assert_eq!(names(&koil), ["b/x"]);
+    koil.open(temp.path().join("{a,b}/*/")).unwrap();
+    assert_eq!(names(&koil), ["a/deep/"]);
+}
+
+#[test]
+fn test_pattern_limits() {
+    let temp = limits_temp_dir();
+    let mut koil = limited_koil(&temp);
+    koil.open(",*/").unwrap();
+    let before = koil.save_state();
+
+    // everything matches
+    assert!(matches!(
+        koil.open(temp.path().join(".*")),
+        Err(OpenError::OverLimit(OverLimit::Matches { pattern, limit: 5 })) if pattern == ".*"
+    ));
+    // only one path matches, but every one has to be searched
+    assert!(matches!(
+        koil.open(temp.path().join(".*x")),
+        Err(OpenError::OverLimit(OverLimit::Searched { limit: 20, .. }))
+    ));
+    // nothing changed
+    assert_eq!(before, koil.save_state());
+
+    // a plain dir has no limits
+    koil.open(temp.path().join("a/deep")).unwrap();
+    assert_eq!(koil.listing().len(), 30);
+}
+
+#[test]
+fn test_pattern_over_limit_on_reopen() {
+    let temp = limits_temp_dir();
+    let mut koil = limited_koil(&temp);
+    koil.open(",*").unwrap();
+    assert_eq!(names(&koil), ["c"]);
+    // with the hidden files, it matches 11, so its dir is opened instead
+    let settings = Settings {
+        show_hidden: true,
+        ..regex()
+    };
+    let canonical = koil.current_dir().to_path_buf();
+    assert_eq!(
+        Some(Warning::OverLimit {
+            error: OverLimit::Matches {
+                pattern: ",*".into(),
+                limit: 5
+            },
+            opened: canonical.clone(),
+        }),
+        koil.set_settings(settings).unwrap()
+    );
+    assert_eq!(None, koil.pattern());
+    assert_eq!(canonical, koil.current_dir());
+}
+
 // ── gitignore ────────────────────────────────────────────────────────────────
 
 /// A temp dir, with a `.gitignore` that ignores `target/` and `*.log`, and:
