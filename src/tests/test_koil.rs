@@ -208,7 +208,7 @@ fn test_copy_then_delete_original() {
 fn test_enter_new_dir() {
     let mut koil = update_test_dir(&["newdir/"]).unwrap();
     let qwerty = id(&koil, "qwerty");
-    assert_eq!(None, koil.open("newdir").unwrap());
+    koil.open("newdir").unwrap();
     assert_eq!(test_path("newdir"), koil.current_dir);
     assert_eq!(Vec::<Entry>::new(), koil.listing());
     assert_eq!(diff(&koil, [], ["newdir/"]), koil.diff);
@@ -246,15 +246,13 @@ fn test_enter_new_dir() {
 #[test]
 fn test_open_made_up_dir() {
     let mut koil = test_koil();
-    // `made/up` does not exist, and is not in the listing, so go as far as possible
-    assert_eq!(
-        Some(Warning::DirNotFound {
-            requested: test_path("dir/made/up"),
-            opened: test_path("dir"),
-        }),
-        koil.open(test_path("dir/made/up")).unwrap()
-    );
-    assert_eq!(test_path("dir"), koil.current_dir);
+    // `made/up` does not exist, and is not in the listing, so it fails at `made`
+    assert!(matches!(
+        koil.open(test_path("dir/made/up")),
+        Err(OpenError::NotFound(path)) if path == test_path("dir/made")
+    ));
+    // nothing changed
+    assert_eq!(test_path(""), koil.current_dir);
     assert_eq!(Diff::default(), koil.diff);
 }
 
@@ -262,28 +260,37 @@ fn test_open_made_up_dir() {
 fn test_open_made_up_dir_in_new_dir() {
     // a new dir can be entered, but a made up dir inside it is not created
     let mut koil = update_test_dir(&["newdir/"]).unwrap();
-    assert_eq!(
-        Some(Warning::DirNotFound {
-            requested: test_path("newdir/made/up"),
-            opened: test_path("newdir"),
-        }),
-        koil.open(test_path("newdir/made/up")).unwrap()
-    );
-    assert_eq!(test_path("newdir"), koil.current_dir);
+    assert!(matches!(
+        koil.open(test_path("newdir/made/up")),
+        Err(OpenError::NotFound(path)) if path == test_path("newdir/made")
+    ));
+    assert_eq!(test_path(""), koil.current_dir);
     assert_eq!(diff(&koil, [], ["newdir/"]), koil.diff);
 }
 
 #[test]
+fn test_open_file() {
+    let mut koil = test_koil();
+    assert!(matches!(
+        koil.open("file"),
+        Err(OpenError::NotADirectory(path)) if path == test_path("file")
+    ));
+    // a path inside a file fails at the file
+    assert!(matches!(
+        koil.open("file/inside/*"),
+        Err(OpenError::NotADirectory(path)) if path == test_path("file")
+    ));
+    assert_eq!(test_path(""), koil.current_dir);
+}
+
+#[test]
 fn test_open_new_file() {
-    // a new file is not a dir, so the dir it is in is opened
+    // a new file is not a dir either
     let mut koil = update_test_dir(&["newfile"]).unwrap();
-    assert_eq!(
-        Some(Warning::DirNotFound {
-            requested: test_path("newfile"),
-            opened: test_path(""),
-        }),
-        koil.open("newfile").unwrap()
-    );
+    assert!(matches!(
+        koil.open("newfile"),
+        Err(OpenError::NotADirectory(path)) if path == test_path("newfile")
+    ));
 }
 
 // ── nested paths ─────────────────────────────────────────────────────────────
@@ -871,7 +878,7 @@ fn test_settings_are_saved() {
 /// Koil with the glob `glob` opened inside `test_dir`
 fn glob_koil(glob: &str) -> Koil {
     let mut koil = test_koil();
-    assert_eq!(None, koil.open(glob).unwrap());
+    koil.open(glob).unwrap();
     koil
 }
 
@@ -1020,13 +1027,10 @@ fn test_glob_in_new_dir() {
 #[test]
 fn test_glob_missing_base() {
     let mut koil = test_koil();
-    assert_eq!(
-        Some(Warning::DirNotFound {
-            requested: test_path("made/up"),
-            opened: test_path(""),
-        }),
-        koil.open("made/up/*").unwrap()
-    );
+    assert!(matches!(
+        koil.open("made/up/*"),
+        Err(OpenError::NotFound(path)) if path == test_path("made")
+    ));
     assert_eq!(None, koil.pattern().map(Pattern::as_str));
     assert_eq!(test_dir_listing(&koil), koil.listing());
 }
@@ -1106,7 +1110,7 @@ fn regex() -> Settings {
 fn regex_koil(pattern: &str) -> Koil {
     let mut koil = Koil::builder().settings(regex()).build();
     koil.open("test_dir").unwrap();
-    assert_eq!(None, koil.open(pattern).unwrap());
+    koil.open(pattern).unwrap();
     koil
 }
 
@@ -1254,15 +1258,12 @@ fn test_regex_dirs() {
     let mut koil = Koil::builder().settings(regex()).build();
     koil.open("test_dir").unwrap();
     // a path without special characters is a dir
-    assert_eq!(None, koil.open("dir").unwrap());
+    koil.open("dir").unwrap();
     assert_eq!(None, koil.pattern());
-    assert_eq!(
-        Some(Warning::DirNotFound {
-            requested: test_path("dir/made/up"),
-            opened: test_path("dir"),
-        }),
-        koil.open("made/up").unwrap()
-    );
+    assert!(matches!(
+        koil.open("made/up"),
+        Err(OpenError::NotFound(path)) if path == test_path("dir/made")
+    ));
 
     // an existing dir is never a regex, even with a `.` in its name
     let temp = tempfile::tempdir().unwrap();
@@ -1428,7 +1429,7 @@ fn gitignore_temp_dir(git: bool) -> tempfile::TempDir {
 /// Koil with `location` opened inside `temp`
 fn temp_koil(temp: &tempfile::TempDir, settings: Settings, location: &str) -> Koil {
     let mut koil = Koil::builder().settings(settings).build();
-    assert_eq!(None, koil.open(temp.path().join(location)).unwrap());
+    koil.open(temp.path().join(location)).unwrap();
     koil
 }
 

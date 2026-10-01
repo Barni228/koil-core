@@ -252,7 +252,8 @@ impl Action {
 /// Something that did not stop koil, but user should know about
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Warning {
-    /// The dir is neither on disk nor new in the diff, so its closest parent was opened instead
+    /// The open dir is neither on disk nor new in the diff anymore (when it is opened again,
+    /// like after an apply), so its closest parent was opened instead
     DirNotFound {
         /// The dir that user wanted to open
         requested: PathBuf,
@@ -274,7 +275,7 @@ impl fmt::Display for Warning {
         match self {
             Warning::DirNotFound { requested, opened } => write!(
                 f,
-                "`{}` is not a directory, and is not written in the listing, opened `{}` instead",
+                "`{}` is not a directory, opened `{}` instead",
                 requested.display(),
                 opened.display()
             ),
@@ -331,6 +332,14 @@ pub enum KoilError {
 pub enum OpenError {
     #[error("Can not read the dir")]
     Io(#[from] io::Error),
+
+    /// The first part of the path that is neither on disk nor new in the diff
+    #[error("`{}` does not exist", .0.display())]
+    NotFound(PathBuf),
+
+    /// The first part of the path that is a file, on disk or new in the diff
+    #[error("`{}` is a file, not a directory", .0.display())]
+    NotADirectory(PathBuf),
 
     #[error("`{glob}` is not a valid glob pattern")]
     InvalidGlob {
@@ -540,11 +549,10 @@ impl Koil {
     /// A pattern fails with [`OverLimit`] if it matches or has to search more paths than
     /// [`Limits`] allow, dirs that nothing inside can match are never searched
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
-    /// If the dir (or the base dir of the pattern) is neither on disk nor in the diff, the
-    /// closest parent that is gets opened as a dir
+    /// The dir (or the base dir of the pattern) must be on disk or new in the diff, else it
+    /// fails with [`OpenError::NotFound`], or [`OpenError::NotADirectory`] if it is a file
     /// This never adds changes, new dirs must be written in the listing
-    /// Returns a warning, if the dir was not found and a parent was opened instead
-    pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<Option<Warning>, OpenError> {
+    pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
         let location = location.as_ref();
         // `resolve` drops a trailing `/`, which a pattern needs to match only dirs
         let slash = location.to_string_lossy().ends_with(is_separator);
@@ -556,11 +564,14 @@ impl Koil {
             }
             None => (path, None),
         };
+        if !self.is_dir(&base) {
+            return Err(self.not_a_dir(&base));
+        }
         // in a copy, so nothing changes if it fails
         let mut opened = self.clone();
-        let warning = opened.open_at(base, pattern)?;
+        opened.open_at(base, pattern)?;
         *self = opened;
-        Ok(warning)
+        Ok(())
     }
 
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
@@ -842,7 +853,8 @@ impl Koil {
     }
 
     /// Open `pattern` (a valid one) inside `base`, or just `base` if there is no pattern
-    /// See [`Koil::open`]
+    /// See [`Koil::open`], which checks that `base` is a dir first, so only when reopening can
+    /// it be gone: then its closest parent that is a dir is opened instead, with a warning
     fn open_at(
         &mut self,
         base: PathBuf,
@@ -1000,6 +1012,17 @@ impl Koil {
     /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`]
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir() || self.diff.creates_dir(path)
+    }
+
+    /// Why `path`, which is not a dir, can not be opened: its first part that is not a dir is
+    /// a file (on disk, or new in the diff), or does not exist
+    fn not_a_dir(&self, path: &Path) -> OpenError {
+        let first = path.ancestors().take_while(|p| !self.is_dir(p)).last();
+        let first = first.unwrap_or(path).to_path_buf();
+        match first.exists() || self.diff.without_id.get(&first) == Some(&false) {
+            true => OpenError::NotADirectory(first),
+            false => OpenError::NotFound(first),
+        }
     }
 
     /// Split `path` into its base dir, and the pattern relative to it, which is a glob, or a
