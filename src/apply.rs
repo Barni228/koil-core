@@ -135,7 +135,25 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS, which opening a dir needs, and FILE_FLAG_OPEN_REPARSE_POINT,
+    // which opens a link itself, not what it points to (like `symlink_metadata`)
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    let id = |path: &Path| -> io::Result<(u64, u64)> {
+        // reading its information needs no access to the file
+        let file = fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FLAGS)
+            .open(path)?;
+        let info = winapi_util::file::information(&file)?;
+        Ok((info.volume_serial_number(), info.file_index()))
+    };
+    Ok(id(a)? == id(b)?)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn same_file(_a: &Path, _b: &Path) -> io::Result<bool> {
     Ok(false)
 }

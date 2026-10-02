@@ -1,11 +1,9 @@
 use super::*;
 use diff::Diff;
 
-/// Path to `s` inside `test_dir`
+/// Path to `s` inside `test_dir`, after a `/`, which a pattern's base dir needs on Windows
 fn test_path(s: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_dir")
-        .join(s)
+    PathBuf::from(format!("{}/test_dir/{s}", env!("CARGO_MANIFEST_DIR")))
 }
 
 /// Koil with `test_dir` opened
@@ -428,7 +426,12 @@ fn test_nested_create_inside_file_fails() {
 
 #[test]
 fn test_invalid_names_fail() {
-    for name in ["../A", "/A", "./A", "a/../b", "a/./b", ""] {
+    let mut names = vec!["../A", "/A", "./A", "a/../b", "a/./b", ""];
+    // `\` is a separator there too, and `C:` a drive
+    if cfg!(windows) {
+        names.extend([r"..\A", r"\A", r"a\.\b", "C:A", "C:/A"]);
+    }
+    for name in names {
         assert_eq!(
             vec![(4, EntryErrorKind::InvalidName(name.into()))],
             errors(update_test_dir(&[name])),
@@ -548,15 +551,31 @@ fn test_name_warnings() {
         vec![
             entry_warning(
                 4,
-                EntryWarningKind::WindowsCharacter {
-                    name: "a:b".into(),
-                    chars: ":".into()
+                EntryWarningKind::ShellCharacter {
+                    name: "a$b".into(),
+                    chars: "$".into()
                 }
             ),
             entry_warning(6, EntryWarningKind::LeadingDash { name: "-x".into() }),
         ],
-        update_with(&["a:b", "fine", "-x"]).unwrap()
+        update_with(&["a$b", "fine", "-x"]).unwrap()
     );
+}
+
+#[test]
+fn test_windows_names() {
+    let kind = EntryWarningKind::WindowsCharacter {
+        name: "a<b".into(),
+        chars: "<".into(),
+    };
+    match cfg!(windows) {
+        // which Windows can not create
+        true => assert_eq!(
+            vec![(4, EntryErrorKind::WindowsName(kind))],
+            errors(update_test_dir(&["a<b"]))
+        ),
+        false => assert_eq!(vec![entry_warning(4, kind)], update_with(&["a<b"]).unwrap()),
+    }
 }
 
 #[test]
@@ -979,6 +998,39 @@ fn test_glob_patterns() {
     );
     assert_eq!(vec![PathBuf::from("file2")], glob_names("file?"));
     assert_eq!(Vec::<PathBuf>::new(), glob_names("*.rs"));
+    // `\` escapes, also on Windows, where only `/` splits a pattern
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into()],
+        glob_names(r"fil\e*")
+    );
+    assert_eq!(Vec::<PathBuf>::new(), glob_names(r"file\*"));
+}
+
+#[test]
+fn test_location_opens_the_same() {
+    for koil in [glob_koil("d*/*"), glob_koil("*/"), regex_koil(r"d.*/\w+")] {
+        let mut again = koil.clone();
+        again.open("dir").unwrap();
+        again.open(koil.location()).unwrap();
+        assert_eq!(koil.current_dir(), again.current_dir());
+        assert_eq!(koil.pattern(), again.pattern());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_paths() {
+    let mut koil = test_koil();
+    // without the `\\?\` that `canonicalize` adds
+    assert!(!koil.current_dir().to_string_lossy().starts_with(r"\\?\"));
+    // `\` is a separator in the base dir, before a `/`
+    koil.open(r"..\test_dir\dir/*").unwrap();
+    assert_eq!(test_path("dir"), koil.current_dir());
+    assert_eq!(Some("*"), koil.pattern().map(Pattern::as_str));
+    // but in a pattern an escape, so this is `dir*` in `test_dir`
+    koil.open(test_path(r"dir\*")).unwrap();
+    assert_eq!(test_path(""), koil.current_dir());
+    assert_eq!(Some(r"dir\*"), koil.pattern().map(Pattern::as_str));
 }
 
 #[test]
@@ -1206,6 +1258,8 @@ fn test_regex_patterns() {
     assert_eq!(vec![PathBuf::from("dir/inside")], regex_names("d.*[^/]"));
     // the whole path must match
     assert_eq!(Vec::<PathBuf>::new(), regex_names("il."));
+    // after the base dir's `/`, `\` is an escape, also on Windows
+    assert_eq!(vec![PathBuf::from("inside")], regex_names(r"dir/\w+"));
 }
 
 #[test]

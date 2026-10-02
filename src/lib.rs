@@ -132,7 +132,8 @@ impl Limits {
 /// It shows every file and dir that matches it, a dir is matched with a `/` after its path
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pattern {
-    /// Like `**/*.rs`, where `*` never matches `/`
+    /// Like `**/*.rs`, where `*` never matches `/`, and `\*` is a `*` (also on Windows, where
+    /// a pattern's parts are split only at `/`)
     Glob(String),
     /// Like `src/.*\.rs`, which must match the whole path
     /// `,` means any character except `/` (like `.`, but within one dir), and `\,` is a `,`
@@ -167,6 +168,9 @@ impl Pattern {
                 };
                 GlobBuilder::new(rest)
                     .literal_separator(true)
+                    // globset's default is off on Windows, where `\` is a separator, but
+                    // patterns use only `/`
+                    .backslash_escape(true)
                     .build()
                     .map(|g| Matcher::Glob(g.compile_matcher(), slash))
                     .map_err(|source| OpenError::InvalidGlob {
@@ -428,6 +432,11 @@ pub enum EntryErrorKind {
     /// A part of the name has a control character, which breaks terminals and scripts
     #[error("`{}` has the control character {char:?}", name.escape_debug())]
     ControlCharacter { name: String, char: char },
+
+    /// On Windows, a name it can not use (elsewhere only a warning): a character it does not
+    /// allow, a reserved name, or a `.` at the end, which it would remove
+    #[error("{0}")]
+    WindowsName(EntryWarningKind),
 }
 
 /// Something about one of the entries given to [`Koil::update`] that is not recommended, but
@@ -551,6 +560,9 @@ impl Koil {
     /// `.,*+?()[]{}|^$\` for a regex). A dir's path has a `/` at its end, so `,*/` shows only
     /// dirs, and `,*` only files. A glob's `*` never matches `/`, and a regex must match the
     /// whole path, where `,` is any character except `/`
+    /// Only `/` splits a pattern into parts, also on Windows: there `\` is a separator only in
+    /// a plain path, and in the base dir before a `/`, like `C:\src/*.rs`, while in a pattern
+    /// it is an escape, as everywhere else (so `C:\src\*.rs` is not the glob `*.rs` in `src`)
     /// A pattern fails with [`OverLimit`] if it matches or has to search more paths than
     /// [`Limits`] allow, dirs that nothing inside can match are never searched
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
@@ -559,10 +571,13 @@ impl Koil {
     /// This never adds changes, new dirs must be written in the listing
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
         let location = location.as_ref();
-        // `resolve` drops a trailing `/`, which a pattern needs to match only dirs
-        let slash = location.to_string_lossy().ends_with(is_separator);
         let path = resolve(&self.current_dir.join(location))?;
-        let (base, pattern) = match self.split_pattern(&path, slash) {
+        let split = match self.is_dir(&path) {
+            // so a dir with a name like `a[1]` is not taken for a pattern
+            true => None,
+            false => self.split_pattern(location),
+        };
+        let (base, pattern) = match split {
             Some((base, pattern)) => {
                 pattern.matcher()?;
                 (base, Some(pattern))
@@ -591,12 +606,19 @@ impl Koil {
     }
 
     /// What is open, as it can be given to [`Koil::open`] again:
-    /// [`Koil::current_dir`], joined with [`Koil::pattern`] if there is one
+    /// [`Koil::current_dir`], then a `/` and [`Koil::pattern`] if there is one (`/` also on
+    /// Windows, as only `/` ends a pattern's base dir)
     pub fn location(&self) -> PathBuf {
-        match &self.pattern {
-            Some(pattern) => self.current_dir.join(pattern.as_str()),
-            None => self.current_dir.clone(),
+        let Some(pattern) = &self.pattern else {
+            return self.current_dir.clone();
+        };
+        let mut location = self.current_dir.clone().into_os_string();
+        // a root, like `/` or `C:\`, already ends with one
+        if !location.to_string_lossy().ends_with(is_separator) {
+            location.push("/");
         }
+        location.push(pattern.as_str());
+        location.into()
     }
 
     /// How the listing is shown
@@ -1030,24 +1052,35 @@ impl Koil {
         }
     }
 
-    /// Split `path` into its base dir, and the pattern relative to it, which is a glob, or a
-    /// regex if [`Settings::regex`] is on, with a `/` at its end if `slash`
+    /// Split `location` (as given to [`Koil::open`]) into its base dir, and the pattern relative
+    /// to it, which is a glob, or a regex if [`Settings::regex`] is on
     /// `None` if it is not a pattern, because no part of it after the longest part that is a
     /// dir has a special character
-    fn split_pattern(&self, path: &Path, slash: bool) -> Option<(PathBuf, Pattern)> {
-        // so a dir with a name like `a[1]` is not taken for a pattern
-        let dir = path.ancestors().find(|p| self.is_dir(p))?;
-        let parts: Vec<String> = path
-            .strip_prefix(dir)
-            .unwrap()
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().to_string())
+    /// Only a `/` (or the root, like `/` or `C:\`) ends a part, so on Windows a `\` after the
+    /// base dir stays in the pattern, where it is an escape
+    fn split_pattern(&self, location: &Path) -> Option<(PathBuf, Pattern)> {
+        let bytes = location.as_os_str().as_encoded_bytes();
+        // the longest part before a `/` that is a dir, else the root (nothing, if relative),
+        // and what comes after it
+        let (dir, rest) = location
+            .ancestors()
+            .filter(|a| a.parent().is_none() || bytes.get(a.as_os_str().len()) == Some(&b'/'))
+            .find_map(|a| {
+                let dir = resolve(&self.current_dir.join(a)).ok()?;
+                let rest = &bytes[a.as_os_str().len()..];
+                self.is_dir(&dir).then_some((dir, rest))
+            })?;
+        let rest = String::from_utf8_lossy(rest);
+        let parts: Vec<&str> = rest
+            .split('/')
+            .filter(|p| !matches!(*p, "" | "."))
             .collect();
         let regex = self.settings.regex;
         let first = parts.iter().position(|p| Pattern::is_pattern(regex, p))?;
         let base = dir.join(parts[..first].iter().collect::<PathBuf>());
         let mut pattern = parts[first..].join("/");
-        if slash {
+        // which makes it match only dirs
+        if rest.ends_with('/') {
             pattern.push('/');
         }
         let pattern = match regex {
@@ -1390,13 +1423,15 @@ fn to_id(index: usize) -> Id {
     Id(index as u64)
 }
 
-/// `name` as a path relative to the listing's dir, `None` if it is empty, absolute,
-/// or has a `.` or `..` part
-/// Name can have `/` inside, like `dir/A`
+/// `name` as a path relative to the listing's dir, `None` if it is empty, absolute (or
+/// starts with a drive, like `C:A` on Windows), or has a `.` or `..` part
+/// Name can have `/` inside, like `dir/A` (and `\` on Windows, where it is a separator too)
 fn relative_path(name: &Path) -> Option<PathBuf> {
     let raw = name.to_string_lossy();
     // `Path::components` ignores `.` in the middle of a path, so check the raw parts
-    if raw.is_empty() || name.has_root() || raw.split('/').any(|p| p == "." || p == "..") {
+    let dots = raw.split(is_separator).any(|p| p == "." || p == "..");
+    let drive = matches!(name.components().next(), Some(Component::Prefix(_)));
+    if raw.is_empty() || name.has_root() || drive || dots {
         return None;
     }
     Some(name.components().collect())
@@ -1441,6 +1476,8 @@ fn expand_commas(regex: &str) -> String {
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist
 /// Existing part of the path is canonicalized, the rest is normalized without touching the filesystem
+/// On Windows, it has no `\\?\` before it (which `canonicalize` adds, and frontends would show),
+/// unless the path can not work without it
 fn resolve(path: &Path) -> io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in std::path::absolute(path)?.components() {
@@ -1453,7 +1490,7 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
             c => {
                 resolved.push(c);
                 if resolved.symlink_metadata().is_ok() {
-                    resolved = resolved.canonicalize()?;
+                    resolved = dunce::canonicalize(&resolved)?;
                 }
             }
         }

@@ -14,6 +14,14 @@ fn error(kind: EntryErrorKind) -> Problem {
     Problem::Error(kind)
 }
 
+/// About a name Windows can not use: an error there, and a warning elsewhere
+fn windows(kind: EntryWarningKind) -> Problem {
+    match cfg!(windows) {
+        true => error(EntryErrorKind::WindowsName(kind)),
+        false => warning(kind),
+    }
+}
+
 #[test]
 fn test_fine_names() {
     let names = [
@@ -72,7 +80,7 @@ fn test_name_too_long() {
 #[test]
 fn test_windows_characters() {
     assert_eq!(
-        vec![warning(EntryWarningKind::WindowsCharacter {
+        vec![windows(EntryWarningKind::WindowsCharacter {
             name: r"a:b<c:d\e".into(),
             chars: r":<:\".into()
         })],
@@ -80,7 +88,7 @@ fn test_windows_characters() {
     );
     // repeated ones are only written once
     assert_eq!(
-        vec![warning(EntryWarningKind::WindowsCharacter {
+        vec![windows(EntryWarningKind::WindowsCharacter {
             name: "a::b".into(),
             chars: ":".into()
         })],
@@ -107,7 +115,7 @@ fn test_shell_characters() {
 fn test_windows_reserved_names() {
     for name in ["CON", "con.txt", "Nul.tar.gz", "LPT9", "com1"] {
         assert_eq!(
-            vec![warning(EntryWarningKind::WindowsReservedName {
+            vec![windows(EntryWarningKind::WindowsReservedName {
                 name: name.into()
             })],
             check(name),
@@ -150,7 +158,7 @@ fn test_edges() {
     assert_eq!(vec![space(" a")], check(" a"));
     assert_eq!(vec![space("a ")], check("a "));
     assert_eq!(
-        vec![warning(EntryWarningKind::TrailingDot { name: "a.".into() })],
+        vec![windows(EntryWarningKind::TrailingDot { name: "a.".into() })],
         check("a.")
     );
     assert_eq!(
@@ -169,11 +177,11 @@ fn test_many_problems() {
                 name: "-a:\tb.".into(),
                 char: '\t'
             }),
-            warning(EntryWarningKind::WindowsCharacter {
+            windows(EntryWarningKind::WindowsCharacter {
                 name: "-a:\tb.".into(),
                 chars: ":".into()
             }),
-            warning(EntryWarningKind::TrailingDot {
+            windows(EntryWarningKind::TrailingDot {
                 name: "-a:\tb.".into()
             }),
             warning(EntryWarningKind::LeadingDash {

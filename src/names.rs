@@ -52,7 +52,7 @@ pub(crate) fn check(name: &OsStr) -> Vec<Problem> {
         });
     }
 
-    let mut warning = |kind| problems.push(Problem::Warning(kind));
+    let mut warning = |kind| problems.push(on_this_os(kind));
     let found = |set: &[char]| -> String {
         let mut found: Vec<char> = name.chars().filter(|c| set.contains(c)).collect();
         found.dedup();
@@ -107,6 +107,21 @@ pub(crate) fn check(name: &OsStr) -> Vec<Problem> {
     }
 
     problems
+}
+
+/// `kind` as a warning, but on Windows an error if Windows can not use the name: there it
+/// fails, or makes something else (`a.txt:b` writes a hidden stream of `a.txt`, and a
+/// trailing `.` goes away)
+fn on_this_os(kind: EntryWarningKind) -> Problem {
+    use EntryWarningKind as W;
+    let windows = matches!(
+        kind,
+        W::WindowsCharacter { .. } | W::WindowsReservedName { .. } | W::TrailingDot { .. }
+    );
+    match windows && cfg!(windows) {
+        true => Problem::Error(EntryErrorKind::WindowsName(kind)),
+        false => Problem::Warning(kind),
+    }
 }
 
 /// Whether `c` is (a part of) an emoji
