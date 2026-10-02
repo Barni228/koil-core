@@ -560,9 +560,9 @@ impl Koil {
     /// `.,*+?()[]{}|^$\` for a regex). A dir's path has a `/` at its end, so `,*/` shows only
     /// dirs, and `,*` only files. A glob's `*` never matches `/`, and a regex must match the
     /// whole path, where `,` is any character except `/`
-    /// Only `/` splits a pattern into parts, also on Windows: there `\` is a separator only in
-    /// a plain path, and in the base dir before a `/`, like `C:\src/*.rs`, while in a pattern
-    /// it is an escape, as everywhere else (so `C:\src\*.rs` is not the glob `*.rs` in `src`)
+    /// Only `/` separates, also on Windows: a plain path with `\` (like one pasted from
+    /// Windows) opens, and [`Koil::location`] then shows it with `/`, but in a pattern `\` is
+    /// an escape, as everywhere else (so `C:\src\*.rs` is not the glob `*.rs` in `src`)
     /// A pattern fails with [`OverLimit`] if it matches or has to search more paths than
     /// [`Limits`] allow, dirs that nothing inside can match are never searched
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
@@ -605,15 +605,16 @@ impl Koil {
         self.pattern.as_ref()
     }
 
-    /// What is open, as it can be given to [`Koil::open`] again:
-    /// [`Koil::current_dir`], then a `/` and [`Koil::pattern`] if there is one (`/` also on
-    /// Windows, as only `/` ends a pattern's base dir)
+    /// What is open, for frontends to show, as it can be given to [`Koil::open`] again:
+    /// [`Koil::current_dir`], then a `/` and [`Koil::pattern`] if there is one
+    /// It only has `/`, also on Windows (`C:/src/*.rs`), so a pattern can be written after it
     pub fn location(&self) -> PathBuf {
+        let dir = with_slashes(&self.current_dir);
         let Some(pattern) = &self.pattern else {
-            return self.current_dir.clone();
+            return dir;
         };
-        let mut location = self.current_dir.clone().into_os_string();
-        // a root, like `/` or `C:\`, already ends with one
+        let mut location = dir.into_os_string();
+        // a root, like `/` or `C:/`, already ends with one
         if !location.to_string_lossy().ends_with(is_separator) {
             location.push("/");
         }
@@ -1077,7 +1078,10 @@ impl Koil {
             .collect();
         let regex = self.settings.regex;
         let first = parts.iter().position(|p| Pattern::is_pattern(regex, p))?;
-        let base = dir.join(parts[..first].iter().collect::<PathBuf>());
+        // not `join`, which with no parts adds a separator at the end, and then on Windows
+        // `location` would put the pattern after a `\`, where it is an escape
+        let mut base = dir;
+        base.extend(&parts[..first]);
         let mut pattern = parts[first..].join("/");
         // which makes it match only dirs
         if rest.ends_with('/') {
@@ -1472,6 +1476,17 @@ fn expand_commas(regex: &str) -> String {
         expanded.push(c);
     }
     expanded
+}
+
+/// `path` with `/` instead of `\` on Windows, where both are separators, and users write `/`
+/// Not if it is verbatim (`\\?\`), where `/` is not a separator, or not Unicode
+fn with_slashes(path: &Path) -> PathBuf {
+    let verbatim =
+        matches!(path.components().next(), Some(Component::Prefix(p)) if p.kind().is_verbatim());
+    match path.to_str() {
+        Some(s) if cfg!(windows) && !verbatim => s.replace('\\', "/").into(),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist

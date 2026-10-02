@@ -6,6 +6,11 @@ fn test_path(s: &str) -> PathBuf {
     PathBuf::from(format!("{}/test_dir/{s}", env!("CARGO_MANIFEST_DIR")))
 }
 
+/// Path to `s` inside `dir`, after a `/`, which a pattern's base dir needs on Windows
+fn inside(dir: &Path, s: &str) -> PathBuf {
+    PathBuf::from(format!("{}/{s}", dir.display()))
+}
+
 /// Koil with `test_dir` opened
 fn test_koil() -> Koil {
     let mut koil = Koil::default();
@@ -621,7 +626,7 @@ fn test_rename_warnings() {
 #[test]
 fn test_existing_names_do_not_warn() {
     let temp = tempfile::tempdir().unwrap();
-    fs::write(temp.path().join("-a:b"), "").unwrap();
+    fs::write(temp.path().join("-a$b"), "").unwrap();
     let mut koil = Koil::default();
     koil.open(temp.path()).unwrap();
     assert_eq!(
@@ -630,7 +635,7 @@ fn test_existing_names_do_not_warn() {
     );
     // a copy has a new name, but its name is fine
     let mut entries = koil.listing();
-    entries.push(with_id(id(&koil, "-a:b"), "fine"));
+    entries.push(with_id(id(&koil, "-a$b"), "fine"));
     assert_eq!(Vec::<EntryWarning>::new(), koil.update(&entries).unwrap());
 }
 
@@ -1023,11 +1028,17 @@ fn test_windows_paths() {
     let mut koil = test_koil();
     // without the `\\?\` that `canonicalize` adds
     assert!(!koil.current_dir().to_string_lossy().starts_with(r"\\?\"));
-    // `\` is a separator in the base dir, before a `/`
-    koil.open(r"..\test_dir\dir/*").unwrap();
+    // a plain path with `\`, like a pasted one, opens, and is shown with `/`
+    koil.open(r"..\test_dir\dir").unwrap();
+    assert_eq!(test_path("dir"), koil.current_dir());
+    let location = koil.location().to_string_lossy().into_owned();
+    assert!(!location.contains('\\'), "{location}");
+    // so a pattern can be written after it
+    koil.open(format!("{location}/*")).unwrap();
     assert_eq!(test_path("dir"), koil.current_dir());
     assert_eq!(Some("*"), koil.pattern().map(Pattern::as_str));
-    // but in a pattern an escape, so this is `dir*` in `test_dir`
+    assert_eq!(PathBuf::from(format!("{location}/*")), koil.location());
+    // but in a pattern `\` is an escape, so this is `dir*` in `test_dir`
     koil.open(test_path(r"dir\*")).unwrap();
     assert_eq!(test_path(""), koil.current_dir());
     assert_eq!(Some(r"dir\*"), koil.pattern().map(Pattern::as_str));
@@ -1307,9 +1318,9 @@ fn test_regex_commas() {
     let mut koil = Koil::builder().settings(regex()).build();
     let names =
         |koil: &Koil| -> Vec<PathBuf> { koil.listing().into_iter().map(|e| e.name).collect() };
-    koil.open(temp.path().join(r"a\,b")).unwrap();
+    koil.open(inside(temp.path(), r"a\,b")).unwrap();
     assert_eq!(vec![PathBuf::from("a,b")], names(&koil));
-    koil.open(temp.path().join("a,b")).unwrap();
+    koil.open(inside(temp.path(), "a,b")).unwrap();
     assert_eq!(vec![PathBuf::from("a,b"), "axb".into()], names(&koil));
 }
 
@@ -1326,15 +1337,15 @@ fn test_regex_trailing_slash() {
     assert_eq!(Some(&Pattern::Regex(",*/".into())), koil.pattern());
     assert_eq!(koil.current_dir().join(",*/"), koil.location());
     assert_eq!(keep_all(&koil, &["a/"]), koil.listing());
-    koil.open(temp.path().join(".*/")).unwrap();
+    koil.open(inside(temp.path(), ".*/")).unwrap();
     assert_eq!(keep_all(&koil, &["a/", "a/b/"]), koil.listing());
-    koil.open(temp.path().join("a/,*/")).unwrap();
+    koil.open(inside(temp.path(), "a/,*/")).unwrap();
     assert_eq!(keep_all(&koil, &["b/"]), koil.listing());
     // without it, everything that matches
-    koil.open(temp.path().join(".*")).unwrap();
+    koil.open(inside(temp.path(), ".*")).unwrap();
     assert_eq!(keep_all(&koil, &["a/", "a/b/", "c"]), koil.listing());
     // and a path that does not end with `/` is not a dir
-    koil.open(temp.path().join(".*,")).unwrap();
+    koil.open(inside(temp.path(), ".*,")).unwrap();
     assert_eq!(keep_all(&koil, &["c"]), koil.listing());
 }
 
@@ -1437,16 +1448,16 @@ fn test_pattern_skips_dirs() {
     // `a/deep/` is never entered, or its 30 files would go over the limit
     koil.open(",*/").unwrap();
     assert_eq!(names(&koil), ["a/", "b/"]);
-    koil.open(temp.path().join(",*/x")).unwrap();
+    koil.open(inside(temp.path(), ",*/x")).unwrap();
     assert_eq!(names(&koil), ["b/x"]);
-    koil.open(temp.path().join("(a|b)/,+/?")).unwrap();
+    koil.open(inside(temp.path(), "(a|b)/,+/?")).unwrap();
     assert_eq!(names(&koil), ["a/deep/", "b/x"]);
 
     // the same with globs
     let mut koil = Koil::builder().limits(koil.limits).build();
-    koil.open(temp.path().join("*/x")).unwrap();
+    koil.open(inside(temp.path(), "*/x")).unwrap();
     assert_eq!(names(&koil), ["b/x"]);
-    koil.open(temp.path().join("{a,b}/*/")).unwrap();
+    koil.open(inside(temp.path(), "{a,b}/*/")).unwrap();
     assert_eq!(names(&koil), ["a/deep/"]);
 }
 
@@ -1459,12 +1470,12 @@ fn test_pattern_limits() {
 
     // everything matches
     assert!(matches!(
-        koil.open(temp.path().join(".*")),
+        koil.open(inside(temp.path(), ".*")),
         Err(OpenError::OverLimit(OverLimit::Matches { pattern, limit: 5 })) if pattern == ".*"
     ));
     // only one path matches, but every one has to be searched
     assert!(matches!(
-        koil.open(temp.path().join(".*x")),
+        koil.open(inside(temp.path(), ".*x")),
         Err(OpenError::OverLimit(OverLimit::Searched { limit: 20, .. }))
     ));
     // nothing changed
@@ -1536,7 +1547,7 @@ fn gitignore_temp_dir(git: bool) -> tempfile::TempDir {
 /// Koil with `location` opened inside `temp`
 fn temp_koil(temp: &tempfile::TempDir, settings: Settings, location: &str) -> Koil {
     let mut koil = Koil::builder().settings(settings).build();
-    koil.open(temp.path().join(location)).unwrap();
+    koil.open(inside(temp.path(), location)).unwrap();
     koil
 }
 
