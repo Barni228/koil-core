@@ -1032,9 +1032,10 @@ impl Koil {
         }
     }
 
-    /// The name of `path` in the listing, relative to [`Koil::current_dir`]
+    /// The name of `path` in the listing, relative to [`Koil::current_dir`], only with `/`,
+    /// also on Windows, as users write it
     fn name(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(&self.current_dir).unwrap().to_path_buf()
+        with_slashes(path.strip_prefix(&self.current_dir).unwrap())
     }
 
     /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`]
@@ -1138,6 +1139,7 @@ impl Koil {
                 continue;
             };
             if let Some(&first) = seen.get(&path) {
+                let path = with_slashes(&path);
                 error(i, EntryErrorKind::Duplicate { path, first });
                 continue;
             }

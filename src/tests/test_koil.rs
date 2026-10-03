@@ -1042,6 +1042,12 @@ fn test_windows_paths() {
     koil.open(test_path(r"dir\*")).unwrap();
     assert_eq!(test_path(""), koil.current_dir());
     assert_eq!(Some(r"dir\*"), koil.pattern().map(Pattern::as_str));
+    // names in the listing only have `/` too
+    koil.open("**/*").unwrap();
+    assert_eq!(
+        vec!["dir/", "dir/inside", "file", "file2", "qwerty"],
+        names(&koil)
+    );
 }
 
 #[test]
