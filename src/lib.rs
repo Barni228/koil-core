@@ -148,14 +148,31 @@ impl Pattern {
         }
     }
 
-    /// Whether `part` of a path has a special character of this kind of pattern
-    fn is_pattern(syntax_regex: bool, part: &str) -> bool {
-        match syntax_regex {
-            false => part.contains(['*', '?', '[', '{']),
-            true => part.contains([
-                '.', ',', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\',
-            ]),
+    /// Whether `part` of a location (see [`read_quoted`]) has a special character of this kind
+    /// of pattern, that is not quoted
+    fn is_pattern(syntax_regex: bool, part: &[ReadChar]) -> bool {
+        let special: &[char] = match syntax_regex {
+            false => &['*', '?', '[', '{'],
+            true => REGEX_SPECIAL,
+        };
+        part.iter().any(|r| !r.quoted && special.contains(&r.c))
+    }
+
+    /// `part` of a location (see [`read_quoted`]) as this kind of pattern, with the quoted
+    /// characters that have a meaning in it escaped
+    fn part_text(syntax_regex: bool, part: &[ReadChar]) -> String {
+        let escaped: &[char] = match syntax_regex {
+            false => &['*', '?', '[', ']', '{', '}', ',', '\\'],
+            true => REGEX_SPECIAL,
+        };
+        let mut text = String::new();
+        for r in part {
+            if r.quoted && escaped.contains(&r.c) {
+                text.push('\\');
+            }
+            text.push(r.c);
         }
+        text
     }
 
     fn matcher(&self) -> Result<Matcher, OpenError> {
@@ -192,6 +209,203 @@ impl Pattern {
             }
         }
     }
+}
+
+/// What a location given to [`Koil::open`] means, see [`Koil::read_location`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    /// The dir to open, or the base dir of [`Location::pattern`], absolute
+    /// It does not have to exist, opening it then fails
+    pub dir: PathBuf,
+    /// The pattern of the paths to show, relative to [`Location::dir`], `None` for a dir
+    pub pattern: Option<Pattern>,
+    /// Where the pattern starts in the location as written (a byte index), `None` for a dir
+    pub pattern_start: Option<usize>,
+}
+
+impl Location {
+    /// The location of the dir `dir`, without a pattern
+    fn dir(dir: PathBuf) -> Location {
+        Location {
+            dir,
+            pattern: None,
+            pattern_start: None,
+        }
+    }
+}
+
+/// The characters that make a part of a location a regex, and that are escaped in it when
+/// they are quoted
+const REGEX_SPECIAL: &[char] = &[
+    '.', ',', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\',
+];
+
+/// A character of a location, as a shell reads it (see [`read_quoted`])
+#[derive(Debug, Clone, Copy)]
+struct ReadChar {
+    c: char,
+    /// Whether it was in quotes, or escaped with a `\`, so it is never special in a pattern
+    quoted: bool,
+    /// Where it is in the location as written, a byte index
+    at: usize,
+}
+
+/// `location`, from its byte `from`, read like a shell reads one word, but not split at
+/// spaces: what is in `'...'` or `"..."` is quoted, and so is a character escaped with a `\`
+/// (which is taken off): any outside quotes, and `"`, `\`, `$` or `` ` `` in `"..."`
+/// A quote that is never closed is a plain character, so a name like `it's` can be written
+/// as it is
+/// `\` only escapes what is not an ASCII letter or digit (no shell needs those escaped), so a
+/// regex's `\d` stays one, and on Windows, where it is a separator, it never escapes
+fn read_quoted(location: &str, from: usize) -> Vec<ReadChar> {
+    let escapes = !cfg!(windows);
+    let mut read = Vec::new();
+    let mut quote = None;
+    let mut at = from;
+    while let Some(c) = location[at..].chars().next() {
+        let after = at + c.len_utf8();
+        let escaped = location[after..].chars().next().filter(|&n| {
+            escapes
+                && c == '\\'
+                && match quote {
+                    None => !n.is_ascii_alphanumeric(),
+                    Some('"') => matches!(n, '"' | '\\' | '$' | '`'),
+                    Some(_) => false,
+                }
+        });
+        if let Some(n) = escaped {
+            read.push(ReadChar {
+                c: n,
+                quoted: true,
+                at: after,
+            });
+            at = after + n.len_utf8();
+            continue;
+        }
+        match quote {
+            None if matches!(c, '\'' | '"') && closes(&location[after..], c, escapes) => {
+                quote = Some(c)
+            }
+            Some(q) if c == q => quote = None,
+            _ => read.push(ReadChar {
+                c,
+                quoted: quote.is_some(),
+                at,
+            }),
+        }
+        at = after;
+    }
+    read
+}
+
+/// Whether `quote` is closed in `after` (what comes after it), see [`read_quoted`]
+fn closes(after: &str, quote: char, escapes: bool) -> bool {
+    let mut chars = after.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c == quote => return true,
+            // `\"` does not close it, and `\\` is skipped whole, so a `"` after it does
+            '\\' if quote == '"' && escapes => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The location of `rest` (see [`read_quoted`]) in `dir`, where `rest` starts at the byte
+/// `start` of the location as written: the parts of `rest` until the first that is a
+/// pattern (a glob, or a regex if `regex`) are in the dir, and that one starts the pattern
+fn location_in(dir: PathBuf, rest: &[ReadChar], start: usize, regex: bool) -> Location {
+    // its parts between `/`, and where each starts as written
+    let mut parts = Vec::new();
+    let (mut from, mut at) = (0, start);
+    for (i, r) in rest.iter().enumerate() {
+        if r.c == '/' {
+            parts.push((&rest[from..i], at));
+            (from, at) = (i + 1, r.at + 1);
+        }
+    }
+    parts.push((&rest[from..], at));
+    parts.retain(|(part, _)| !matches!(read_text(part).as_str(), "" | "."));
+
+    let first = parts
+        .iter()
+        .position(|(part, _)| Pattern::is_pattern(regex, part));
+    let first = first.unwrap_or(parts.len());
+    // not `join`, which with no parts adds a separator at the end, and then on Windows
+    // `location` would put the pattern after a `\`, where it is an escape
+    let mut base = dir;
+    base.extend(parts[..first].iter().map(|(part, _)| read_text(part)));
+    let Some(&(_, pattern_start)) = parts.get(first) else {
+        return Location::dir(resolve(&base).unwrap_or(base));
+    };
+    let parts: Vec<String> = (parts[first..].iter())
+        .map(|(part, _)| Pattern::part_text(regex, part))
+        .collect();
+    let mut pattern = parts.join("/");
+    // which makes it match only dirs
+    if rest.last().is_some_and(|r| r.c == '/') {
+        pattern.push('/');
+    }
+    Location {
+        dir: base,
+        pattern: Some(match regex {
+            true => Pattern::Regex(pattern),
+            false => Pattern::Glob(pattern),
+        }),
+        pattern_start: Some(pattern_start),
+    }
+}
+
+/// A location as it was written, see [`Koil::read_location`]
+struct Written<'a> {
+    text: &'a str,
+    /// The `~` at its start that is the home dir (see [`expand_tilde`]): where it is, and the
+    /// home dir
+    home: Option<(usize, String)>,
+}
+
+impl Written<'_> {
+    /// Its text until the byte `end`, with its `~` as the home dir
+    fn until(&self, end: usize) -> String {
+        match &self.home {
+            Some((at, home)) if *at < end => {
+                format!("{}{home}{}", &self.text[..*at], &self.text[at + 1..end])
+            }
+            _ => self.text[..end].to_string(),
+        }
+    }
+}
+
+/// Makes the `~` that starts `read` (see [`read_quoted`]) of `location` the home dir, if it
+/// is followed by a `/` or nothing, and returns where it is written and the home dir
+/// Also right after the quote that starts `location` (`"~/my dir"`), but not after a `\`
+/// The home dir is quoted, so it is never special in a pattern
+fn expand_tilde(location: &str, read: &mut Vec<ReadChar>) -> Option<(usize, String)> {
+    let first = read.first()?;
+    let at_start = first.at == 0 || (first.at == 1 && location.starts_with(['\'', '"']));
+    if first.c != '~' || !at_start || read.get(1).is_some_and(|r| r.c != '/') {
+        return None;
+    }
+    let home = std::env::home_dir()?.to_str()?.to_string();
+    if home.is_empty() {
+        return None;
+    }
+    let at = first.at;
+    let home_chars = home.chars().map(|c| ReadChar {
+        c,
+        quoted: true,
+        at,
+    });
+    read.splice(..1, home_chars);
+    Some((at, home))
+}
+
+/// The text of `chars` (see [`read_quoted`])
+fn read_text(chars: &[ReadChar]) -> String {
+    chars.iter().map(|r| r.c).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -566,32 +780,69 @@ impl Koil {
     /// A pattern fails with [`OverLimit`] if it matches or has to search more paths than
     /// [`Limits`] allow, dirs that nothing inside can match are never searched
     /// A path that is a dir is always opened as a dir, even if its name looks like a pattern
+    /// It is read like a shell reads a path, without splitting it at spaces: what is quoted
+    /// (`'my dir'`, `"my dir"`), or escaped with `\` (`my\ dir`, but not on Windows, where `\`
+    /// is a separator) is never special in a pattern (`"[1]"*` is the glob `\[1\]*`), and
+    /// [`Koil::location`] then shows it without quotes, and `~/` at its start is the home dir,
+    /// see [`Koil::read_location`]
     /// The dir (or the base dir of the pattern) must be on disk or new in the diff, else it
     /// fails with [`OpenError::NotFound`], or [`OpenError::NotADirectory`] if it is a file
     /// This never adds changes, new dirs must be written in the listing
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
-        let location = location.as_ref();
-        let path = resolve(&self.current_dir.join(location))?;
-        let split = match self.is_dir(&path) {
-            // so a dir with a name like `a[1]` is not taken for a pattern
-            true => None,
-            false => self.split_pattern(location),
-        };
-        let (base, pattern) = match split {
-            Some((base, pattern)) => {
-                pattern.matcher()?;
-                (base, Some(pattern))
-            }
-            None => (path, None),
-        };
-        if !self.is_dir(&base) {
-            return Err(self.not_a_dir(&base));
+        let Location { dir, pattern, .. } = self.read_location(location, self.settings.regex);
+        if let Some(pattern) = &pattern {
+            pattern.matcher()?;
+        }
+        if !self.is_dir(&dir) {
+            return Err(self.not_a_dir(&dir));
         }
         // in a copy, so nothing changes if it fails
         let mut opened = self.clone();
-        opened.open_at(base, pattern)?;
+        opened.open_at(dir, pattern)?;
         *self = opened;
         Ok(())
+    }
+
+    /// What [`Koil::open`] would open for `location`, with a pattern read as a regex if
+    /// `regex`, else as a glob (`open` uses [`Settings::regex`]), without opening it, or
+    /// checking that the dir exists, or that the pattern is valid
+    /// A `~` at its start, before a `/` or nothing, is the home dir, also right after the
+    /// quote that starts it (`"~/my dir"`, which a shell would not expand, but nobody means a
+    /// dir named `~`, which is written `\~` or `./~`)
+    /// A location that is a dir as it is written is that dir (also a name with quotes or `\`
+    /// in it, like `it's`), else it is read like a shell reads one word, but not split at
+    /// spaces: what is in `'...'` or `"..."` is quoted, and so is a character after a `\`
+    /// (taken off), which only escapes what is not an ASCII letter or digit (so a regex's `\d`
+    /// stays one), and on Windows never does. A quote that is not closed is a plain character
+    /// The base dir is the longest part before a `/` that is a dir, as written or as read (else
+    /// the root, or [`Koil::current_dir`] for a relative location), then every part after it
+    /// until the first with a special character that is not quoted (`*?[{` for a glob, and
+    /// `.,*+?()[]{}|^$\` for a regex), which starts the pattern, where the quoted characters
+    /// that are special in it are escaped
+    pub fn read_location<P: AsRef<Path>>(&self, location: P, regex: bool) -> Location {
+        let location = location.as_ref();
+        let text = location.to_string_lossy();
+        let mut read = read_quoted(&text, 0);
+        let written = Written {
+            home: expand_tilde(&text, &mut read),
+            text: &text,
+        };
+        // so a name with quotes opens as it is shown, and one like `a[1]` is not a pattern
+        let as_written = match written.home {
+            None => location.to_path_buf(),
+            Some(_) => written.until(text.len()).into(),
+        };
+        if let Some(dir) = self.dir_at(&as_written) {
+            return Location::dir(dir);
+        }
+        let path = PathBuf::from(read_text(&read));
+        if path != as_written
+            && let Some(dir) = self.dir_at(&path)
+        {
+            return Location::dir(dir);
+        }
+        (self.split_location(&written, &read, regex))
+            .unwrap_or_else(|| Location::dir(self.absolute(&path)))
     }
 
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
@@ -1054,45 +1305,60 @@ impl Koil {
         }
     }
 
-    /// Split `location` (as given to [`Koil::open`]) into its base dir, and the pattern relative
-    /// to it, which is a glob, or a regex if [`Settings::regex`] is on
-    /// `None` if it is not a pattern, because no part of it after the longest part that is a
-    /// dir has a special character
+    /// `path` (relative to [`Koil::current_dir`]) as an absolute path, if it is a dir
+    fn dir_at(&self, path: &Path) -> Option<PathBuf> {
+        let path = resolve(&self.current_dir.join(path)).ok()?;
+        self.is_dir(&path).then_some(path)
+    }
+
+    /// `path` (relative to [`Koil::current_dir`]) as an absolute path, resolved as far as it
+    /// can be
+    fn absolute(&self, path: &Path) -> PathBuf {
+        let path = self.current_dir.join(path);
+        resolve(&path).unwrap_or(path)
+    }
+
+    /// [`Koil::read_location`] of a location that is not a dir, `written` as given, and as
+    /// [`read_quoted`] reads it (`read`, with its `~` expanded), `None` if no part of it (not
+    /// even its root) is a dir
     /// Only a `/` (or the root, like `/` or `C:\`) ends a part, so on Windows a `\` after the
     /// base dir stays in the pattern, where it is an escape
-    fn split_pattern(&self, location: &Path) -> Option<(PathBuf, Pattern)> {
-        let bytes = location.as_os_str().as_encoded_bytes();
-        // the longest part before a `/` that is a dir, else the root (nothing, if relative),
-        // and what comes after it
-        let (dir, rest) = location
-            .ancestors()
-            .filter(|a| a.parent().is_none() || bytes.get(a.as_os_str().len()) == Some(&b'/'))
-            .find_map(|a| {
-                let dir = resolve(&self.current_dir.join(a)).ok()?;
-                let rest = &bytes[a.as_os_str().len()..];
-                self.is_dir(&dir).then_some((dir, rest))
-            })?;
-        let rest = String::from_utf8_lossy(rest);
-        let parts: Vec<&str> = rest
-            .split('/')
-            .filter(|p| !matches!(*p, "" | "."))
-            .collect();
-        let regex = self.settings.regex;
-        let first = parts.iter().position(|p| Pattern::is_pattern(regex, p))?;
-        // not `join`, which with no parts adds a separator at the end, and then on Windows
-        // `location` would put the pattern after a `\`, where it is an escape
-        let mut base = dir;
-        base.extend(&parts[..first]);
-        let mut pattern = parts[first..].join("/");
-        // which makes it match only dirs
-        if rest.ends_with('/') {
-            pattern.push('/');
+    fn split_location(
+        &self,
+        written: &Written,
+        read: &[ReadChar],
+        regex: bool,
+    ) -> Option<Location> {
+        let text = read_text(read);
+        // like `/` or `C:\`, nothing if it is relative
+        let root = Path::new(&text).ancestors().last();
+        let root = &text[..root.map_or(0, |r| r.as_os_str().len())];
+        let root_chars = root.chars().count();
+        // the longest part before a `/` that is a dir, as written (then what comes after it is
+        // read again from there), or as read
+        // Not as written before a quoted `/`, where it would end in the middle of the quotes
+        // (`"a/..` is the dir it is in, even if `"a` does not exist)
+        for i in (root_chars..read.len()).rev().filter(|&i| read[i].c == '/') {
+            let at = read[i].at;
+            if !read[i].quoted
+                && let Some(dir) = self.dir_at(Path::new(&written.until(at)))
+            {
+                let rest = read_quoted(written.text, at + 1);
+                return Some(location_in(dir, &rest, at + 1, regex));
+            }
+            let as_read = read_text(&read[..i]);
+            if as_read != written.until(at)
+                && let Some(dir) = self.dir_at(Path::new(&as_read))
+            {
+                return Some(location_in(dir, &read[i + 1..], at + 1, regex));
+            }
         }
-        let pattern = match regex {
-            true => Pattern::Regex(pattern),
-            false => Pattern::Glob(pattern),
+        let dir = self.dir_at(Path::new(root))?;
+        let start = match root_chars {
+            0 => 0,
+            _ => read[root_chars - 1].at + read[root_chars - 1].c.len_utf8(),
         };
-        Some((base, pattern))
+        Some(location_in(dir, &read[root_chars..], start, regex))
     }
 
     /// Fail if there are changes that are not applied yet

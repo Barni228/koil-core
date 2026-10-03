@@ -83,6 +83,10 @@ temporary name.
   dir at once. Names are shown relative to the base dir. Dirs that nothing inside can match
   are never searched, and a pattern that matches or has to search too much (`Limits`) stops
   early, instead of reading every path.
+- **Paths as a shell reads them.** A path can be quoted (`"my dir"`, `'my dir'`) or escaped
+  (`my\ dir`, except on Windows, where `\` is a separator), like one copied from a terminal.
+  What is quoted is never special in a pattern, so `"[draft]"*.md` is every file starting
+  with `[draft]`.
 - **Hidden and ignored files.** Hidden entries and entries ignored by git can be hidden or
   shown (`Settings`). A hidden entry is still shown while it has pending changes, so a
   change is never lost.

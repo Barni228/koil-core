@@ -1008,7 +1008,7 @@ fn test_glob_patterns() {
         vec![PathBuf::from("file"), "file2".into()],
         glob_names(r"fil\e*")
     );
-    assert_eq!(Vec::<PathBuf>::new(), glob_names(r"file\*"));
+    assert_eq!(Vec::<PathBuf>::new(), glob_names(r"file\**"));
 }
 
 #[test]
@@ -1048,6 +1048,187 @@ fn test_windows_paths() {
         vec!["dir/", "dir/inside", "file", "file2", "qwerty"],
         names(&koil)
     );
+}
+
+/// A temp dir with names that need quotes in a shell: `my dir/` (with `[1]x` and `y`),
+/// `it's/` and `a'b/c'd/`, each dir with an `x` in it
+fn quoting_temp_dir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    for file in ["my dir/x", "my dir/[1]x", "my dir/y", "it's/x", "a'b/c'd/x"] {
+        let path = temp.path().join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    temp
+}
+
+/// What `koil` opens at `location`: the open dir relative to the one open now, and the
+/// pattern, or the error
+fn opened(koil: &Koil, location: &str) -> Result<(String, Option<String>), OpenError> {
+    let mut opened = koil.clone();
+    opened.open(location)?;
+    let dir = opened
+        .current_dir()
+        .strip_prefix(koil.current_dir())
+        .unwrap();
+    let pattern = opened.pattern().map(|p| p.as_str().to_string());
+    Ok((with_slashes(dir).display().to_string(), pattern))
+}
+
+#[test]
+fn test_open_quoted() {
+    let temp = quoting_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let root = koil.current_dir().to_path_buf();
+    let open = |location| opened(&koil, location).unwrap();
+    let dir = |dir: &str| (dir.to_string(), None);
+    let glob = |dir: &str, glob: &str| (dir.to_string(), Some(glob.to_string()));
+
+    for location in [r#""my dir""#, "'my dir'", r#"my" "dir"#, r#""my dir/""#] {
+        assert_eq!(dir("my dir"), open(location), "{location}");
+    }
+    // a `"` in `'...'`, and a `'` in `"..."`
+    assert_eq!(dir("it's"), open(r#""my dir/../it's""#));
+    // also the base dir of a pattern, even if a `/` in it is quoted
+    assert_eq!(glob("my dir", "*"), open(r#""my dir"/*"#));
+    assert_eq!(glob("my dir", "*"), open(r#""my dir/"*"#));
+    // what is quoted is never special in a pattern, so it is escaped
+    assert_eq!(glob("my dir", r"\[1\]*"), open(r#""my dir"/"[1]"*"#));
+    let mut quoted = koil.clone();
+    quoted.open(r#""my dir"/"[1]"*"#).unwrap();
+    assert_eq!(vec!["[1]x"], names(&quoted));
+    // which is shown without quotes, and opens the same again
+    let location = format!(r"{}/my dir/\[1\]*", with_slashes(&root).display());
+    assert_eq!(PathBuf::from(&location), quoted.location());
+    assert_eq!(glob("my dir", r"\[1\]*"), open(&location));
+    // and a part with only quoted special characters is a path
+    assert!(matches!(
+        opened(&koil, r#""my dir"/"*""#),
+        Err(OpenError::NotFound(path)) if path == root.join("my dir/*")
+    ));
+
+    // a name with quotes opens as it is written, as it is shown
+    assert_eq!(dir("it's"), open("it's"));
+    assert_eq!(glob("it's", "*"), open("it's/*"));
+    assert_eq!(dir("a'b/c'd"), open("a'b/c'd"));
+    assert_eq!(glob("a'b/c'd", "*"), open("a'b/c'd/*"));
+    // and a quote that is not closed is a plain character
+    assert!(matches!(
+        opened(&koil, r#""my dir"#),
+        Err(OpenError::NotFound(path)) if path == root.join(r#""my dir"#)
+    ));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_open_escaped() {
+    let temp = quoting_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let open = |location| opened(&koil, location).unwrap();
+    let dir = |dir: &str| (dir.to_string(), None);
+    let glob = |dir: &str, glob: &str| (dir.to_string(), Some(glob.to_string()));
+
+    assert_eq!(dir("my dir"), open(r"my\ dir"));
+    assert_eq!(dir("it's"), open(r"it\'s"));
+    assert_eq!(glob("my dir", "*"), open(r"my\ dir/*"));
+    assert_eq!(glob("my dir", r"\[1\]*"), open(r"my\ dir/\[1\]*"));
+    // in `"..."`, `\` only escapes `"`, `\`, `$` and `` ` ``
+    assert_eq!(glob("my dir", r"\\\[*"), open(r#"my\ dir/"\\["*"#));
+    assert_eq!(glob("my dir", r"\\\[*"), open(r#"my\ dir/"\["*"#));
+    let root = koil.current_dir();
+    assert!(matches!(
+        opened(&koil, r#""my dir/../it\'s""#),
+        Err(OpenError::NotFound(path)) if path == root.join(r"it\'s")
+    ));
+    // a letter is never escaped, so `\x` is the glob's escape
+    assert_eq!(glob("my dir", r"\[1\]\x*"), open(r"my\ dir/\[1\]\x*"));
+}
+
+#[test]
+fn test_open_quoted_regex() {
+    let temp = quoting_temp_dir();
+    let koil = temp_koil(&temp, regex(), "");
+    let open = |location| opened(&koil, location).unwrap();
+    let regex = |dir: &str, regex: &str| (dir.to_string(), Some(regex.to_string()));
+
+    assert_eq!(regex("my dir", ".*"), open(r#""my dir"/.*"#));
+    assert_eq!(regex("my dir", r"\[1\]."), open(r#""my dir"/"[1]"."#));
+    #[cfg(not(windows))]
+    {
+        assert_eq!(regex("my dir", ".*"), open(r"my\ dir/.*"));
+        // `\.` is a `.` either way, and `\w` stays the regex's
+        assert_eq!(regex("my dir", r"\[1\]\w"), open(r"my\ dir/\[1\]\w"));
+        assert_eq!(regex("my dir", r".*\.rs"), open(r"my\ dir/.*\.rs"));
+        let mut koil = koil.clone();
+        koil.open(r"my\ dir/\[1\]\w").unwrap();
+        assert_eq!(vec!["[1]x"], names(&koil));
+    }
+}
+
+#[test]
+fn test_read_location() {
+    let temp = quoting_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let root = koil.current_dir().to_path_buf();
+    let location = koil.read_location(r#""my dir"/"[1]"*"#, false);
+    assert_eq!(root.join("my dir"), location.dir);
+    assert_eq!(Some(Pattern::Glob(r"\[1\]*".into())), location.pattern);
+    // where it is written, after the `/`, with its quotes
+    assert_eq!(Some(9), location.pattern_start);
+    let location = koil.read_location(r#""my dir"/"[1]"*"#, true);
+    assert_eq!(Some(Pattern::Regex(r"\[1\]*".into())), location.pattern);
+    assert_eq!(Some(9), location.pattern_start);
+    // a dir, that does not have to exist
+    let location = koil.read_location(r#""my dir"/z"#, false);
+    assert_eq!(root.join("my dir/z"), location.dir);
+    assert_eq!((None, None), (location.pattern, location.pattern_start));
+}
+
+#[test]
+fn test_read_location_home() {
+    let Some(home) = std::env::home_dir() else {
+        return;
+    };
+    let home = dunce::canonicalize(home).unwrap();
+    let koil = test_koil();
+    let read = |location: &str, regex| {
+        let location = koil.read_location(location, regex);
+        (
+            location.dir,
+            location.pattern.map(|p| p.as_str().to_string()),
+        )
+    };
+    let dir = |location| read(location, false).0;
+    for location in ["~", "~/", r#""~""#, "'~'", r#""~/""#, r#"~"/""#] {
+        assert_eq!(home, dir(location), "{location}");
+    }
+    // a pattern in it, which starts after the `~` as written
+    assert_eq!((home.clone(), Some("*.rs".into())), read("~/*.rs", false));
+    assert_eq!((home.clone(), Some(".*".into())), read(r#""~"/.*"#, true));
+    assert_eq!(Some(2), koil.read_location("~/*.rs", false).pattern_start);
+    assert_eq!(
+        Some(4),
+        koil.read_location(r#""~"/*.rs"#, false).pattern_start
+    );
+    // only a `~` at the start, before a `/` or nothing, and not an escaped one (which on
+    // Windows is a `\` before it)
+    assert_eq!(test_path("~"), dir("./~"));
+    assert_eq!(test_path("a/~"), dir("a/~"));
+    assert_eq!(test_path("~x"), dir("~x"));
+    assert_ne!(home, dir(r"\~"));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_open_quoted_windows() {
+    let temp = quoting_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let root = koil.current_dir().display().to_string();
+    // like Copy as path gives it, and `\` is a separator, never an escape
+    let (dir, pattern) = opened(&koil, &format!(r#""{root}\my dir""#)).unwrap();
+    assert_eq!(("my dir", None), (dir.as_str(), pattern));
+    let (dir, pattern) = opened(&koil, &format!(r#"'{root}\my dir'/*"#)).unwrap();
+    assert_eq!(("my dir", Some("*")), (dir.as_str(), pattern.as_deref()));
 }
 
 #[test]
@@ -1324,9 +1505,9 @@ fn test_regex_commas() {
     let mut koil = Koil::builder().settings(regex()).build();
     let names =
         |koil: &Koil| -> Vec<PathBuf> { koil.listing().into_iter().map(|e| e.name).collect() };
-    koil.open(inside(temp.path(), r"a\,b")).unwrap();
+    koil.open(inside(temp.path(), r"a\,.")).unwrap();
     assert_eq!(vec![PathBuf::from("a,b")], names(&koil));
-    koil.open(inside(temp.path(), "a,b")).unwrap();
+    koil.open(inside(temp.path(), "a,.")).unwrap();
     assert_eq!(vec![PathBuf::from("a,b"), "axb".into()], names(&koil));
 }
 
