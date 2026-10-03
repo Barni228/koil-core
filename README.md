@@ -52,7 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## How editing works
 
-Each existing entry has an `Id`. It is a stable handle that always points to the same path.
+Each existing entry has an `Id`. It is a stable handle that always points to the same file.
+If the file is renamed or moved on disk, `sync` sees it, and the ID follows it.
 The edit is read by what happened to each ID:
 
 - A new name means rename.
@@ -92,6 +93,12 @@ temporary name.
   change is never lost.
 - **Undo.** Deleted paths are moved to the system trash, not removed. `undo` brings them
   back and moves created paths to the trash.
+- **Changes on disk.** `sync` reads the open dir again while the user is still editing,
+  and returns how their listing should change to show what is on disk now: new entries,
+  gone ones, and renamed or moved ones (found by their inode, or creation time on Windows),
+  with the user's edits kept. Where a change on disk goes against an edit (a file the user
+  deleted was renamed, say), it returns a `Conflict` for the frontend to ask about, and
+  `resolve` takes the other way. `watched` says what a file watcher should watch.
 - **Sessions.** `save_state` and `load_state` save the whole session as JSON, so another
   process can continue it.
 

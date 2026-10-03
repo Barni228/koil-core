@@ -9,7 +9,6 @@
 - [ ] Add a way to open files from koil
 - [ ] Add file icons
 - [ ] Parse file with `chumsky`
-- [ ] Handle cases where file system changes while this is still running (open koil, then create new file)
 - [ ] Publish to crates.io
 
 ## Not Planned
@@ -18,6 +17,7 @@
 
 ## Done
 
+- [x] Handle cases where file system changes while this is still running (open koil, then create new file)
 - [x] Warn user about creating files with weird names (like `:^&<here>`)
 - [x] Allow entering a regex pattern, so like glob but its regex (`regex=true` in the CLI header)
 - [x] Optionally respect `.gitignore` (`gitignore=true` in the CLI header), so `**/*.rs` skips `target/`

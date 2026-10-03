@@ -63,3 +63,4 @@ mod test_diff;
 mod test_koil;
 mod test_names;
 mod test_planner;
+mod test_sync;

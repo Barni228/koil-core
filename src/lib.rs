@@ -2,6 +2,7 @@
 
 use crate::apply::{Undo, inside, same_file};
 use crate::diff::Diff;
+use crate::sync::{FileKey, Seen};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
@@ -20,10 +21,14 @@ pub mod apply;
 pub mod diff;
 mod names;
 pub mod planner;
+mod sync;
 pub mod trash;
 
+pub use sync::{Conflict, ConflictKind, Edit, Synced, Watched};
+
 /// A stable handle of a path that koil has seen
-/// It never starts pointing to a different path, even after navigating or applying
+/// It never starts pointing to a different file, even after navigating or applying, but it
+/// follows its file when [`Koil::sync`] sees it renamed or moved on disk
 /// A frontend can show it however it likes, or hide it and keep it next to its entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -687,6 +692,11 @@ pub enum EntryErrorKind {
     #[error("`{}` has the control character {char:?}", name.escape_debug())]
     ControlCharacter { name: String, char: char },
 
+    /// The entry's ID is of a path that is no longer on disk (it was deleted, or moved where
+    /// koil did not see it go), so nothing can be done with it
+    #[error("`{}` is no longer on disk", shown(.0))]
+    NotOnDisk(PathBuf),
+
     /// On Windows, a name it can not use (elsewhere only a warning): a character it does not
     /// allow, a reserved name, or a `.` at the end, which it would remove
     #[error("{0}")]
@@ -794,6 +804,18 @@ pub struct Koil {
     #[serde(default)]
     /// Steps that revert each apply of this session, the last apply is last
     undo: Vec<Vec<Undo>>,
+
+    #[builder(default, setter(skip))]
+    #[serde(skip)]
+    /// What was at the path of each ID when koil last read it, so [`Koil::sync`] can find it
+    /// again after it is renamed or moved
+    seen: HashMap<usize, Seen>,
+
+    #[builder(default, setter(skip))]
+    #[serde(skip)]
+    /// [`Koil::current_dir`] and every dir it is in, as they were on disk when it was read, so
+    /// [`Koil::sync`] can follow it when one of them is renamed or moved
+    dirs_seen: Vec<(PathBuf, FileKey)>,
 }
 
 impl Default for Koil {
@@ -1324,50 +1346,70 @@ impl Koil {
     /// Read [`Koil::current_listing`] for the open dir or pattern from the filesystem
     fn read_listing(&mut self) -> Result<(), OpenError> {
         self.current_listing.clear();
-        let view = self.view();
+        let paths = self.read_view(&self.view())?;
+        self.list(paths);
+        self.see_dirs();
+        Ok(())
+    }
 
-        let paths = match self.current_dir.is_dir() {
-            true => self.walk(&view)?,
-            // a new dir that is not created yet
-            false => Vec::new(),
-        };
+    /// Every path on disk that `view` shows (see [`Koil::walk`]), with what is there, nothing
+    /// if [`Koil::current_dir`] is a new dir that is not created yet
+    fn read_view(&self, view: &View) -> Result<Vec<(PathBuf, Option<Seen>)>, OpenError> {
+        match self.current_dir.is_dir() {
+            true => self.walk(view),
+            false => Ok(Vec::new()),
+        }
+    }
+
+    /// Make `paths` (read by [`Koil::read_view`]) [`Koil::current_listing`], giving new IDs to
+    /// the ones koil has not seen, and remember what is at each
+    /// A changed entry in the view stays too, even if it is hidden, so it is not taken for
+    /// deleted in the next update
+    fn list(&mut self, paths: Vec<(PathBuf, Option<Seen>)>) {
+        self.current_listing.clear();
         // a pattern can show thousands of paths, so they are not searched for in `ids` one by one
-        let known: HashMap<&Path, usize> = (self.ids.iter().enumerate())
-            .map(|(index, path)| (path.as_path(), index))
-            .collect();
-        let mut new = Vec::new();
-        for path in paths {
-            if self.ignore.contains(&path) {
-                continue;
+        let found: Vec<(Option<usize>, PathBuf, Option<Seen>)> = {
+            let known: HashMap<&Path, usize> = (self.ids.iter().enumerate())
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            (paths.into_iter())
+                .filter(|(path, _)| !self.ignore.contains(path))
+                .map(|(path, seen)| (known.get(path.as_path()).copied(), path, seen))
+                .collect()
+        };
+        for (index, path, seen) in found {
+            let index = index.unwrap_or_else(|| {
+                self.ids.push(path);
+                self.ids.len() - 1
+            });
+            self.current_listing.insert(index);
+            if let Some(seen) = seen {
+                self.seen.insert(index, seen);
             }
-            match known.get(path.as_path()) {
-                Some(&index) => {
-                    self.current_listing.insert(index);
-                }
-                None => new.push(path),
-            }
-        }
-        for path in new {
-            self.ids.push(path);
-            self.current_listing.insert(self.ids.len() - 1);
         }
 
-        // a changed entry stays, even if it is hidden, so it is not taken for deleted in
-        // the next update
+        let view = self.view();
         for (&index, (before, _afters)) in &self.diff.with_id {
             if view.contains(before, self.ids[index].is_dir()) {
                 self.current_listing.insert(index);
             }
         }
+    }
 
-        Ok(())
+    /// Remember what [`Koil::current_dir`] and the dirs it is in are on disk (see
+    /// [`Koil::dirs_seen`])
+    fn see_dirs(&mut self) {
+        self.dirs_seen = (self.current_dir.ancestors())
+            .filter_map(|dir| Some((dir.to_path_buf(), FileKey::at(dir)?)))
+            .collect();
     }
 
     /// Every path on disk that `view` shows, without hidden entries if they are not shown,
-    /// and without ignored paths if [`Settings::respect_gitignore`] is on
+    /// and without ignored paths if [`Settings::respect_gitignore`] is on, and what is at each
+    /// (`None` if it can not be read)
     /// Fails if [`Koil::current_dir`] can not be read, but dirs inside it that can not be read
     /// are skipped, or if a pattern goes over [`Limits`]
-    fn walk(&self, view: &View) -> Result<Vec<PathBuf>, OpenError> {
+    fn walk(&self, view: &View) -> Result<Vec<(PathBuf, Option<Seen>)>, OpenError> {
         fs::read_dir(&self.current_dir)?;
         let max_depth = match &self.pattern {
             None => Some(1),
@@ -1398,11 +1440,14 @@ impl Koil {
                     return WalkState::Continue;
                 }
                 let is_dir = item.file_type().is_some_and(|t| t.is_dir());
-                let skip_inside = is_dir && prune.as_ref().is_some_and(|p| p.skips_inside(&item));
+                let skip_inside =
+                    is_dir && prune.as_ref().is_some_and(|p| p.skips_inside(item.path()));
                 let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
                 let matches = match view.contains(item.path(), is_dir) {
                     true => {
-                        paths.lock().unwrap().push(item.into_path());
+                        // here, on the walk's threads, as it reads the disk again
+                        let seen = item.metadata().ok().map(|m| Seen::new(item.path(), &m));
+                        paths.lock().unwrap().push((item.into_path(), seen));
                         matched.fetch_add(1, Ordering::Relaxed) + 1
                     }
                     false => matched.load(Ordering::Relaxed),
@@ -1425,7 +1470,7 @@ impl Koil {
         }
         let mut paths = paths.into_inner().unwrap();
         // the walk runs on many threads, in no order, and new IDs are given in this one
-        paths.sort();
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(paths)
     }
 
@@ -1601,6 +1646,16 @@ impl Koil {
                 }
                 None => None,
             };
+            // what the listing shows was on disk when it was read, and is followed by `sync`
+            if let Some(index) = index
+                && !self.current_listing.contains(&index)
+                && self.ids[index].symlink_metadata().is_err()
+            {
+                let path = &self.ids[index];
+                let path = self.relative(path).unwrap_or_else(|| with_slashes(path));
+                error(i, EntryErrorKind::NotOnDisk(path));
+                continue;
+            }
             let Some(path) = relative_path(&entry.name) else {
                 error(i, EntryErrorKind::InvalidName(entry.name.clone()));
                 continue;
@@ -1770,6 +1825,7 @@ impl Koil {
 }
 
 /// Which paths a listing shows
+#[derive(Clone)]
 struct View {
     /// The open dir, or the base dir of the pattern
     base: PathBuf,
@@ -1789,6 +1845,7 @@ impl View {
 }
 
 /// A compiled [`Pattern`]
+#[derive(Clone)]
 enum Matcher {
     /// The glob without its trailing `/`, and whether it had one
     Glob(GlobMatcher, bool),
@@ -1844,6 +1901,7 @@ fn match_text(path: &Path, is_dir: bool) -> String {
 }
 
 /// Which dirs a walk of a pattern does not need to enter, since nothing inside them can match
+#[derive(Clone)]
 struct Prune {
     /// The base dir of the pattern
     base: PathBuf,
@@ -1860,9 +1918,9 @@ impl Prune {
         })
     }
 
-    /// Whether nothing inside the dir `item` can match
-    fn skips_inside(&self, item: &ignore::DirEntry) -> bool {
-        let Ok(path) = item.path().strip_prefix(&self.base) else {
+    /// Whether nothing inside the dir `path` can match
+    fn skips_inside(&self, path: &Path) -> bool {
+        let Ok(path) = path.strip_prefix(&self.base) else {
             return false;
         };
         // the text of every path inside is the dir's (its `/` included), and then more
