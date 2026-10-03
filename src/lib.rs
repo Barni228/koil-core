@@ -494,14 +494,28 @@ impl fmt::Display for Warning {
             Warning::DirNotFound { requested, opened } => write!(
                 f,
                 "`{}` is not a directory, opened `{}` instead",
-                requested.display(),
-                opened.display()
+                shown(requested),
+                shown(opened)
             ),
             Warning::OverLimit { error, opened } => {
-                write!(f, "{error}, opened `{}` instead", opened.display())
+                write!(f, "{error}, opened `{}` instead", shown(opened))
             }
         }
     }
+}
+
+/// What [`Koil::update_and_open`] did
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Updated {
+    /// Names that can be used, but are not recommended, see [`Koil::update`]
+    pub warnings: Vec<EntryWarning>,
+    /// Set if the open dir was read again with the new settings, and it is gone, or its pattern
+    /// goes over [`Limits`] with them, so something else was opened (see [`Koil::set_settings`])
+    pub warning: Option<Warning>,
+    /// Whether the listing shows other entries now: another dir or pattern is open, or the
+    /// settings show or hide other entries. A frontend should then show the listing as a new
+    /// one, as the old one's text is of another view, which must not be read as this one's
+    pub moved: bool,
 }
 
 /// What [`Koil::apply`] or [`Koil::undo`] did
@@ -552,11 +566,11 @@ pub enum OpenError {
     Io(#[from] io::Error),
 
     /// The first part of the path that is neither on disk nor new in the diff
-    #[error("`{}` does not exist", .0.display())]
+    #[error("`{}` does not exist", shown(.0))]
     NotFound(PathBuf),
 
     /// The first part of the path that is a file, on disk or new in the diff
-    #[error("`{}` is a file, not a directory", .0.display())]
+    #[error("`{}` is a file, not a directory", shown(.0))]
     NotADirectory(PathBuf),
 
     #[error("`{glob}` is not a valid glob pattern")]
@@ -575,6 +589,17 @@ pub enum OpenError {
 
     #[error(transparent)]
     OverLimit(#[from] OverLimit),
+}
+
+/// Why [`Koil::update_and_open`] failed, nothing was changed
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateOpenError {
+    /// The entries can not be read
+    #[error(transparent)]
+    Update(#[from] UpdateError),
+    /// The location can not be opened, or the open dir read again with the new settings
+    #[error(transparent)]
+    Open(#[from] OpenError),
 }
 
 /// A pattern matched or searched more paths than [`Limits`] allow
@@ -614,7 +639,7 @@ pub enum EntryErrorKind {
 
     #[error(
         "`{}` is not a valid name, it can not be empty, absolute, or contain `.` or `..`",
-        .0.display()
+        shown(.0)
     )]
     InvalidName(PathBuf),
 
@@ -982,6 +1007,42 @@ impl Koil {
         self.clone().update(entries)
     }
 
+    /// [`Koil::update`] with `entries`, then use `settings`, then [`Koil::open`] `location`
+    /// (if there is one) with them, as one step: if any of it fails, nothing changes
+    /// This is how a frontend reads an edited listing, and then shows what user asked for. The
+    /// entries must be read with the settings they were listed with, as `update` takes every
+    /// listed entry that is missing as deleted: read with [`Settings::show_hidden`] just
+    /// turned on, a listing that does not show the hidden entries yet would delete them all
+    /// Without `location`, the open dir is read again if the settings changed
+    pub fn update_and_open(
+        &mut self,
+        entries: &[Entry],
+        settings: Settings,
+        location: Option<&Path>,
+    ) -> Result<Updated, UpdateOpenError> {
+        let mut updated = self.clone();
+        let warnings = updated.update(entries)?;
+        let mut warning = None;
+        match location {
+            // not read again first, as the location is read with them right away
+            Some(location) => {
+                updated.settings = settings;
+                updated.open(location)?;
+            }
+            None if settings != updated.settings => {
+                warning = updated.set_settings(settings).map_err(OpenError::from)?;
+            }
+            None => {}
+        }
+        let moved = updated.shows() != self.shows();
+        *self = updated;
+        Ok(Updated {
+            warnings,
+            warning,
+            moved,
+        })
+    }
+
     /// The actions that [`Koil::apply`] would run to do what user did, in order
     pub fn compute_actions(&self) -> Vec<Action> {
         self.diff.clone().compute_actions()
@@ -1084,6 +1145,24 @@ impl Koil {
     /// The ID of `path`, `None` if koil has not seen it in any dir it opened
     pub fn id_of(&self, path: &Path) -> Option<Id> {
         self.ids.iter().position(|p| p == path).map(to_id)
+    }
+
+    /// `path` relative to [`Koil::current_dir`], only with `/` (see [`with_slashes`]), like
+    /// the names in the listing, `None` if it is not inside it
+    pub fn relative(&self, path: &Path) -> Option<PathBuf> {
+        let rest = path.strip_prefix(&self.current_dir).ok()?;
+        (!rest.as_os_str().is_empty()).then(|| with_slashes(rest))
+    }
+
+    /// Whether applying would change `entry`, as it is written in a listing of the open dir:
+    /// it is new (but not [`Entry::parent`]), or not at the path of its ID, so it is renamed,
+    /// copied, or moved here from another dir
+    /// A frontend can use it to mark the entries that are not on disk as they are written
+    pub fn is_pending(&self, entry: &Entry) -> bool {
+        match entry.id {
+            None => !entry.is_parent(),
+            Some(id) => self.path_of(id) != Some(self.current_dir.join(&entry.name).as_path()),
+        }
     }
 }
 
@@ -1287,6 +1366,19 @@ impl Koil {
     /// also on Windows, as users write it
     fn name(&self, path: &Path) -> PathBuf {
         with_slashes(path.strip_prefix(&self.current_dir).unwrap())
+    }
+
+    /// What decides which entries the listing shows (not [`Settings::regex`], which only
+    /// changes how the next location is read), see [`Updated::moved`]
+    fn shows(&self) -> (&Path, Option<&Pattern>, bool, bool) {
+        let settings = &self.settings;
+        let pattern = self.pattern.as_ref();
+        (
+            &self.current_dir,
+            pattern,
+            settings.show_hidden,
+            settings.respect_gitignore,
+        )
     }
 
     /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`]
@@ -1746,15 +1838,22 @@ fn expand_commas(regex: &str) -> String {
     expanded
 }
 
-/// `path` with `/` instead of `\` on Windows, where both are separators, and users write `/`
+/// `path` with `/` instead of `\` on Windows, where both are separators, as users write it:
+/// koil gives every path it shows that way (names, [`Koil::location`], and the paths in its
+/// messages), and a frontend should show the others like that too
 /// Not if it is verbatim (`\\?\`), where `/` is not a separator, or not Unicode
-fn with_slashes(path: &Path) -> PathBuf {
+pub fn with_slashes(path: &Path) -> PathBuf {
     let verbatim =
         matches!(path.components().next(), Some(Component::Prefix(p)) if p.kind().is_verbatim());
     match path.to_str() {
         Some(s) if cfg!(windows) && !verbatim => s.replace('\\', "/").into(),
         _ => path.to_path_buf(),
     }
+}
+
+/// `path` as koil's messages show it, see [`with_slashes`]
+pub(crate) fn shown(path: &Path) -> String {
+    with_slashes(path).display().to_string()
 }
 
 /// Like [`Path::canonicalize`], but `path` does not need to exist

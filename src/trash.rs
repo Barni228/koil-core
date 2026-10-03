@@ -1,5 +1,6 @@
 //! Moving paths to the system trash, and restoring them from it
 
+use crate::shown;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ pub fn restore(trashed: &Trashed) -> io::Result<()> {
     if trashed.original.symlink_metadata().is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("`{}` already exists", trashed.original.display()),
+            format!("`{}` already exists", shown(&trashed.original)),
         ));
     }
     platform::restore(trashed)
@@ -36,7 +37,7 @@ pub fn restore(trashed: &Trashed) -> io::Result<()> {
 fn not_in_trash(trashed: &Trashed) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
-        format!("`{}` is no longer in the trash", trashed.original.display()),
+        format!("`{}` is no longer in the trash", shown(&trashed.original)),
     )
 }
 

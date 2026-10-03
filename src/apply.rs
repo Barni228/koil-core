@@ -1,5 +1,5 @@
-use crate::Action;
 use crate::trash::{self, Trashed};
+use crate::{Action, shown};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
@@ -51,12 +51,12 @@ impl Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::CreateFile(n) => write!(f, "create {}", n.display()),
-            Action::CreateDir(n) => write!(f, "create {}/", n.display()),
-            Action::DeleteFile(n) => write!(f, "delete {}", n.display()),
-            Action::DeleteDir(n) => write!(f, "delete {}/", n.display()),
-            Action::Rename(s, d) => write!(f, "move {} -> {}", s.display(), d.display()),
-            Action::Copy(s, d) => write!(f, "copy {} -> {}", s.display(), d.display()),
+            Action::CreateFile(n) => write!(f, "create {}", shown(n)),
+            Action::CreateDir(n) => write!(f, "create {}/", shown(n)),
+            Action::DeleteFile(n) => write!(f, "delete {}", shown(n)),
+            Action::DeleteDir(n) => write!(f, "delete {}/", shown(n)),
+            Action::Rename(s, d) => write!(f, "move {} -> {}", shown(s), shown(d)),
+            Action::Copy(s, d) => write!(f, "copy {} -> {}", shown(s), shown(d)),
         }
     }
 }
@@ -91,9 +91,9 @@ impl Undo {
 impl fmt::Display for Undo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Undo::Trash(n) => write!(f, "trash {}", n.display()),
-            Undo::Restore(t) => write!(f, "restore {}", t.original.display()),
-            Undo::Rename(s, d) => write!(f, "move {} -> {}", s.display(), d.display()),
+            Undo::Trash(n) => write!(f, "trash {}", shown(n)),
+            Undo::Restore(t) => write!(f, "restore {}", shown(&t.original)),
+            Undo::Rename(s, d) => write!(f, "move {} -> {}", shown(s), shown(d)),
         }
     }
 }
@@ -183,8 +183,8 @@ fn into_itself(src: &Path, dst: &Path) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!(
             "`{}` can not go into itself, at `{}`",
-            src.display(),
-            dst.display()
+            shown(src),
+            shown(dst)
         ),
     )
 }
@@ -192,6 +192,6 @@ fn into_itself(src: &Path, dst: &Path) -> io::Error {
 fn already_exists(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
-        format!("`{}` already exists", path.display()),
+        format!("`{}` already exists", shown(path)),
     )
 }

@@ -1042,6 +1042,9 @@ fn test_windows_paths() {
     koil.open(test_path(r"dir\*")).unwrap();
     assert_eq!(test_path(""), koil.current_dir());
     assert_eq!(Some(r"dir\*"), koil.pattern().map(Pattern::as_str));
+    // and so do the paths in messages
+    let error = koil.open(test_path(r"nope\x")).unwrap_err();
+    assert!(!error.to_string().contains('\\'), "{error}");
     // names in the listing only have `/` too
     koil.open("**/*").unwrap();
     assert_eq!(
@@ -1914,4 +1917,94 @@ fn test_invalid_update_changes_nothing() {
     let entries = [keep(&koil, "dir/"), with_id(Id(999), "new")];
     assert!(koil.update(&entries).is_err());
     assert_eq!(before, koil.save_state());
+}
+
+// ── update and open ──────────────────────────────────────────────────────────
+
+fn show_hidden() -> Settings {
+    Settings {
+        show_hidden: true,
+        ..Settings::default()
+    }
+}
+
+#[test]
+fn test_update_and_open() {
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "renamed");
+    // the entries are read, then `dir` is opened with the new settings
+    let dir = Some(Path::new("dir"));
+    let updated = koil.update_and_open(&entries, show_hidden(), dir).unwrap();
+    assert!(updated.moved);
+    assert_eq!((vec![], None), (updated.warnings, updated.warning));
+    assert_eq!(test_path("dir"), koil.current_dir());
+    assert_eq!(&show_hidden(), koil.settings());
+    assert_eq!(vec!["../", "inside"], names(&koil));
+    let root = test_path("");
+    assert_eq!(
+        vec![Action::Rename(root.join("file"), root.join("renamed"))],
+        koil.compute_actions()
+    );
+}
+
+#[test]
+fn test_update_and_open_with_old_settings() {
+    // the listing does not show `.hidden` yet, so it is not read as deleted
+    let mut koil = test_koil();
+    let entries = test_dir_listing(&koil);
+    let updated = koil.update_and_open(&entries, show_hidden(), None).unwrap();
+    assert!(updated.moved);
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+    assert!(names(&koil).contains(&".hidden".to_string()));
+    // and with the same settings, and nothing to open, it shows the same
+    let entries = koil.listing();
+    let updated = koil.update_and_open(&entries, show_hidden(), None).unwrap();
+    assert!(!updated.moved);
+}
+
+#[test]
+fn test_update_and_open_changes_nothing_if_it_fails() {
+    let mut koil = test_koil();
+    let before = koil.save_state();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "renamed");
+    // a location that can not be opened, after entries that can be read, and new settings
+    let nope = Some(Path::new("nope"));
+    let result = koil.update_and_open(&entries, show_hidden(), nope);
+    assert!(matches!(
+        result,
+        Err(UpdateOpenError::Open(OpenError::NotFound(_)))
+    ));
+    assert_eq!(before, koil.save_state());
+    // entries that can not be read
+    entries.push(without_id("file2"));
+    let result = koil.update_and_open(&entries, show_hidden(), None);
+    assert!(matches!(result, Err(UpdateOpenError::Update(_))));
+    assert_eq!(before, koil.save_state());
+}
+
+#[test]
+fn test_relative() {
+    let koil = test_koil();
+    let inside = koil.relative(&test_path("dir/inside"));
+    assert_eq!(Some(PathBuf::from("dir/inside")), inside);
+    assert_eq!(None, koil.relative(koil.current_dir()));
+    assert_eq!(None, koil.relative(Path::new(env!("CARGO_MANIFEST_DIR"))));
+}
+
+#[test]
+fn test_is_pending() {
+    let koil = test_koil();
+    let file = id(&koil, "file");
+    let pending = |entry: Entry| koil.is_pending(&entry);
+    assert!(!pending(keep(&koil, "file")));
+    assert!(!pending(keep(&koil, "dir/")));
+    assert!(!pending(Entry::parent()));
+    // renamed, moved, or new
+    assert!(pending(with_id(file, "renamed")));
+    assert!(pending(with_id(file, "dir/file")));
+    assert!(pending(without_id("new")));
+    // an ID koil does not know
+    assert!(pending(with_id(Id(1000), "file")));
 }
