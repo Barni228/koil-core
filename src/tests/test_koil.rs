@@ -2008,3 +2008,169 @@ fn test_is_pending() {
     // an ID koil does not know
     assert!(pending(with_id(Id(1000), "file")));
 }
+
+// ── completion ───────────────────────────────────────────────────────────────
+
+/// A temp dir with the dirs `.config/`, `Documents/`, `Downloads/`, `a[1]/b/`, `my dir/sub/`,
+/// `src/` and `src-old/`, and the file `script`
+fn completion_temp_dir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let dirs = [
+        ".config",
+        "Documents",
+        "Downloads",
+        "a[1]/b",
+        "my dir/sub",
+        "src",
+        "src-old",
+    ];
+    for dir in dirs {
+        fs::create_dir_all(temp.path().join(dir)).unwrap();
+    }
+    fs::write(temp.path().join("script"), "").unwrap();
+    temp
+}
+
+/// What `location` completes to in `koil` with `settings`: where the part being written
+/// starts, and the names it can be
+fn completed(koil: &Koil, settings: &Settings, location: &str) -> (usize, Vec<String>) {
+    let completion = koil.complete(location, settings);
+    (completion.start, completion.names)
+}
+
+fn completion(start: usize, names: &[&str]) -> (usize, Vec<String>) {
+    (start, names.iter().map(|n| n.to_string()).collect())
+}
+
+#[test]
+fn test_complete() {
+    let temp = completion_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let complete = |location| completed(&koil, &Settings::default(), location);
+    let none = completion(0, &[]);
+
+    // dirs, but not hidden ones
+    let all = [
+        "Documents/",
+        "Downloads/",
+        "a[1]/",
+        "my dir/",
+        "src/",
+        "src-old/",
+    ];
+    assert_eq!(completion(0, &all), complete(""));
+    assert_eq!(completion(0, &["src/", "src-old/"]), complete("s"));
+    assert_eq!(completion(0, &["src/", "src-old/"]), complete("src"));
+    assert_eq!(completion(0, &["src-old/"]), complete("src-"));
+    assert_eq!(none, complete("script"));
+    // case is only ignored when nothing matches with it
+    assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("do"));
+    let c = koil.complete("do", &Settings::default());
+    assert_eq!(
+        (koil.current_dir(), "do"),
+        (c.dir.as_path(), c.part.as_str())
+    );
+    // hidden ones for a part that starts with a `.`, and `..`
+    assert_eq!(completion(0, &["../", ".config/"]), complete("."));
+    assert_eq!(completion(0, &["../"]), complete(".."));
+
+    // in the dir before the last `/`, read like a location
+    assert_eq!(completion(7, &["sub/"]), complete("my dir/"));
+    assert_eq!(completion(7, &["sub/"]), complete("my dir/s"));
+    assert_eq!(completion(5, &["b/"]), complete("a[1]/"));
+    assert_eq!(completion(9, &["sub/"]), complete(r#""my dir"/s"#));
+    assert_eq!(
+        completion(10, &["src/", "src-old/"]),
+        complete("my dir/../s")
+    );
+    let root = with_slashes(koil.current_dir()).display().to_string();
+    let absolute = completed(&koil, &Settings::default(), &format!("{root}/s"));
+    assert_eq!(completion(root.len() + 1, &["src/", "src-old/"]), absolute);
+    // and the part is read too
+    assert_eq!(completion(0, &["my dir/"]), complete(r#""my d""#));
+    assert_eq!(completion(0, &["my dir/"]), complete("'my'' d'"));
+
+    // nothing in what is not a dir, or a pattern, or for a part that starts in quotes
+    assert_eq!(none, complete("nope/"));
+    assert_eq!(none, complete("script/"));
+    assert_eq!(none, complete("*/"));
+    assert_eq!(none, complete(r#""my dir/s"#));
+    assert_eq!(none, complete(r#""my dir/s""#));
+    // a pattern in the part is a name no dir starts with
+    assert_eq!(completion(4, &[]), complete("src/*"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_complete_escaped() {
+    let temp = completion_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let complete = |location| completed(&koil, &Settings::default(), location);
+    assert_eq!(completion(0, &["my dir/"]), complete(r"my\ d"));
+    assert_eq!(completion(8, &["sub/"]), complete(r"my\ dir/s"));
+    assert_eq!(completion(6, &["b/"]), complete(r"a\[1]/"));
+    // after an escaped `/`
+    assert_eq!(completion(0, &[]), complete(r"my dir\/s"));
+}
+
+#[test]
+fn test_complete_settings() {
+    let temp = completion_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let hidden = completed(&koil, &show_hidden(), "");
+    let all = [
+        ".config/",
+        "Documents/",
+        "Downloads/",
+        "a[1]/",
+        "my dir/",
+        "src/",
+        "src-old/",
+    ];
+    assert_eq!(completion(0, &all), hidden);
+
+    let temp = gitignore_temp_dir(true);
+    let koil = temp_koil(&temp, Settings::default(), "");
+    let complete = |settings: Settings| completed(&koil, &settings, "").1;
+    assert_eq!(vec!["src/", "target/"], complete(Settings::default()));
+    assert_eq!(vec!["src/"], complete(gitignore()));
+    let both = Settings {
+        show_hidden: true,
+        ..gitignore()
+    };
+    assert_eq!(vec![".git/", "src/", "target/"], complete(show_hidden()));
+    assert_eq!(vec!["src/"], complete(both));
+
+    // a regex in the dir is a pattern
+    let temp = completion_temp_dir();
+    let koil = temp_koil(&temp, Settings::default(), "");
+    assert_eq!(completion(0, &[]), completed(&koil, &regex(), "a.*/"));
+    assert_eq!(completion(0, &[]), completed(&koil, &regex(), "my dir/.*/"));
+    assert_eq!(completion(5, &["b/"]), completed(&koil, &regex(), "a[1]/"));
+}
+
+#[test]
+fn test_complete_new_dirs() {
+    let koil = update_test_dir(&["new/inner/", "newer/file", "newest"]).unwrap();
+    let complete = |location| completed(&koil, &Settings::default(), location);
+    // `newer` is made for the file in it, and `newest` is a file
+    assert_eq!(completion(0, &["new/", "newer/"]), complete("ne"));
+    assert_eq!(completion(4, &["inner/"]), complete("new/"));
+    assert_eq!(completion(0, &["dir/"]), complete("d"));
+}
+
+#[test]
+fn test_complete_home() {
+    let Some(home) = std::env::home_dir() else {
+        return;
+    };
+    let home = dunce::canonicalize(home).unwrap();
+    let koil = test_koil();
+    let complete = |location| completed(&koil, &Settings::default(), location);
+    assert_eq!(completion(0, &["~/"]), complete("~"));
+    assert_eq!(completion(0, &["~/"]), complete(r#""~""#));
+    let c = koil.complete("~/", &Settings::default());
+    assert_eq!((home.as_path(), 2), (c.dir.as_path(), c.start));
+    // not `~x`, which is a name in the open dir
+    assert_eq!(completion(0, &[]), complete("~x"));
+}

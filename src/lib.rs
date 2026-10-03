@@ -9,7 +9,7 @@ use regex_automata::dfa::{Automaton, StartKind, dense};
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf, is_separator};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -232,6 +232,21 @@ impl Location {
             pattern_start: None,
         }
     }
+}
+
+/// What a location being written can go on as, see [`Koil::complete`]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Completion {
+    /// The dir of the part being written (the location's last part, after its last `/`)
+    pub dir: PathBuf,
+    /// Where that part starts in the location as written (a byte index): each of
+    /// [`Completion::names`] can be written from there instead of it
+    pub start: usize,
+    /// The part, as it is read (see [`Koil::read_location`]), without its quotes
+    pub part: String,
+    /// The dirs in [`Completion::dir`] whose names start with the part (or, if none do, the
+    /// ones whose names do when case is ignored), sorted, each with a `/` after it
+    pub names: Vec<String>,
 }
 
 /// The characters that make a part of a location a regex, and that are escaped in it when
@@ -870,6 +885,76 @@ impl Koil {
             .unwrap_or_else(|| Location::dir(self.absolute(&path)))
     }
 
+    /// What `location`, written up to where it is being written, can go on as, for a frontend
+    /// to complete it like a shell: the dirs its last part (after its last `/`) can be the
+    /// start of, in the dir before that part, read like [`Koil::read_location`] reads it (with
+    /// [`Settings::regex`] of `settings`), or in [`Koil::current_dir`] if it has no `/`
+    /// They are the dirs on disk, without hidden ones unless [`Settings::show_hidden`] is on
+    /// or the part starts with a `.`, and without ignored ones if
+    /// [`Settings::respect_gitignore`] is on, the dirs that are new in the diff (which
+    /// [`Koil::open`] can open), and `..` for a part that is `.` or `..`
+    /// A name can be written as it is, even one like `a[1]`, as a location that is a dir as
+    /// written is never read as a pattern
+    /// The `~` alone completes to `~/`. Nothing completes if the part's dir is not a dir, or is
+    /// a pattern, or the part starts in quotes (or after an escaped `/`)
+    pub fn complete(&self, location: &str, settings: &Settings) -> Completion {
+        let mut read = read_quoted(location, 0);
+        let home = expand_tilde(location, &mut read);
+        // the home dir is read in place of the `~`, so it has no `/` of its own
+        let tilde = home.as_ref().map(|(at, _)| *at);
+        let slash = read.iter().rposition(|r| r.c == '/' && Some(r.at) != tilde);
+        if let (None, Some((_, home))) = (slash, &home) {
+            let home = Path::new(home);
+            return Completion {
+                dir: home.parent().unwrap_or(home).to_path_buf(),
+                start: 0,
+                part: "~".to_string(),
+                names: vec!["~/".to_string()],
+            };
+        }
+        let (dir, start) = match slash {
+            None => (self.current_dir.clone(), 0),
+            Some(i) if read[i].quoted => return Completion::default(),
+            Some(i) => {
+                let start = read[i].at + 1;
+                match self.read_location(&location[..start], settings.regex) {
+                    Location {
+                        dir, pattern: None, ..
+                    } if self.is_dir(&dir) => (dir, start),
+                    _ => return Completion::default(),
+                }
+            }
+        };
+        let part = read_text(&read[slash.map_or(0, |i| i + 1)..]);
+
+        let show_hidden = settings.show_hidden || part.starts_with('.');
+        let mut dirs = self.dirs_in(&dir, show_hidden, settings.respect_gitignore);
+        if !part.is_empty() && "..".starts_with(&part) {
+            dirs.insert("..".to_string());
+        }
+        let starting = |ignore_case: bool| -> Vec<String> {
+            let lower = part.to_lowercase();
+            let starts = |name: &&String| match ignore_case {
+                true => name.to_lowercase().starts_with(&lower),
+                false => name.starts_with(&part),
+            };
+            dirs.iter()
+                .filter(starts)
+                .map(|n| format!("{n}/"))
+                .collect()
+        };
+        let mut names = starting(false);
+        if names.is_empty() {
+            names = starting(true);
+        }
+        Completion {
+            dir,
+            start,
+            part,
+            names,
+        }
+    }
+
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
     /// Names of entries are relative to it
     pub fn current_dir(&self) -> &Path {
@@ -1292,18 +1377,9 @@ impl Koil {
             }
             Some(_) => None,
         };
-        let gitignore = self.settings.respect_gitignore;
-        let walk = WalkBuilder::new(&self.current_dir)
+        let (hidden, gitignore) = (self.settings.show_hidden, self.settings.respect_gitignore);
+        let walk = walker(&self.current_dir, hidden, gitignore)
             .max_depth(max_depth)
-            .hidden(!self.settings.show_hidden)
-            // only what git ignores, not the `.ignore` files of ripgrep
-            .ignore(false)
-            .git_ignore(gitignore)
-            .git_global(gitignore)
-            .git_exclude(gitignore)
-            .parents(gitignore)
-            // git never shows its own dir
-            .filter_entry(move |item| !(gitignore && item.file_name() == ".git"))
             .build_parallel();
 
         let prune = Prune::new(view);
@@ -1351,6 +1427,39 @@ impl Koil {
         // the walk runs on many threads, in no order, and new IDs are given in this one
         paths.sort();
         Ok(paths)
+    }
+
+    /// The names of the dirs in `dir` (see [`Koil::complete`]): on disk (also links to dirs),
+    /// without hidden ones unless `show_hidden`, and without ignored ones if `gitignore`, and
+    /// the ones that are new in the diff
+    fn dirs_in(&self, dir: &Path, show_hidden: bool, gitignore: bool) -> BTreeSet<String> {
+        let walk = walker(dir, show_hidden, gitignore)
+            .max_depth(Some(1))
+            .build();
+        let on_disk = walk.flatten().filter(|item| item.depth() == 1);
+        let on_disk = on_disk.filter(|item| item.path().is_dir());
+        let mut names: BTreeSet<String> = on_disk
+            .filter_map(|item| item.file_name().to_str().map(String::from))
+            .collect();
+        let afters = self.diff.with_id.values().flat_map(|(_, afters)| afters);
+        for path in self.diff.without_id.keys().chain(afters) {
+            let first = path
+                .strip_prefix(dir)
+                .ok()
+                .and_then(|p| p.components().next());
+            let Some(Component::Normal(name)) = first else {
+                continue;
+            };
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let path = dir.join(name);
+            let new = path.symlink_metadata().is_err() && self.diff.creates_dir(&path);
+            if new && (show_hidden || !name.starts_with('.')) {
+                names.insert(name.to_string());
+            }
+        }
+        names
     }
 
     /// Which paths the listing shows
@@ -1878,6 +1987,22 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+/// A walk of `dir`, without hidden entries unless `show_hidden`, and without what git ignores
+/// (and the `.git` dir) if `gitignore`, see [`Koil::walk`]
+fn walker(dir: &Path, show_hidden: bool, gitignore: bool) -> WalkBuilder {
+    let mut walk = WalkBuilder::new(dir);
+    walk.hidden(!show_hidden)
+        // only what git ignores, not the `.ignore` files of ripgrep
+        .ignore(false)
+        .git_ignore(gitignore)
+        .git_global(gitignore)
+        .git_exclude(gitignore)
+        .parents(gitignore)
+        // git never shows its own dir
+        .filter_entry(move |item| !(gitignore && item.file_name() == ".git"));
+    walk
 }
 
 #[cfg(test)]
