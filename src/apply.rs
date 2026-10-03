@@ -128,6 +128,9 @@ fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     fs::copy(src, dst).map(|_| ())
 }
 
+/// Whether `a` and `b` are the same file, a link compared as itself, not what it points to
+/// Not `same_file::is_same_file`, which follows links, and on Unix opens both files to read
+/// them, which waits forever on a named pipe, and fails without read access
 #[cfg(unix)]
 pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
@@ -141,16 +144,18 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     // FILE_FLAG_BACKUP_SEMANTICS, which opening a dir needs, and FILE_FLAG_OPEN_REPARSE_POINT,
     // which opens a link itself, not what it points to (like `symlink_metadata`)
     const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
-    let id = |path: &Path| -> io::Result<(u64, u64)> {
+    // opened here, as `same_file::is_same_file` follows links (and so would let `link` be
+    // renamed onto the file it points to)
+    let handle = |path: &Path| {
         // reading its information needs no access to the file
         let file = fs::OpenOptions::new()
             .access_mode(0)
             .custom_flags(FLAGS)
             .open(path)?;
-        let info = winapi_util::file::information(&file)?;
-        Ok((info.volume_serial_number(), info.file_index()))
+        // compares the volume serial and file index
+        same_file::Handle::from_file(file)
     };
-    Ok(id(a)? == id(b)?)
+    Ok(handle(a)? == handle(b)?)
 }
 
 #[cfg(not(any(unix, windows)))]

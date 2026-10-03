@@ -51,7 +51,7 @@ objc2-foundation = { version = "0.3.2", features = [
 
 # tells if two paths are the same file, as a name that only differs in case can be
 [target.'cfg(windows)'.dependencies]
-winapi-util = "0.1"
+same-file = "1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

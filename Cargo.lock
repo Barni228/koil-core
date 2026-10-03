@@ -312,13 +312,13 @@ dependencies = [
  "pathfinding",
  "regex",
  "regex-automata",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "trash",
  "typed-builder",
- "winapi-util",
 ]
 
 [[package]]
