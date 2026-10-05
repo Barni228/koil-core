@@ -371,3 +371,89 @@ fn test_apply_only_new_dir() {
         .concat(),
     );
 }
+
+#[test]
+fn test_create_now() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+    let dir = koil.current_dir().to_path_buf();
+    let a = id(&koil, "a");
+
+    // `new/file` is created with its new dir, and the other changes stay
+    let entries = [
+        with_id(a, "renamed"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+        without_id("new/file"),
+        without_id("other"),
+    ];
+    koil.update(&entries).unwrap();
+    let new = dir.join("new/file");
+    let created = vec![
+        Action::CreateDir(dir.join("new")),
+        Action::CreateFile(new.clone()),
+    ];
+    assert_eq!(created, koil.create_steps(&new).unwrap());
+    assert_eq!(2, koil.create_now(&new).unwrap().changes);
+    let expected: BTreeMap<PathBuf, Option<String>> = [
+        [("a", Some("a")), ("b", Some("b"))].as_slice(),
+        &DIR,
+        &[("new", None), ("new/file", Some(""))],
+    ]
+    .concat()
+    .iter()
+    .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
+    .collect();
+    assert_eq!(expected, snapshot(temp.path()));
+    let mut pending = koil.compute_actions();
+    pending.sort();
+    let mut expected = vec![
+        Action::Rename(dir.join("a"), dir.join("renamed")),
+        Action::CreateFile(dir.join("other")),
+    ];
+    expected.sort();
+    assert_eq!(expected, pending);
+    // the new dir is on disk now, with an ID
+    assert!(koil.listing().contains(&keep(&koil, "new/")));
+
+    // undone like an apply, once nothing else is pending
+    assert!(matches!(koil.undo(), Err(KoilError::PendingChanges)));
+    let entries = [
+        keep(&koil, "a"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+        keep(&koil, "new/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+#[test]
+fn test_create_now_needs_other_changes() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+    let dir = koil.current_dir().to_path_buf();
+
+    // a new `a` where `a` is moved away from, and a new file in a renamed dir
+    let entries = [
+        with_id(id(&koil, "a"), "a2"),
+        without_id("a"),
+        keep(&koil, "b"),
+        with_id(id(&koil, "dir"), "dir2/"),
+        without_id("dir2/new"),
+    ];
+    koil.update(&entries).unwrap();
+    let actions = koil.compute_actions();
+    for name in ["a", "dir2/new"] {
+        let result = koil.create_now(&dir.join(name));
+        assert!(matches!(result, Err(KoilError::NeedsChanges(_))));
+    }
+    let result = koil.create_now(&dir.join("b"));
+    assert!(matches!(result, Err(KoilError::NotNew(_))));
+    // nothing changed
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(actions, koil.compute_actions());
+}

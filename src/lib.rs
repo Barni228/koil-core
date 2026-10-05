@@ -588,6 +588,15 @@ pub enum KoilError {
 
     #[error("Nothing to undo")]
     NothingToUndo,
+
+    /// [`Koil::create_now`] was given a path that the changes do not create
+    #[error("`{}` is not new", shown(.0))]
+    NotNew(PathBuf),
+
+    /// [`Koil::create_now`] can not create the path without applying other changes, like the
+    /// one that moves away what is at the path now
+    #[error("`{}` can not be created before the other changes are applied", shown(.0))]
+    NeedsChanges(PathBuf),
 }
 
 /// Why [`Koil::open`] failed, nothing was changed
@@ -1224,6 +1233,60 @@ impl Koil {
         }))
     }
 
+    /// What [`Koil::create_now`] would run to create the new file or dir at `path`: its
+    /// create, after those of the new dirs it is in, in order
+    /// Fails with [`KoilError::NotNew`] if the changes do not create `path`, and with
+    /// [`KoilError::NeedsChanges`] if it needs changes that are not creates (see
+    /// [`Change::needs`]), like the rename that moves away what is at `path` now
+    pub fn create_steps(&self, path: &Path) -> Result<Vec<Action>, KoilError> {
+        let changes = self.changes();
+        let creates = |action: &Action| matches!(action, Action::CreateFile(p) | Action::CreateDir(p) if p == path);
+        let first = (changes.iter())
+            .position(|c| creates(&c.action))
+            .ok_or_else(|| KoilError::NotNew(path.to_path_buf()))?;
+        let mut needed = vec![false; changes.len()];
+        needed[first] = true;
+        let mut todo = vec![first];
+        while let Some(i) = todo.pop() {
+            for &j in &changes[i].needs {
+                if !matches!(changes[j].action, Action::CreateDir(_)) {
+                    return Err(KoilError::NeedsChanges(path.to_path_buf()));
+                }
+                if !needed[j] {
+                    needed[j] = true;
+                    todo.push(j);
+                }
+            }
+        }
+        Ok((changes.into_iter().zip(needed))
+            .filter_map(|(change, needed)| needed.then_some(change.action))
+            .collect())
+    }
+
+    /// Create the new file or dir at `path` on disk now, with the new dirs it is in (see
+    /// [`Koil::create_steps`]), rather than when the changes are applied, so a frontend can
+    /// open a new file to write in it
+    /// Unlike [`Koil::apply_only`], every other change stays pending. The open dir is read
+    /// again, so its listing shows what was created as on disk (with an ID), and it can be
+    /// reverted with [`Koil::undo`], like an apply
+    pub fn create_now(&mut self, path: &Path) -> Result<Report, KoilError> {
+        let actions = self.create_steps(path)?;
+        let result = self.run(&actions);
+        // what was created is not new anymore, even if a later create failed (a missing
+        // parent is not in the diff, it is only missing)
+        for action in &actions {
+            if action.path().symlink_metadata().is_ok() {
+                self.diff.without_id.remove(action.path());
+            }
+        }
+        let reopened = self.reopen();
+        result?;
+        Ok(Report {
+            changes: actions.len(),
+            warning: reopened?,
+        })
+    }
+
     /// The steps that [`Koil::undo`] would run to revert the last apply, in order
     /// `None` if there is nothing to undo
     /// Fails if there are changes that are not applied, since undo would make them wrong
@@ -1312,6 +1375,19 @@ impl Koil {
 impl Koil {
     /// Run `actions` in order, then refresh, see [`Koil::apply`]
     fn run_actions(&mut self, actions: &[Action]) -> Result<Report, KoilError> {
+        let result = self.run(actions);
+        // even if some action failed, others changed the filesystem
+        let refreshed = self.refresh();
+        result?;
+        Ok(Report {
+            changes: actions.len(),
+            warning: refreshed?,
+        })
+    }
+
+    /// Run `actions` in order, and remember the steps that revert them for [`Koil::undo`]
+    /// If one fails, the rest are not run, and the ones that ran can still be undone
+    fn run(&mut self, actions: &[Action]) -> Result<(), KoilError> {
         let mut steps = Vec::new();
         let mut result = Ok(());
         for (i, action) in actions.iter().enumerate() {
@@ -1331,13 +1407,7 @@ impl Koil {
         // undo runs the steps backwards
         steps.reverse();
         self.push_undo(steps);
-        // even if some action failed, others changed the filesystem
-        let refreshed = self.refresh();
-        result?;
-        Ok(Report {
-            changes: actions.len(),
-            warning: refreshed?,
-        })
+        result
     }
 
     /// Remember `steps` that revert an apply, so [`Koil::undo`] can run them later
