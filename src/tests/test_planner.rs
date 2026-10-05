@@ -980,3 +980,84 @@ fn test_temp_skips_paths_used_by_plan() {
         plan_actions(&[rename("A", "B"), rename("B", "A"), add(".A.koil0")])
     );
 }
+
+#[test]
+fn test_order_keeps_cycles() {
+    assert_eq!(
+        vec![
+            vec![rename("A", "B"), rename("B", "A")],
+            vec![delete("E")],
+            vec![rename("C", "D")]
+        ],
+        planner::order(&[
+            delete("E"),
+            rename("C", "D"),
+            rename("B", "A"),
+            rename("A", "B")
+        ])
+    );
+}
+
+#[test]
+fn test_needs_swap() {
+    // each frees the path the other one takes
+    let needs = planner::needs(&[rename("A", "B"), rename("B", "A")]);
+    assert_eq!(needs, [vec![1], vec![0]]);
+}
+
+#[test]
+fn test_needs_chain() {
+    // only directly, `A -> B` needs `C -> D` through `B -> C`
+    let needs = planner::needs(&[rename("A", "B"), rename("B", "C"), rename("C", "D")]);
+    assert_eq!(needs, [vec![1], vec![2], vec![]]);
+}
+
+#[test]
+fn test_needs_delete() {
+    let needs = planner::needs(&[delete("B"), rename("A", "B"), copy("C", "D")]);
+    assert_eq!(needs, [vec![], vec![0], vec![]]);
+}
+
+#[test]
+fn test_needs_new_dirs() {
+    let needs = planner::needs(&[
+        add_dir("new"),
+        add_dir("new/nested"),
+        add("new/nested/file"),
+        rename("A", "new/A"),
+        copy("dir", "dir2"),
+        add("dir2/file"),
+        add("other/file"),
+    ]);
+    assert_eq!(
+        needs,
+        [
+            vec![],
+            vec![0],
+            vec![0, 1],
+            vec![0],
+            vec![],
+            vec![4],
+            vec![]
+        ]
+    );
+}
+
+#[test]
+fn test_needs_independent() {
+    // a copy and a rename of one path, and a move out of a deleted dir, run in either order
+    let needs = planner::needs(&[
+        copy("A", "B"),
+        rename("A", "C"),
+        delete("dir"),
+        rename("dir/x", "x"),
+    ]);
+    assert!(needs.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn test_needs_dir_taken_again() {
+    // `P/new` goes into the old `P`, before it is renamed, so it does not need `R -> P`
+    let needs = planner::needs(&[rename("P", "Q"), rename("R", "P"), add("P/new")]);
+    assert_eq!(needs, [vec![], vec![0], vec![]]);
+}

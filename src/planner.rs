@@ -13,33 +13,7 @@ use std::{
 pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<Action> {
     let mut result = Vec::new();
 
-    // detect all rename cycles (like rename A to B and B to A)
-    // every action that is not in a cycle is its own group of 1
-    let mut groups = scc(actions, |a| successors(actions, a));
-    // when nothing else decides the order, cycles go first
-    groups.sort_by_key(|group| group.len() == 1);
-    let group_of: HashMap<&Action, usize> = groups
-        .iter()
-        .enumerate()
-        .flat_map(|(i, group)| group.iter().map(move |a| (a, i)))
-        .collect();
-
-    // sort the groups topologically, so a cycle runs at the right time relative to everything else
-    let indexes: Vec<usize> = (0..groups.len()).collect();
-    let order = topo_sort(&indexes, |&i| {
-        let mut next: Vec<usize> = groups[i]
-            .iter()
-            .flat_map(|a| successors(actions, a))
-            .map(|a| group_of[&a])
-            .filter(|&j| j != i)
-            .collect();
-        next.sort_unstable();
-        next.dedup();
-        next
-    })
-    .unwrap();
-
-    for cycle in order.into_iter().map(|i| groups[i].clone()) {
+    for cycle in order(actions) {
         if cycle.len() == 1 {
             result.extend(cycle);
             continue;
@@ -70,6 +44,73 @@ pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<A
     }
 
     result
+}
+
+/// `actions` in the order they can run, in groups: an action alone, or a rename cycle (like
+/// rename A to B and B to A), which can only run through a temp path (see [`plan_actions`])
+pub fn order(actions: &[Action]) -> Vec<Vec<Action>> {
+    // detect all rename cycles (like rename A to B and B to A)
+    // every action that is not in a cycle is its own group of 1
+    let mut groups = scc(actions, |a| successors(actions, a));
+    // when nothing else decides the order, cycles go first
+    groups.sort_by_key(|group| group.len() == 1);
+    let group_of: HashMap<&Action, usize> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(i, group)| group.iter().map(move |a| (a, i)))
+        .collect();
+
+    // sort the groups topologically, so a cycle runs at the right time relative to everything else
+    let indexes: Vec<usize> = (0..groups.len()).collect();
+    let order = topo_sort(&indexes, |&i| {
+        let mut next: Vec<usize> = groups[i]
+            .iter()
+            .flat_map(|a| successors(actions, a))
+            .map(|a| group_of[&a])
+            .filter(|&j| j != i)
+            .collect();
+        next.sort_unstable();
+        next.dedup();
+        next
+    })
+    .unwrap();
+
+    order
+        .into_iter()
+        .map(|i| std::mem::take(&mut groups[i]))
+        .collect()
+}
+
+/// For each of `actions`, the indexes of the others it can not run without: the one that
+/// removes the path it creates (which is taken until then), and the ones that create a new dir
+/// it creates something in, as [`plan_actions`] runs them first
+/// Only what each needs directly, so in a chain of renames, the first needs only the second
+pub fn needs(actions: &[Action]) -> Vec<Vec<usize>> {
+    // at most one action removes or creates a path, as an ID has one path, and update rejects
+    // two entries with one name
+    let removed: HashMap<&Path, usize> = (actions.iter().enumerate())
+        .filter_map(|(i, a)| Some((a.removes()?, i)))
+        .collect();
+    // if a created path is also removed, paths inside it refer to the old one
+    let created: HashMap<&Path, usize> = (actions.iter().enumerate())
+        .filter_map(|(i, a)| Some((a.creates()?, i)))
+        .filter(|(path, _)| !removed.contains_key(path))
+        .collect();
+    (actions.iter().enumerate())
+        .map(|(i, action)| {
+            let Some(path) = action.creates() else {
+                return Vec::new();
+            };
+            let in_dirs = path.ancestors().skip(1).filter_map(|dir| created.get(dir));
+            let mut needs: Vec<usize> = (removed.get(path).into_iter().chain(in_dirs))
+                .copied()
+                .filter(|&j| j != i)
+                .collect();
+            needs.sort_unstable();
+            needs.dedup();
+            needs
+        })
+        .collect()
 }
 
 /// A free path next to `from`, to temporarily move it out of the way

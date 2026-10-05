@@ -538,6 +538,17 @@ pub struct Updated {
     pub moved: bool,
 }
 
+/// A change that applying would make, see [`Koil::changes`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub action: Action,
+    /// The indexes of the changes (in the list this one is in) that it can not be applied
+    /// without, only directly: the one that moves or deletes what is at the path it creates,
+    /// and the ones that create the new dir it creates something in
+    /// The renames of a cycle (like swapping two names) need each other
+    pub needs: Vec<usize>,
+}
+
 /// What [`Koil::apply`] or [`Koil::undo`] did
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -1155,38 +1166,62 @@ impl Koil {
         self.diff.clone().compute_actions()
     }
 
+    /// What applying would change, one [`Change`] per action, in the order they run
+    /// Unlike [`Koil::compute_actions`], a rename cycle (like swapping two names) is its
+    /// renames, not the steps through a temp path that run it
+    /// A frontend can show them to confirm, and apply only the ones user picks with
+    /// [`Koil::apply_only`], picking what each needs along with it
+    pub fn changes(&self) -> Vec<Change> {
+        let actions: Vec<Action> = planner::order(&self.diff.clone().actions())
+            .into_iter()
+            .flatten()
+            .collect();
+        let needs = planner::needs(&actions);
+        (actions.into_iter().zip(needs))
+            .map(|(action, needs)| Change { action, needs })
+            .collect()
+    }
+
     /// Run every change made so far on the filesystem, deleted paths are moved to the trash
     /// Then the listing is refreshed, and the changes can be reverted with [`Koil::undo`]
     /// If an action fails, the rest are not run, and every change that was not applied is
     /// forgotten, the ones that were applied can still be undone
     pub fn apply(&mut self) -> Result<Report, KoilError> {
         let actions = self.compute_actions();
-        let mut steps = Vec::new();
-        let mut result = Ok(());
-        for (i, action) in actions.iter().enumerate() {
-            match action.run() {
-                Ok(step) => steps.extend(step),
-                Err(source) => {
-                    result = Err(KoilError::ApplyFailed {
-                        action: action.clone(),
-                        done: i,
-                        total: actions.len(),
-                        source,
-                    });
-                    break;
+        self.run_actions(&actions)
+    }
+
+    /// [`Koil::apply`], but only the changes in `picked` (actions of [`Koil::changes`]), and
+    /// every other change is forgotten, as the refresh shows what is on disk
+    /// A change that needs one that is not picked is not applied either (see
+    /// [`Change::needs`]): it would fail (a rename onto a path that is still taken), or do
+    /// what was not picked (create the new dir it goes into)
+    pub fn apply_only(&mut self, picked: &[Action]) -> Result<Report, KoilError> {
+        let picked: HashSet<&Action> = picked.iter().collect();
+        let changes = self.changes();
+        let mut applied: Vec<bool> = changes.iter().map(|c| picked.contains(&c.action)).collect();
+        let mut needed_by = vec![Vec::new(); changes.len()];
+        for (i, change) in changes.iter().enumerate() {
+            for &j in &change.needs {
+                needed_by[j].push(i);
+            }
+        }
+        let mut left_out: Vec<usize> = (0..changes.len()).filter(|&i| !applied[i]).collect();
+        while let Some(j) = left_out.pop() {
+            for &i in &needed_by[j] {
+                if applied[i] {
+                    applied[i] = false;
+                    left_out.push(i);
                 }
             }
         }
-        // undo runs the steps backwards
-        steps.reverse();
-        self.push_undo(steps);
-        // even if some action failed, others changed the filesystem
-        let refreshed = self.refresh();
-        result?;
-        Ok(Report {
-            changes: actions.len(),
-            warning: refreshed?,
-        })
+        let actions: Vec<Action> = (changes.into_iter().zip(applied))
+            .filter_map(|(change, applied)| applied.then_some(change.action))
+            .collect();
+        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
+        self.run_actions(&planner::plan_actions(&actions, |p| {
+            p.symlink_metadata().is_ok()
+        }))
     }
 
     /// The steps that [`Koil::undo`] would run to revert the last apply, in order
@@ -1275,6 +1310,36 @@ impl Koil {
 
 // Private functions
 impl Koil {
+    /// Run `actions` in order, then refresh, see [`Koil::apply`]
+    fn run_actions(&mut self, actions: &[Action]) -> Result<Report, KoilError> {
+        let mut steps = Vec::new();
+        let mut result = Ok(());
+        for (i, action) in actions.iter().enumerate() {
+            match action.run() {
+                Ok(step) => steps.extend(step),
+                Err(source) => {
+                    result = Err(KoilError::ApplyFailed {
+                        action: action.clone(),
+                        done: i,
+                        total: actions.len(),
+                        source,
+                    });
+                    break;
+                }
+            }
+        }
+        // undo runs the steps backwards
+        steps.reverse();
+        self.push_undo(steps);
+        // even if some action failed, others changed the filesystem
+        let refreshed = self.refresh();
+        result?;
+        Ok(Report {
+            changes: actions.len(),
+            warning: refreshed?,
+        })
+    }
+
     /// Remember `steps` that revert an apply, so [`Koil::undo`] can run them later
     /// `steps` must be in the order they should run, nothing is remembered if it is empty
     fn push_undo(&mut self, mut steps: Vec<Undo>) {

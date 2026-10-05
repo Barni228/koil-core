@@ -61,8 +61,15 @@ impl Diff {
         missing
     }
 
-    /// Compute actions required to resolve this diff
+    /// Compute actions required to resolve this diff, in the order they can run
     pub fn compute_actions(self) -> Vec<Action> {
+        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
+        planner::plan_actions(&self.actions(), |p| p.symlink_metadata().is_ok())
+    }
+
+    /// The actions required to resolve this diff, in no particular order, and with rename
+    /// cycles not broken yet (see [`planner::plan_actions`])
+    pub fn actions(self) -> Vec<Action> {
         let mut actions: Vec<Action> = self
             .missing_parents()
             .into_iter()
@@ -107,8 +114,6 @@ impl Diff {
             }
         }
 
-        // sort the actions in correct order
-        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
-        planner::plan_actions(&actions, |p| p.symlink_metadata().is_ok())
+        actions
     }
 }

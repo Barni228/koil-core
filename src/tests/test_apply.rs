@@ -282,3 +282,92 @@ fn test_undo_failed_apply() {
     koil.undo().unwrap();
     assert_eq!(before, snapshot(temp.path()));
 }
+
+/// Apply only the changes of `listing` (on a fresh [`test_temp_dir`]) that `pick` picks, check
+/// it gives `after`, and that the rest are forgotten, then undo it
+fn check_apply_only(
+    listing: impl Fn(&Koil) -> Vec<Entry>,
+    pick: impl Fn(&Action) -> bool,
+    after: &[(&str, Option<&str>)],
+) {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    koil.update(&listing(&koil)).unwrap();
+    let picked: Vec<Action> = (koil.changes().into_iter())
+        .map(|c| c.action)
+        .filter(|a| pick(a))
+        .collect();
+    koil.apply_only(&picked).unwrap();
+    let expected: BTreeMap<PathBuf, Option<String>> = after
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
+        .collect();
+    assert_eq!(expected, snapshot(temp.path()));
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+/// Everything in [`test_temp_dir`] that is in `dir`
+const DIR: [(&str, Option<&str>); 4] = [
+    ("dir", None),
+    ("dir/sub", None),
+    ("dir/sub/y", Some("y")),
+    ("dir/x", Some("x")),
+];
+
+#[test]
+fn test_apply_only_some() {
+    // the rename, but not the delete
+    check_apply_only(
+        |k| vec![with_id(id(k, "a"), "renamed"), keep(k, "dir/")],
+        |a| matches!(a, Action::Rename(..)),
+        &[[("b", Some("b")), ("renamed", Some("a"))].as_slice(), &DIR].concat(),
+    );
+}
+
+#[test]
+fn test_apply_only_with_what_it_needs() {
+    // `a` goes to `a2` and is copied to `b`, and `b` to `a`; without `b -> a`, `b` is still
+    // taken, so the copy onto it is left out too
+    check_apply_only(
+        |k| {
+            vec![
+                with_id(id(k, "a"), "b"),
+                with_id(id(k, "b"), "a"),
+                with_id(id(k, "a"), "a2"),
+                keep(k, "dir/"),
+            ]
+        },
+        |a| !matches!(a, Action::Rename(s, _) if s.ends_with("b")),
+        &[[("a2", Some("a")), ("b", Some("b"))].as_slice(), &DIR].concat(),
+    );
+}
+
+#[test]
+fn test_apply_only_new_dir() {
+    // the new dir, but not what goes in it
+    check_apply_only(
+        |k| {
+            vec![
+                keep(k, "a"),
+                keep(k, "b"),
+                keep(k, "dir/"),
+                without_id("new/nested/file"),
+                without_id("new/file"),
+            ]
+        },
+        |a| {
+            matches!(a, Action::CreateDir(p) if p.ends_with("new"))
+                || matches!(a, Action::CreateFile(p) if p.ends_with("nested/file"))
+        },
+        &[
+            [("a", Some("a")), ("b", Some("b")), ("new", None)].as_slice(),
+            &DIR,
+        ]
+        .concat(),
+    );
+}

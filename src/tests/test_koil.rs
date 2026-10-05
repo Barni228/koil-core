@@ -2174,3 +2174,38 @@ fn test_complete_home() {
     // not `~x`, which is a name in the open dir
     assert_eq!(completion(0, &[]), complete("~x"));
 }
+
+#[test]
+fn test_changes() {
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(test_id(&koil, "file"), "file2"),
+        with_id(test_id(&koil, "file2"), "file"),
+        without_id("new/nested/file"),
+    ];
+    koil.update(&entries).unwrap();
+    let changes: Vec<(Action, Vec<usize>)> = koil
+        .changes()
+        .into_iter()
+        .map(|c| (c.action, c.needs))
+        .collect();
+    // the swap is its two renames, without a temp path, and the new dirs go before what is in them
+    assert_eq!(
+        changes,
+        [
+            (
+                Action::Rename(test_path("file"), test_path("file2")),
+                vec![1]
+            ),
+            (
+                Action::Rename(test_path("file2"), test_path("file")),
+                vec![0]
+            ),
+            (Action::DeleteFile(test_path("qwerty")), vec![]),
+            (Action::CreateDir(test_path("new")), vec![]),
+            (Action::CreateDir(test_path("new/nested")), vec![3]),
+            (Action::CreateFile(test_path("new/nested/file")), vec![3, 4]),
+        ]
+    );
+}
