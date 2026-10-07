@@ -7,11 +7,50 @@ use tempfile::TempDir;
 fn setup() -> (TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = dunce::canonicalize(tmp.path()).unwrap();
-    fs::write(root.join("a"), "a").unwrap();
-    fs::write(root.join("b"), "b").unwrap();
-    fs::create_dir(root.join("d")).unwrap();
-    fs::write(root.join("d/inside"), "inside").unwrap();
+    write(&root.join("a"), "a");
+    write(&root.join("b"), "b");
+    mkdir(&root.join("d"));
+    write(&root.join("d/inside"), "inside");
     (tmp, root)
+}
+
+/// Writes the file `path`, which gets a key of its own (see `own_key`)
+fn write(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    own_key(path);
+}
+
+/// Makes the dir `path`, which gets a key of its own (see `own_key`)
+fn mkdir(path: &Path) {
+    fs::create_dir(path).unwrap();
+    own_key(path);
+}
+
+/// Gives what was just made at `path` a creation time of its own on Windows, where that is its
+/// key (see `FileKey`): files made in the same tick of the clock get the same one, and then
+/// koil can not tell them apart, which a test that follows a move does not expect
+fn own_key(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, SystemTime};
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        // a millisecond apart, in 2020, so nothing else made by then has it
+        let made = MADE.fetch_add(1, Ordering::Relaxed);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let times = fs::FileTimes::new().set_created(created + Duration::from_millis(made));
+        // FILE_WRITE_ATTRIBUTES, which setting its times needs, and FILE_FLAG_BACKUP_SEMANTICS,
+        // which opening a dir needs
+        let file = fs::OpenOptions::new()
+            .access_mode(0x0100)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .unwrap();
+        file.set_times(times).unwrap();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 /// Koil with `dir` open
@@ -61,8 +100,8 @@ fn test_sync_nothing_changed() {
 fn test_sync_added() {
     let (_tmp, root) = setup();
     let mut koil = open(&root);
-    fs::write(root.join("c"), "").unwrap();
-    fs::create_dir(root.join("e")).unwrap();
+    write(&root.join("c"), "");
+    mkdir(&root.join("e"));
     let synced = koil.sync(&listing(&koil)).unwrap();
     let edits = vec![Edit::Add(keep(&koil, "c")), Edit::Add(keep(&koil, "e/"))];
     assert_eq!(edits, synced.edits);
@@ -234,6 +273,25 @@ fn test_sync_gone_but_copied() {
     assert_eq!(vec![with_id(a, "a2")], synced.conflicts[0].listed);
 }
 
+// A key that two files share tells neither apart, so it is never taken for a move: on Windows,
+// where it is when the file was created, files made in the same tick of the clock (by a
+// checkout, say) share one; here hard links, which share it everywhere
+#[test]
+fn test_sync_shared_key() {
+    let (_tmp, root) = setup();
+    fs::hard_link(root.join("a"), root.join("a2")).unwrap();
+    let mut koil = open(&root);
+    let a = id(&koil, "a");
+    let entries = koil.listing();
+    // one that koil does not know, near where `a` was
+    fs::hard_link(root.join("a"), root.join("d/x")).unwrap();
+    fs::remove_file(root.join("a")).unwrap();
+    let synced = koil.sync(&entries).unwrap();
+    // gone, not moved to `d/x`
+    assert_eq!(vec![Edit::Remove(with_id(a, "a"))], synced.edits);
+    assert_eq!(Some(root.join("a").as_path()), koil.path_of(a));
+}
+
 #[test]
 fn test_sync_created_what_user_wrote() {
     let (_tmp, root) = setup();
@@ -241,9 +299,9 @@ fn test_sync_created_what_user_wrote() {
     let mut entries = listing(&koil);
     entries.push(without_id("c"));
     entries.push(without_id("e/"));
-    fs::write(root.join("c"), "").unwrap();
+    write(&root.join("c"), "");
     // a file, where user wrote a dir
-    fs::write(root.join("e"), "").unwrap();
+    write(&root.join("e"), "");
     let synced = koil.sync(&entries).unwrap();
     let edits = vec![
         Edit::Change {
@@ -271,7 +329,7 @@ fn test_sync_taken() {
     let mut koil = open(&root);
     let a = id(&koil, "a");
     let entries = listing_with_a(&koil, Some(with_id(a, "c")));
-    fs::write(root.join("c"), "").unwrap();
+    write(&root.join("c"), "");
     let synced = koil.sync(&entries).unwrap();
     let c = id(&koil, "c");
     assert_eq!(vec![Edit::Add(with_id(c, "c"))], synced.edits);
@@ -292,7 +350,7 @@ fn test_sync_kind_changed() {
     let mut koil = open(&root);
     let b = keep(&koil, "b");
     fs::remove_file(root.join("b")).unwrap();
-    fs::create_dir(root.join("b")).unwrap();
+    mkdir(&root.join("b"));
     let synced = koil.sync(&listing(&koil)).unwrap();
     let edits = vec![Edit::Change {
         from: b.clone(),

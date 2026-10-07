@@ -574,6 +574,7 @@ impl Koil {
     /// [`FileKey`]): to a new path in `paths` (the open view, as it is now), or else near the
     /// dir it was in (see [`near`]). One that was `listed` before is not where it was if it is
     /// not in `paths`
+    /// A key that two files share (see [`shared`]) is never followed, as it can be either
     fn find_moved(
         &self,
         tracked: &BTreeSet<usize>,
@@ -589,18 +590,24 @@ impl Koil {
                 !in_view.contains(path) && (listed(index) || path.symlink_metadata().is_err())
             })
             .collect();
+        // what koil saw when it last read, and the new paths in the view
+        let ambiguous = shared(self.seen.values().filter_map(|s| s.key));
+        let key_of = |index: &usize| (self.seen.get(index)?.key).filter(|k| !ambiguous.contains(k));
         let by_key: HashMap<FileKey, usize> = (missing.iter())
-            .filter_map(|&index| Some((self.seen.get(&index)?.key?, index)))
+            .filter_map(|index| Some((key_of(index)?, *index)))
             .collect();
+        let new: Vec<(&PathBuf, Option<FileKey>)> = (paths.iter())
+            .filter(|(path, _)| !known.contains(path.as_path()) && !self.ignore.contains(path))
+            .map(|(path, seen)| (path, seen.and_then(|s| s.key)))
+            .collect();
+        let new_ambiguous = shared(new.iter().filter_map(|&(_, key)| key));
 
         let mut moves = Vec::new();
         let mut found = HashSet::new();
         let mut claimed = HashSet::new();
-        for (path, seen) in paths {
-            if known.contains(path.as_path()) || self.ignore.contains(path) {
-                continue;
-            }
-            let index = seen.and_then(|s| by_key.get(&s.key?));
+        for (path, key) in new {
+            let key = key.filter(|key| !new_ambiguous.contains(key));
+            let index = key.and_then(|key| by_key.get(&key));
             if let Some(&index) = index
                 && found.insert(index)
             {
@@ -617,9 +624,7 @@ impl Koil {
             if path.symlink_metadata().is_ok() {
                 continue;
             }
-            let (Some(key), Some(parent)) =
-                (self.seen.get(&index).and_then(|s| s.key), path.parent())
-            else {
+            let (Some(key), Some(parent)) = (key_of(&index), path.parent()) else {
                 continue;
             };
             for dir in nears.entry(parent).or_insert_with(|| near(parent)) {
@@ -781,14 +786,27 @@ fn near(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// The key of each path in `dir` (not inside its dirs) that is not in `known`
+/// The key of each path in `dir` (not inside its dirs) that is not in `known`, but the keys
+/// that several share (see [`shared`])
 fn keys_in(dir: &Path, known: &HashSet<&Path>) -> HashMap<FileKey, PathBuf> {
     let Ok(items) = fs::read_dir(dir) else {
         return HashMap::new();
     };
-    (items.flatten())
+    let keys: Vec<(FileKey, PathBuf)> = (items.flatten())
         .map(|item| item.path())
         .filter(|path| !known.contains(path.as_path()))
         .filter_map(|path| Some((FileKey::at(&path)?, path)))
+        .collect();
+    let ambiguous = shared(keys.iter().map(|&(key, _)| key));
+    (keys.into_iter())
+        .filter(|(key, _)| !ambiguous.contains(key))
         .collect()
+}
+
+/// The keys that more than one of `keys` has, which tell no file apart: hard links share one,
+/// and on Windows, where a key is when its file was created, so do files made in the same tick
+/// of the clock (by a checkout or an unzip, say)
+fn shared(keys: impl IntoIterator<Item = FileKey>) -> HashSet<FileKey> {
+    let mut once = HashSet::new();
+    keys.into_iter().filter(|&key| !once.insert(key)).collect()
 }
