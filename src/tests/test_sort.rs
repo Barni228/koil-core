@@ -153,6 +153,59 @@ fn test_entries_only_counted_when_sorting_by_size() {
 }
 
 #[test]
+fn test_sort_by_disk_size() {
+    let (_tmp, root) = setup();
+    fs::write(root.join("written"), vec![1; 100_000]).unwrap();
+    let koil = open_sorted(&root, SortBy::Disk, false);
+    // a dir by its entries, as by size
+    assert_eq!(vec!["big/", "small/", "written"], names(&koil)[..3]);
+    let big = koil.metadata(id(&koil, "big")).unwrap();
+    assert_eq!(Some(2), big.entries);
+    let written = koil.metadata(id(&koil, "written")).unwrap();
+    assert!(written.disk_size.unwrap() >= 100_000, "{written:?}");
+    let koil = open_sorted(&root, SortBy::Disk, true);
+    assert_eq!(vec!["small/", "big/"], names(&koil)[..2]);
+    assert_eq!(Some("written"), names(&koil).last().map(String::as_str));
+}
+
+/// A sparse file is bigger than what it takes on disk
+#[cfg(unix)]
+#[test]
+fn test_sort_by_disk_size_not_size() {
+    let (_tmp, root) = setup();
+    fs::write(root.join("written"), vec![1; 100_000]).unwrap();
+    let sparse = fs::File::create(root.join("sparse")).unwrap();
+    sparse.set_len(10_000_000).unwrap();
+    let files = |by| -> Vec<String> {
+        let koil = open_sorted(&root, by, false);
+        names(&koil).into_iter().skip(2).collect()
+    };
+    assert_eq!(files(SortBy::Size)[..2], ["sparse", "written"]);
+    let by_disk = files(SortBy::Disk);
+    assert_eq!(
+        (by_disk.first(), by_disk.last()),
+        (Some(&"written".into()), Some(&"sparse".into()))
+    );
+}
+
+#[test]
+fn test_disk_size_only_read_when_sorting_by_it() {
+    let (_tmp, root) = setup();
+    let koil = open_sorted(&root, SortBy::Size, false);
+    assert_eq!(None, koil.metadata(id(&koil, "A.rs")).unwrap().disk_size);
+}
+
+#[test]
+fn test_disk_size() {
+    let (_tmp, root) = setup();
+    let path = root.join("written");
+    fs::write(&path, vec![1; 100_000]).unwrap();
+    let size = disk_size(&path, &path.symlink_metadata().unwrap()).unwrap();
+    // in whole blocks
+    assert!((100_000..200_000).contains(&size), "{size}");
+}
+
+#[test]
 fn test_sort_by_modified() {
     let (_tmp, root) = setup();
     let files = |reverse| -> Vec<String> {

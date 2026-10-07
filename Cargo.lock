@@ -319,6 +319,7 @@ dependencies = [
  "thiserror",
  "trash",
  "typed-builder",
+ "windows-sys",
 ]
 
 [[package]]

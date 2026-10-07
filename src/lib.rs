@@ -123,6 +123,10 @@ pub enum SortBy {
     Extension,
     /// Biggest first: a file by its size, a dir by how many entries it has
     Size,
+    /// Biggest first by the space it takes on disk (see [`disk_size`]): a file by its own, a dir
+    /// by how many entries it has, as [`SortBy::Size`]
+    /// On Windows it is much slower to read, as every file is opened
+    Disk,
     /// Last modified first
     Modified,
     /// Last created first, on filesystems that keep it
@@ -149,8 +153,9 @@ impl SortBy {
         let key = |meta: Option<&Metadata>| {
             let meta = meta?;
             match self {
-                SortBy::Size if meta.is_dir => meta.entries.map(u128::from),
+                SortBy::Size | SortBy::Disk if meta.is_dir => meta.entries.map(u128::from),
                 SortBy::Size => Some(u128::from(meta.size)),
+                SortBy::Disk => meta.disk_size.map(u128::from),
                 SortBy::Modified => since_epoch(meta.modified),
                 SortBy::Created => since_epoch(meta.created),
                 SortBy::Accessed => since_epoch(meta.accessed),
@@ -220,8 +225,11 @@ pub struct Metadata {
     /// The size in bytes
     pub size: u64,
     /// How many entries a dir has (without hidden ones, unless [`Settings::show_hidden`] is on),
-    /// only counted when sorting by [`SortBy::Size`]
+    /// only counted when sorting by [`SortBy::Size`] or [`SortBy::Disk`]
     pub entries: Option<u64>,
+    /// The space it takes on disk (see [`disk_size`]), only read when sorting by
+    /// [`SortBy::Disk`]
+    pub disk_size: Option<u64>,
     /// `None` where the filesystem does not keep it
     pub modified: Option<SystemTime>,
     pub created: Option<SystemTime>,
@@ -229,14 +237,16 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// What `meta` (of `path`, the link itself for a link) says, and how many entries a dir
-    /// has if `settings` sort by size
+    /// What `meta` (of `path`, the link itself for a link) says, how many entries a dir has
+    /// if `settings` sort by size (or size on disk), and the space it takes on disk if they
+    /// sort by that
     fn new(path: &Path, meta: &fs::Metadata, settings: &Settings) -> Metadata {
         let is_dir = meta.is_dir() || meta.file_type().is_symlink() && path.is_dir();
         let shown = |name: &std::ffi::OsStr| {
             settings.show_hidden || !name.as_encoded_bytes().starts_with(b".")
         };
-        let entries = (is_dir && settings.sort.by == SortBy::Size)
+        let by = settings.sort.by;
+        let entries = (is_dir && matches!(by, SortBy::Size | SortBy::Disk))
             .then(|| fs::read_dir(path).ok())
             .flatten()
             .map(|entries| entries.flatten().filter(|e| shown(&e.file_name())).count() as u64);
@@ -244,6 +254,9 @@ impl Metadata {
             is_dir,
             size: meta.len(),
             entries,
+            disk_size: (by == SortBy::Disk)
+                .then(|| disk_size(path, meta))
+                .flatten(),
             modified: meta.modified().ok(),
             created: meta.created().ok(),
             accessed: meta.accessed().ok(),
@@ -255,6 +268,56 @@ impl Metadata {
         let meta = path.symlink_metadata().ok()?;
         Some(Metadata::new(path, &meta, settings))
     }
+}
+
+/// The space that what is at `path` (whose metadata, of the link itself for a link, is `meta`)
+/// takes on disk: the blocks it has, so less than its size for a sparse or compressed file, and
+/// a whole block for a small one (or nothing, where the filesystem keeps it with its name)
+/// `None` if it can not be read
+/// On Windows the file is opened for it (`meta` from a directory walk does not have it), which
+/// is much slower than reading its size
+#[cfg(unix)]
+pub fn disk_size(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    // in blocks of 512 bytes, whatever the filesystem's own are
+    Some(meta.blocks() * 512)
+}
+
+#[cfg(windows)]
+pub fn disk_size(path: &Path, _meta: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+    // as in `same_file`: a dir can be opened, and a link is opened itself
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // reading it needs no access to the file
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FLAGS)
+        .open(path)
+        .ok()?;
+    // SAFETY: all zeros is a valid `FILE_STANDARD_INFO` (numbers, and `false`)
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open while `file` is, and `info` is as big as the size given
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    match read {
+        0 => None,
+        _ => u64::try_from(info.AllocationSize).ok(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn disk_size(_path: &Path, _meta: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 /// How much opening a pattern can read, so one that matches too much (like `.*` in a home dir)

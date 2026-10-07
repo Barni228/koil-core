@@ -92,8 +92,8 @@ temporary name.
   shown (`Settings`). A hidden entry is still shown while it has pending changes, so a
   change is never lost.
 - **Sorting.** The listing can be sorted by name, by name as people sort it (`a2` before
-  `a10`), by extension, size, or when entries were modified, created or accessed, either
-  way round (`Settings::sort`). Dirs stay first. `metadata` gives what it is sorted by, for
+  `a10`), by extension, size, size on disk (`disk_size`), or when entries were modified,
+  created or accessed, either way round (`Settings::sort`). Dirs stay first. `metadata` gives what it is sorted by, for
   a frontend to show, and `compare` where an entry goes.
 - **Undo.** Deleted paths are moved to the system trash, not removed. `undo` brings them
   back and moves created paths to the trash.

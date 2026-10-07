@@ -52,6 +52,8 @@ objc2-foundation = { version = "0.3.2", features = [
 # tells if two paths are the same file, as a name that only differs in case can be
 [target.'cfg(windows)'.dependencies]
 same-file = "1.0"
+# the space a file takes on disk (`disk_size`)
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
