@@ -1,7 +1,10 @@
 //! Following what changes on disk while koil has a dir open, see [`Koil::sync`]
 
 use crate::apply::Undo;
-use crate::{Entry, Id, Koil, OpenError, Prune, View, Warning, io_error, to_id, with_slashes};
+use crate::{
+    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, to_id,
+    with_slashes,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,16 +51,17 @@ impl FileKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Seen {
     key: Option<FileKey>,
-    /// Like [`Path::is_dir`], so a link to a dir is one, as the listing shows it
-    is_dir: bool,
+    /// What the listing can be sorted by, and whether it is a dir
+    pub(crate) meta: Metadata,
 }
 
 impl Seen {
-    /// What is at `path`, whose metadata (of the link itself, for a link) is `meta`
-    pub(crate) fn new(path: &Path, meta: &fs::Metadata) -> Seen {
+    /// What is at `path`, whose metadata (of the link itself, for a link) is `meta`, read for
+    /// a listing shown with `settings`
+    pub(crate) fn new(path: &Path, meta: &fs::Metadata, settings: &Settings) -> Seen {
         Seen {
             key: FileKey::of(meta),
-            is_dir: meta.is_dir() || meta.file_type().is_symlink() && path.is_dir(),
+            meta: Metadata::new(path, meta, settings),
         }
     }
 }
@@ -536,7 +540,7 @@ impl Koil {
         let is_dir = self
             .seen
             .get(&index)
-            .map_or_else(|| path.is_dir(), |s| s.is_dir);
+            .map_or_else(|| path.is_dir(), |s| s.meta.is_dir);
         let entries = written.get(&index).cloned().unwrap_or_default();
         // the diff's paths in the listing are of when it was last read, and `entries` are
         // what it has now
@@ -671,7 +675,7 @@ impl Koil {
                 *path = new;
             }
         };
-        match index.filter(|i| self.seen.get(i).is_some_and(|s| !s.is_dir)) {
+        match index.filter(|i| self.seen.get(i).is_some_and(|s| !s.meta.is_dir)) {
             Some(index) => self.ids[index] = to.to_path_buf(),
             None => {
                 let taken: HashSet<PathBuf> = (self.ids.iter())

@@ -3,7 +3,6 @@
 - [ ] Allow commands to be entered in the settings box
 - [ ] Allow creating many files with `file{1,2,3}` syntax
 - [ ] Allow creating many files with `file{1..3}` syntax
-- [ ] Allow different sorting
 - [ ] Allow updating listing on save
 - [ ] Add a way to open files from koil
 - [ ] Add file icons
@@ -16,6 +15,7 @@
 
 ## Done
 
+- [x] Allow different sorting (by name, natural, extension, size, modified, created, accessed)
 - [x] Allow rejecting some actions while keeping others (in confirm dialog)
 - [x] Handle cases where file system changes while this is still running (open koil, then create new file)
 - [x] Warn user about creating files with weird names (like `:^&<here>`)

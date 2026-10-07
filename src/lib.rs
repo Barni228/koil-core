@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf, is_separator};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
@@ -90,6 +91,170 @@ pub struct Settings {
     /// [`Koil::open`] reads patterns as regexes, instead of globs
     /// A pattern that is already open stays as it is until something else is opened
     pub regex: bool,
+
+    /// The order of [`Koil::listing`]
+    pub sort: Sort,
+}
+
+/// The order of [`Koil::listing`] (see [`Koil::compare`]): [`Entry::parent`], the dirs with IDs,
+/// the files with IDs, then the new entries, each sorted by [`Sort::by`], and then by name
+/// New entries are not on disk, so a [`SortBy`] that [`reads_metadata`](SortBy::reads_metadata)
+/// sorts them only by name
+/// `reverse` turns the order within each of those groups around, but not the groups
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sort {
+    pub by: SortBy,
+    /// The other way round: from Z to A, smallest first, oldest first
+    pub reverse: bool,
+}
+
+/// What [`Sort`] sorts by, each in the order people usually want first
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortBy {
+    /// By name, from A to Z, as their bytes compare (so `B` before `a`, and `a10` before `a2`)
+    #[default]
+    Name,
+    /// By name, from A to Z, as people sort names: ignoring case, with numbers by their value
+    /// (`a2` before `a10`)
+    Natural,
+    /// By extension (after the last `.`, ignoring case), names without one first
+    Extension,
+    /// Biggest first: a file by its size, a dir by how many entries it has
+    Size,
+    /// Last modified first
+    Modified,
+    /// Last created first, on filesystems that keep it
+    Created,
+    /// Last accessed first, as the filesystem keeps it (many only now and then)
+    Accessed,
+}
+
+impl SortBy {
+    /// Whether it sorts by something [`Koil::metadata`] has to read from disk
+    pub fn reads_metadata(self) -> bool {
+        !matches!(self, SortBy::Name | SortBy::Natural | SortBy::Extension)
+    }
+
+    /// How `a` (with `a_meta`) and `b` (with `b_meta`) compare by this alone, in its own
+    /// direction (biggest or newest first), what is not known last
+    fn compare(
+        self,
+        a: &Entry,
+        a_meta: Option<&Metadata>,
+        b: &Entry,
+        b_meta: Option<&Metadata>,
+    ) -> std::cmp::Ordering {
+        let key = |meta: Option<&Metadata>| {
+            let meta = meta?;
+            match self {
+                SortBy::Size if meta.is_dir => meta.entries.map(u128::from),
+                SortBy::Size => Some(u128::from(meta.size)),
+                SortBy::Modified => since_epoch(meta.modified),
+                SortBy::Created => since_epoch(meta.created),
+                SortBy::Accessed => since_epoch(meta.accessed),
+                SortBy::Name | SortBy::Natural | SortBy::Extension => None,
+            }
+        };
+        let extension = |e: &Entry| {
+            let extension = e.name.extension().unwrap_or_default();
+            extension.to_string_lossy().to_lowercase()
+        };
+        match self {
+            SortBy::Name => a.name.cmp(&b.name),
+            SortBy::Natural => natural_order(&a.name.to_string_lossy(), &b.name.to_string_lossy()),
+            SortBy::Extension => extension(a).cmp(&extension(b)),
+            // the bigger or newer first, and `None` last
+            _ => key(b_meta).cmp(&key(a_meta)),
+        }
+    }
+}
+
+/// `time` as a number that sorts like it, what is before 1970 as 0
+fn since_epoch(time: Option<SystemTime>) -> Option<u128> {
+    let since = time?.duration_since(SystemTime::UNIX_EPOCH);
+    Some(since.map_or(0, |d| d.as_nanos()))
+}
+
+/// `a` against `b` as people sort names: ignoring case, and with numbers by their value, so
+/// `a2` comes before `a10` (and `a02` is the same as `a2`)
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    // the digits of the number `chars` start with, without its leading zeros
+    fn number(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+        let mut digits = String::new();
+        while let Some(d) = chars.next_if(char::is_ascii_digit) {
+            digits.push(d);
+        }
+        digits.trim_start_matches('0').to_string()
+    }
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        let order = match (a.peek(), b.peek()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let (n, m) = (number(&mut a), number(&mut b));
+                // a longer number is bigger
+                n.len().cmp(&m.len()).then_with(|| n.cmp(&m))
+            }
+            (Some(&x), Some(&y)) => {
+                a.next();
+                b.next();
+                x.to_lowercase().cmp(y.to_lowercase())
+            }
+        };
+        if order.is_ne() {
+            return order;
+        }
+    }
+}
+
+/// What is on disk at an entry's path (of a link itself, for a link), which the listing can be
+/// sorted by (see [`Koil::metadata`])
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Metadata {
+    /// Like [`Path::is_dir`], so a link to a dir is one, as the listing shows it
+    pub is_dir: bool,
+    /// The size in bytes
+    pub size: u64,
+    /// How many entries a dir has (without hidden ones, unless [`Settings::show_hidden`] is on),
+    /// only counted when sorting by [`SortBy::Size`]
+    pub entries: Option<u64>,
+    /// `None` where the filesystem does not keep it
+    pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
+}
+
+impl Metadata {
+    /// What `meta` (of `path`, the link itself for a link) says, and how many entries a dir
+    /// has if `settings` sort by size
+    fn new(path: &Path, meta: &fs::Metadata, settings: &Settings) -> Metadata {
+        let is_dir = meta.is_dir() || meta.file_type().is_symlink() && path.is_dir();
+        let shown = |name: &std::ffi::OsStr| {
+            settings.show_hidden || !name.as_encoded_bytes().starts_with(b".")
+        };
+        let entries = (is_dir && settings.sort.by == SortBy::Size)
+            .then(|| fs::read_dir(path).ok())
+            .flatten()
+            .map(|entries| entries.flatten().filter(|e| shown(&e.file_name())).count() as u64);
+        Metadata {
+            is_dir,
+            size: meta.len(),
+            entries,
+            modified: meta.modified().ok(),
+            created: meta.created().ok(),
+            accessed: meta.accessed().ok(),
+        }
+    }
+
+    /// What is at `path` on disk now
+    fn read(path: &Path, settings: &Settings) -> Option<Metadata> {
+        let meta = path.symlink_metadata().ok()?;
+        Some(Metadata::new(path, &meta, settings))
+    }
 }
 
 /// How much opening a pattern can read, so one that matches too much (like `.*` in a home dir)
@@ -1041,7 +1206,8 @@ impl Koil {
     /// The entries of the open dir or glob, with every change made so far, which user should
     /// modify
     /// Starts with [`Entry::parent`] if [`Settings::show_hidden`] is on, then existing entries
-    /// (dirs, then files, each sorted by name), then new entries
+    /// (dirs, then files), then new entries, each sorted as [`Settings::sort`] says (see
+    /// [`Sort`])
     pub fn listing(&self) -> Vec<Entry> {
         let view = self.view();
         let in_view = |index: usize, path: &Path| view.contains(path, self.ids[index].is_dir());
@@ -1080,9 +1246,6 @@ impl Koil {
             );
         }
 
-        // dirs first, then by name
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-
         // dirs that are created because something new is inside them are shown too
         let parents = self.diff.missing_parents().into_iter().map(|p| (p, true));
         let created = self
@@ -1090,17 +1253,26 @@ impl Koil {
             .without_id
             .iter()
             .map(|(p, &is_dir)| (p.clone(), is_dir));
-        let mut new: Vec<Entry> = created
+        let new = created
             .chain(parents)
             .filter(|(p, is_dir)| view.contains(p, *is_dir))
             .map(|(p, is_dir)| Entry {
                 id: None,
                 name: self.name(&p),
                 is_dir,
+            });
+        entries.extend(new);
+
+        // what is on disk is read once per entry, not once per comparison
+        let mut sorted: Vec<(Entry, Option<Metadata>)> = (entries.into_iter())
+            .map(|entry| {
+                let meta = self.sort_metadata(&entry);
+                (entry, meta)
             })
             .collect();
-        new.sort_by(|a, b| a.name.cmp(&b.name));
-        entries.extend(new);
+        sorted
+            .sort_by(|(a, a_meta), (b, b_meta)| self.order(a, a_meta.as_ref(), b, b_meta.as_ref()));
+        let mut entries: Vec<Entry> = sorted.into_iter().map(|(entry, _)| entry).collect();
 
         if self.settings.show_hidden && self.current_dir.parent().is_some() {
             entries.insert(0, Entry::parent());
@@ -1341,6 +1513,25 @@ impl Koil {
         serde_json::from_str(state)
     }
 
+    /// Where [`Koil::listing`] lists `a` against `b` (see [`Sort`]), so a frontend can put an
+    /// entry where the listing would have it, like one that [`Koil::sync`] adds
+    pub fn compare(&self, a: &Entry, b: &Entry) -> std::cmp::Ordering {
+        let (a_meta, b_meta) = (self.sort_metadata(a), self.sort_metadata(b));
+        self.order(a, a_meta.as_ref(), b, b_meta.as_ref())
+    }
+
+    /// What is on disk at the path of `id` (of a link itself, for a link): as koil read it
+    /// when it last read the open dir (see [`Koil::sync`]), if the listing has it, else as it
+    /// is now, `None` if the ID is not known or nothing can be read there
+    /// A frontend can show what the listing is sorted by with it, like a file's size
+    pub fn metadata(&self, id: Id) -> Option<Metadata> {
+        let index = self.index_of(id)?;
+        match self.seen.get(&index) {
+            Some(seen) if self.current_listing.contains(&index) => Some(seen.meta),
+            _ => Metadata::read(&self.ids[index], &self.settings),
+        }
+    }
+
     /// The path that `id` pointed to when koil first saw it, `None` if the ID is not known
     /// It stays the same until the changes are applied, even if the entry was renamed
     pub fn path_of(&self, id: Id) -> Option<&Path> {
@@ -1560,7 +1751,7 @@ impl Koil {
             .build_parallel();
 
         let prune = Prune::new(view);
-        let (pattern, limits) = (self.pattern.as_ref(), self.limits);
+        let (pattern, limits, settings) = (self.pattern.as_ref(), self.limits, &self.settings);
         let paths = Mutex::new(Vec::new());
         let (searched, matched) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let over_limit = Mutex::new(None);
@@ -1580,8 +1771,10 @@ impl Koil {
                 let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
                 let matches = match view.contains(item.path(), is_dir) {
                     true => {
-                        // here, on the walk's threads, as it reads the disk again
-                        let seen = item.metadata().ok().map(|m| Seen::new(item.path(), &m));
+                        // here, on the walk's threads, as it reads the disk again (and a dir's
+                        // entries, when sorting by size)
+                        let seen =
+                            (item.metadata().ok()).map(|m| Seen::new(item.path(), &m, settings));
                         paths.lock().unwrap().push((item.into_path(), seen));
                         matched.fetch_add(1, Ordering::Relaxed) + 1
                     }
@@ -1640,6 +1833,40 @@ impl Koil {
             }
         }
         names
+    }
+
+    /// What [`Koil::listing`] is sorted by on disk for `entry`, `None` if it is new, or the
+    /// listing is sorted by its name
+    fn sort_metadata(&self, entry: &Entry) -> Option<Metadata> {
+        match self.settings.sort.by.reads_metadata() {
+            true => self.metadata(entry.id?),
+            false => None,
+        }
+    }
+
+    /// See [`Koil::compare`], where `a_meta` and `b_meta` are what [`Koil::sort_metadata`]
+    /// gives for `a` and `b`
+    fn order(
+        &self,
+        a: &Entry,
+        a_meta: Option<&Metadata>,
+        b: &Entry,
+        b_meta: Option<&Metadata>,
+    ) -> std::cmp::Ordering {
+        let group = |e: &Entry| match e.id {
+            _ if e.is_parent() => 0,
+            Some(_) if e.is_dir => 1,
+            Some(_) => 2,
+            None => 3,
+        };
+        let Sort { by, reverse } = self.settings.sort;
+        group(a).cmp(&group(b)).then_with(|| {
+            let order = (by.compare(a, a_meta, b, b_meta)).then_with(|| a.name.cmp(&b.name));
+            match reverse {
+                true => order.reverse(),
+                false => order,
+            }
+        })
     }
 
     /// Which paths the listing shows
