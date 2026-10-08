@@ -2011,8 +2011,8 @@ fn test_is_pending() {
 
 // ── completion ───────────────────────────────────────────────────────────────
 
-/// A temp dir with the dirs `.config/`, `Documents/`, `Downloads/`, `a[1]/b/`, `my dir/sub/`,
-/// `src/` and `src-old/`, and the file `script`
+/// A temp dir with the dirs `.config/`, `Documents/`, `Downloads/`, `a[1]/b/`, `dev/`,
+/// `my dir/sub/`, `src/` and `src-old/`, and the file `script`
 fn completion_temp_dir() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let dirs = [
@@ -2020,6 +2020,7 @@ fn completion_temp_dir() -> tempfile::TempDir {
         "Documents",
         "Downloads",
         "a[1]/b",
+        "dev",
         "my dir/sub",
         "src",
         "src-old",
@@ -2054,6 +2055,7 @@ fn test_complete() {
         "Documents/",
         "Downloads/",
         "a[1]/",
+        "dev/",
         "my dir/",
         "src/",
         "src-old/",
@@ -2063,8 +2065,14 @@ fn test_complete() {
     assert_eq!(completion(0, &["src/", "src-old/"]), complete("src"));
     assert_eq!(completion(0, &["src-old/"]), complete("src-"));
     assert_eq!(none, complete("script"));
-    // case is only ignored when nothing matches with it
+    // case is ignored unless the part has an uppercase letter
+    let d = ["Documents/", "Downloads/", "dev/"];
+    assert_eq!(completion(0, &d), complete("d"));
     assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("do"));
+    assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("D"));
+    assert_eq!(completion(0, &["Downloads/"]), complete("Dow"));
+    assert_eq!(none, complete("De"));
+    assert_eq!(none, complete("DO"));
     let c = koil.complete("do", &Settings::default());
     assert_eq!(
         (koil.current_dir(), "do"),
@@ -2123,6 +2131,7 @@ fn test_complete_settings() {
         "Documents/",
         "Downloads/",
         "a[1]/",
+        "dev/",
         "my dir/",
         "src/",
         "src-old/",

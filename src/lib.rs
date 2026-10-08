@@ -477,8 +477,8 @@ pub struct Completion {
     pub start: usize,
     /// The part, as it is read (see [`Koil::read_location`]), without its quotes
     pub part: String,
-    /// The dirs in [`Completion::dir`] whose names start with the part (or, if none do, the
-    /// ones whose names do when case is ignored), sorted, each with a `/` after it
+    /// The dirs in [`Completion::dir`] whose names start with the part, ignoring case unless
+    /// the part has an uppercase letter (smart case), sorted, each with a `/` after it
     pub names: Vec<String>,
 }
 
@@ -1220,6 +1220,7 @@ impl Koil {
     /// or the part starts with a `.`, and without ignored ones if
     /// [`Settings::respect_gitignore`] is on, the dirs that are new in the diff (which
     /// [`Koil::open`] can open), and `..` for a part that is `.` or `..`
+    /// Case is ignored unless the part has an uppercase letter, like vim's `smartcase`
     /// A name can be written as it is, even one like `a[1]`, as a location that is a dir as
     /// written is never read as a pattern
     /// The `~` alone completes to `~/`. Nothing completes if the part's dir is not a dir, or is
@@ -1259,21 +1260,19 @@ impl Koil {
         if !part.is_empty() && "..".starts_with(&part) {
             dirs.insert("..".to_string());
         }
-        let starting = |ignore_case: bool| -> Vec<String> {
-            let lower = part.to_lowercase();
-            let starts = |name: &&String| match ignore_case {
-                true => name.to_lowercase().starts_with(&lower),
-                false => name.starts_with(&part),
-            };
-            dirs.iter()
-                .filter(starts)
-                .map(|n| format!("{n}/"))
-                .collect()
+        // smart case, like vim's `smartcase`: case is ignored unless the part has an uppercase
+        // letter
+        let ignore_case = !part.chars().any(char::is_uppercase);
+        let lower = part.to_lowercase();
+        let starts = |name: &&String| match ignore_case {
+            true => name.to_lowercase().starts_with(&lower),
+            false => name.starts_with(&part),
         };
-        let mut names = starting(false);
-        if names.is_empty() {
-            names = starting(true);
-        }
+        let names = dirs
+            .iter()
+            .filter(starts)
+            .map(|n| format!("{n}/"))
+            .collect();
         Completion {
             dir,
             start,
