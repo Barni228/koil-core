@@ -337,6 +337,41 @@ fn test_undo_blocked_by_changes_on_disk() {
     assert_eq!(history, koil.history());
 }
 
+/// Once the trash is emptied, the path of what an apply deleted is free there, and what is
+/// trashed at it later must never be restored in its place
+/// Only on macOS, where the trash's paths can be emptied one by one
+#[cfg(target_os = "macos")]
+#[test]
+fn test_undo_after_the_trash_was_emptied() {
+    let since = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+    let name = format!("koil-test-{}", since.unwrap().as_nanos());
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    fs::write(first.path().join(&name), "first").unwrap();
+    fs::write(second.path().join(&name), "second").unwrap();
+    let mut koil = Koil::default();
+    koil.open(first.path()).unwrap();
+    koil.update(&[]).unwrap();
+    koil.apply().unwrap();
+
+    // the trash emptied (of this test's file only), then the other one trashed at its path
+    let in_trash = std::env::home_dir().unwrap().join(".Trash").join(&name);
+    assert_eq!("first", fs::read_to_string(&in_trash).unwrap());
+    fs::remove_file(&in_trash).unwrap();
+    let other = crate::trash::trash(&second.path().join(&name)).unwrap();
+    assert_eq!("second", fs::read_to_string(&in_trash).unwrap());
+
+    let undoable = koil.undoable().unwrap();
+    let undone = koil.undo();
+    // out of the trash before anything fails
+    crate::trash::restore(&other).unwrap();
+    assert!(
+        matches!(undoable[0].blocked, Some((_, Blocked::NotInTrash(_)))),
+        "{undoable:?}"
+    );
+    assert!(undone.is_err());
+    assert!(!first.path().join(&name).exists());
+}
+
 #[test]
 fn test_history_in_another_session() {
     let temp = test_temp_dir();

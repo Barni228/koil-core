@@ -14,7 +14,7 @@ use std::{fs, io};
 /// moved within its filesystem: its device and inode on Unix, and when it was created, as a
 /// new file can get the inode of one that was just deleted; and on Windows when it was created
 /// and whether it is a dir, as its file index can only be read by opening it
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct FileKey(u64, u64, u64);
 
 impl FileKey {
