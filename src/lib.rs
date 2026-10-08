@@ -779,7 +779,6 @@ pub struct Change {
 
 /// An apply (or [`Koil::create_now`]) that can be reverted, one of [`Koil::history`]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(from = "StoredApplied")]
 pub struct Applied {
     /// When it was applied, which also tells it apart from the others
     pub time: SystemTime,
@@ -788,32 +787,6 @@ pub struct Applied {
     pub dir: PathBuf,
     /// The steps that revert it, in the order they run
     pub steps: Vec<Undo>,
-}
-
-/// How an [`Applied`] is read: also as it was saved before it had a time, only its steps
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredApplied {
-    Applied {
-        time: SystemTime,
-        #[serde(default)]
-        dir: PathBuf,
-        steps: Vec<Undo>,
-    },
-    Steps(Vec<Undo>),
-}
-
-impl From<StoredApplied> for Applied {
-    fn from(stored: StoredApplied) -> Self {
-        match stored {
-            StoredApplied::Applied { time, dir, steps } => Applied { time, dir, steps },
-            StoredApplied::Steps(steps) => Applied {
-                time: SystemTime::UNIX_EPOCH,
-                dir: PathBuf::new(),
-                steps,
-            },
-        }
-    }
 }
 
 /// An apply of [`Koil::history`], as [`Koil::undo_only`] can revert it, see

@@ -396,20 +396,6 @@ fn test_history_in_another_session() {
 }
 
 #[test]
-fn test_history_saved_without_times() {
-    // as `save_state` saved them before
-    let applied: Vec<Applied> = serde_json::from_str(r#"[[{"Trash": "/a"}]]"#).unwrap();
-    assert_eq!(
-        vec![Applied {
-            time: SystemTime::UNIX_EPOCH,
-            dir: PathBuf::new(),
-            steps: vec![Undo::Trash("/a".into())],
-        }],
-        applied
-    );
-}
-
-#[test]
 fn test_never_into_itself() {
     let temp = test_temp_dir();
     let before = snapshot(temp.path());
