@@ -602,6 +602,43 @@ fn test_create_now_needs_other_changes() {
 }
 
 #[test]
+fn test_dir_replaced_by_one_inside() {
+    for renamed in [false, true] {
+        let temp = test_temp_dir();
+        let before = snapshot(temp.path());
+        let mut koil = temp_koil(&temp);
+
+        // `dir/sub` moves out of `dir`, takes its name, and `dir` is deleted or renamed
+        koil.open("dir").unwrap();
+        let sub = id(&koil, "sub");
+        let entries = [keep(&koil, "x")];
+        koil.update(&entries).unwrap();
+        koil.open(temp.path()).unwrap();
+        let mut entries = vec![keep(&koil, "a"), keep(&koil, "b"), with_id(sub, "dir/")];
+        if renamed {
+            entries.push(with_id(id(&koil, "dir"), "old/"));
+        }
+        koil.update(&entries).unwrap();
+        koil.apply().unwrap();
+        let mut after = vec![
+            ("a", Some("a")),
+            ("b", Some("b")),
+            ("dir", None),
+            ("dir/y", Some("y")),
+        ];
+        if renamed {
+            after.extend([("old", None), ("old/x", Some("x"))]);
+        }
+        let after: BTreeMap<PathBuf, Option<String>> = (after.into_iter())
+            .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
+            .collect();
+        assert_eq!(after, snapshot(temp.path()));
+        koil.undo().unwrap();
+        assert_eq!(before, snapshot(temp.path()));
+    }
+}
+
+#[test]
 fn test_undo_in_renamed_dir() {
     let temp = test_temp_dir();
     let before = snapshot(temp.path());

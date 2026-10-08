@@ -308,6 +308,50 @@ fn test_cycle3_plus_lone_rename() {
     );
 }
 
+#[test]
+fn test_dir_replaced_by_one_inside() {
+    // `x` must leave `A` before it is deleted, and `A` must be gone before `x` takes its name
+    assert_eq!(
+        vec![
+            rename("A/x", ".A.koil0"),
+            Action::DeleteDir("A".into()),
+            rename(".A.koil0", "A")
+        ],
+        plan_actions(&[Action::DeleteDir("A".into()), rename("A/x", "A")])
+    );
+    assert_eq!(
+        vec![
+            rename("A/x", ".A.koil0"),
+            rename("A", "B"),
+            rename(".A.koil0", "A")
+        ],
+        plan_actions(&[rename("A", "B"), rename("A/x", "A")])
+    );
+    // a copy leaves the original in `A`, which goes to `B` with it
+    assert_eq!(
+        vec![
+            copy("A/x", ".A.koil0"),
+            rename("A", "B"),
+            rename(".A.koil0", "A")
+        ],
+        plan_actions(&[rename("A", "B"), copy("A/x", "A")])
+    );
+}
+
+#[test]
+fn test_dir_replaced_from_two_dirs_down() {
+    // the deepest leaves first, so nothing else moves out of it
+    assert_eq!(
+        vec![
+            rename("A/x/z", ".A.koil0"),
+            rename("A/x", "C"),
+            rename("A", "B"),
+            rename(".A.koil0", "A")
+        ],
+        plan_actions(&[rename("A", "B"), rename("A/x", "C"), rename("A/x/z", "A")])
+    );
+}
+
 // --- ADD ----------------------------------------------------------------
 
 #[test]
