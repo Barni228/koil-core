@@ -207,28 +207,171 @@ fn test_undo_never_overwrites() {
     koil.update(&entries).unwrap();
     koil.apply().unwrap();
     fs::write(temp.path().join("a"), "new a").unwrap();
+    let applied = snapshot(temp.path());
 
-    // `c` is renamed back to `b`, then restoring `a` fails
+    // restoring `a` would fail, so nothing is undone
     let result = koil.undo();
     assert!(
         matches!(
             result,
-            Err(KoilError::UndoFailed { done: 1, total: 2, ref source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists
+            Err(KoilError::UndoBlocked { blocked: Blocked::Taken(ref p), .. })
+                if p.ends_with("a")
         ),
         "{result:?}"
     );
-    assert_eq!(
-        Some("new a".to_string()),
-        fs::read_to_string(temp.path().join("a")).ok()
-    );
-    assert!(temp.path().join("b").exists());
+    assert_eq!(applied, snapshot(temp.path()));
 
-    // once the new `a` is gone, the step that failed can still be undone
+    // once the new `a` is gone, it can be undone
     fs::remove_file(temp.path().join("a")).unwrap();
     koil.undo().unwrap();
     assert_eq!(before, snapshot(temp.path()));
     assert_eq!(None, koil.undo_steps().unwrap());
+}
+
+/// The applies of `koil`'s history that can be undone now, oldest first, by whether they are
+/// blocked, and their needs
+fn undoable(koil: &Koil) -> Vec<(bool, Vec<usize>)> {
+    (koil.undoable().unwrap().into_iter())
+        .map(|u| (u.blocked.is_none(), u.needs))
+        .collect()
+}
+
+#[test]
+fn test_undo_older_apply() {
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+
+    // rename `a`, then `b`, which have nothing to do with each other
+    let entries = [
+        with_id(id(&koil, "a"), "a2"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let entries = [
+        keep(&koil, "a2"),
+        with_id(id(&koil, "b"), "b2"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let history = koil.history().to_vec();
+    assert_eq!(2, history.len());
+    assert!(history[0].time < history[1].time);
+    assert_eq!(koil.current_dir(), history[0].dir);
+    assert_eq!(vec![(true, vec![]), (true, vec![])], undoable(&koil));
+
+    // the first one is undone, and the second one stays
+    assert_eq!(1, koil.undo_only(&history[..1]).unwrap().changes);
+    assert!(temp.path().join("a").exists());
+    assert!(temp.path().join("b2").exists());
+    assert_eq!(&history[1..], koil.history());
+}
+
+#[test]
+fn test_undo_with_newer_apply() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // delete `a`, then rename `b` to `a`, then rename `dir/x`
+    let entries = [keep(&koil, "b"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let entries = [with_id(id(&koil, "b"), "a"), keep(&koil, "dir/")];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    koil.open("dir").unwrap();
+    let entries = [keep(&koil, "sub/"), with_id(id(&koil, "x"), "x2")];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    // the first one can not be undone without the second one, which put something at `a`
+    assert_eq!(
+        vec![(true, vec![1]), (true, vec![]), (true, vec![])],
+        undoable(&koil)
+    );
+
+    // so it is not undone without it
+    let history = koil.history().to_vec();
+    let result = koil.undo_only(&history[..1]);
+    assert!(
+        matches!(result, Err(KoilError::NothingToUndo)),
+        "{result:?}"
+    );
+    assert_eq!(history, koil.history());
+
+    // and with it, both are, the newest first
+    assert_eq!(2, koil.undo_only(&history[..2]).unwrap().changes);
+    assert_eq!(&history[2..], koil.history());
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+#[test]
+fn test_undo_blocked_by_changes_on_disk() {
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+
+    // rename `a` to `c`, which is then deleted outside of koil
+    let entries = [
+        with_id(id(&koil, "a"), "c"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    fs::remove_file(temp.path().join("c")).unwrap();
+    let undoable = koil.undoable().unwrap();
+    let c = koil.current_dir().join("c");
+    assert_eq!(
+        Some(Blocked::Missing(c.clone())),
+        undoable[0].blocked.clone().map(|(_, blocked)| blocked)
+    );
+    let history = koil.history().to_vec();
+    let result = koil.undo_only(&history);
+    assert!(
+        matches!(result, Err(KoilError::UndoBlocked { blocked: Blocked::Missing(ref p), .. }) if *p == c),
+        "{result:?}"
+    );
+    assert_eq!(history, koil.history());
+}
+
+#[test]
+fn test_history_in_another_session() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // delete `a` and make `dir/new`
+    let entries = [keep(&koil, "b"), keep(&koil, "dir/"), without_id("dir/new")];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+
+    // a new koil, somewhere else, undoes it
+    let history = koil.history().to_vec();
+    let saved = serde_json::to_string(&history).unwrap();
+    let mut other = Koil::default();
+    other.open(temp.path().join("dir/sub")).unwrap();
+    other.set_history(serde_json::from_str(&saved).unwrap());
+    assert_eq!(history, other.history());
+    other.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert!(other.history().is_empty());
+}
+
+#[test]
+fn test_history_saved_without_times() {
+    // as `save_state` saved them before
+    let applied: Vec<Applied> = serde_json::from_str(r#"[[{"Trash": "/a"}]]"#).unwrap();
+    assert_eq!(
+        vec![Applied {
+            time: SystemTime::UNIX_EPOCH,
+            dir: PathBuf::new(),
+            steps: vec![Undo::Trash("/a".into())],
+        }],
+        applied
+    );
 }
 
 #[test]
@@ -456,4 +599,32 @@ fn test_create_now_needs_other_changes() {
     // nothing changed
     assert_eq!(before, snapshot(temp.path()));
     assert_eq!(actions, koil.compute_actions());
+}
+
+#[test]
+fn test_undo_in_renamed_dir() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // `dir/x` moves out of `dir`, which is renamed: undo puts `x` back in a dir that one of
+    // its own steps moves
+    koil.open("dir").unwrap();
+    let x = id(&koil, "x");
+    let entries = [keep(&koil, "sub/")];
+    koil.update(&entries).unwrap();
+    koil.open(temp.path()).unwrap();
+    let entries = [
+        keep(&koil, "a"),
+        keep(&koil, "b"),
+        with_id(id(&koil, "dir"), "dir2/"),
+        with_id(x, "x"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    assert!(temp.path().join("dir2/sub").exists());
+    assert!(temp.path().join("x").exists());
+    assert_eq!(vec![(true, vec![])], undoable(&koil));
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
 }

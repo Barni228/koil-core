@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub(crate) use platform::Contents;
+
+/// Whether [`restore`] makes the dirs the item was in, if they are gone
+/// The freedesktop trash does, but on macOS and Windows restoring there fails
+pub(crate) const RESTORE_MAKES_PARENTS: bool = cfg!(all(unix, not(target_os = "macos")));
+
 /// A path that was moved to the trash, and can be restored with [`restore`]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Trashed {
@@ -68,6 +74,17 @@ mod platform {
         }
         fs::rename(&trashed.id, &trashed.original)
     }
+
+    /// Tells whether items are still in the trash, so [`restore`] can bring them back
+    /// Made with `default`, as on other systems, so not a unit struct
+    #[derive(Default)]
+    pub struct Contents {}
+
+    impl Contents {
+        pub fn has(&self, trashed: &Trashed) -> bool {
+            trashed.id.symlink_metadata().is_ok()
+        }
+    }
 }
 
 #[cfg(any(
@@ -81,6 +98,9 @@ mod platform {
 ))]
 mod platform {
     use super::{Trashed, not_in_trash};
+    use std::cell::OnceCell;
+    use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::{fs, io};
     use trash::TrashItem;
@@ -110,6 +130,25 @@ mod platform {
             .find(|item| item.id == trashed.id.as_os_str())
             .ok_or_else(|| not_in_trash(trashed))?;
         restore_all([item]).map_err(io::Error::other)
+    }
+
+    /// Tells whether items are still in the trash, so [`restore`] can bring them back
+    /// The trash is listed once, on the first item asked about
+    #[derive(Default)]
+    pub struct Contents {
+        /// `None` if it can not be listed, then every item counts as there
+        ids: OnceCell<Option<HashSet<OsString>>>,
+    }
+
+    impl Contents {
+        pub fn has(&self, trashed: &Trashed) -> bool {
+            let ids = self.ids.get_or_init(|| {
+                let items = list().ok()?;
+                Some(items.into_iter().map(|item| item.id).collect())
+            });
+            ids.as_ref()
+                .is_none_or(|ids| ids.contains(trashed.id.as_os_str()))
+        }
     }
 
     fn canonical_parent(path: &Path) -> io::Result<PathBuf> {

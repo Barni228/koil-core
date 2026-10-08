@@ -562,3 +562,30 @@ fn test_watched() {
     assert!(!watched.affects(&root.join("notes.txt")));
     assert!(!watched.affects(&root.join("d/main.rs")));
 }
+
+#[test]
+fn test_sync_follows_applied() {
+    let (_tmp, root) = setup();
+    let mut koil = open(&root);
+    // `b` renamed to `c` and applied, then `c` renamed to `z` on disk
+    let entries = [
+        keep(&koil, "d/"),
+        keep(&koil, "a"),
+        with_id(id(&koil, "b"), "c"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    fs::rename(root.join("c"), root.join("z")).unwrap();
+    let entries = [keep(&koil, "d/"), keep(&koil, "a"), keep(&koil, "c")];
+    let c = keep(&koil, "c");
+    let synced = koil.sync(&entries).unwrap();
+    // followed, though koil saw the same file at `b` before the apply
+    let edits = vec![Edit::Change {
+        from: c.clone(),
+        to: with_id(c.id.unwrap(), "z"),
+    }];
+    assert_eq!(edits, synced.edits);
+    // undo moves it back from where it is now
+    let steps = vec![Undo::Rename(root.join("z"), root.join("b"))];
+    assert_eq!(steps, koil.history()[0].steps);
+}

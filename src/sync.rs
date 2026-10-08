@@ -709,7 +709,10 @@ impl Koil {
             follow(&mut path);
             self.diff.without_id.insert(path, is_dir);
         }
-        for step in self.undo.iter_mut().flatten() {
+        for applied in &mut self.undo {
+            follow(&mut applied.dir);
+        }
+        for step in self.undo.iter_mut().flat_map(|applied| &mut applied.steps) {
             match step {
                 Undo::Trash(path) => follow(path),
                 Undo::Restore(trashed) => follow(&mut trashed.original),

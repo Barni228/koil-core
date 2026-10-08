@@ -1,4 +1,4 @@
-use crate::trash::{self, Trashed};
+use crate::trash::{self, Contents, Trashed};
 use crate::{Action, shown};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -82,6 +82,147 @@ impl Undo {
             }
             Undo::Restore(t) => trash::restore(t)?,
             Undo::Rename(s, d) => Action::Rename(s.clone(), d.clone()).run().map(|_| ())?,
+        }
+        Ok(())
+    }
+
+    /// The paths this step changes on disk: what it trashes, restores, or moves, and where to
+    pub fn paths(&self) -> Vec<&Path> {
+        match self {
+            Undo::Trash(p) => vec![p],
+            Undo::Restore(t) => vec![&t.original],
+            Undo::Rename(s, d) => vec![s, d],
+        }
+    }
+}
+
+/// Why an [`Undo`] step can not run now (see [`check`])
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Blocked {
+    /// Nothing is at the path it trashes or moves, or the dir it puts something in is gone
+    Missing(PathBuf),
+    /// Something is already at the path it puts something at
+    Taken(PathBuf),
+    /// What it restores is no longer in the trash (it was emptied)
+    NotInTrash(PathBuf),
+}
+
+impl fmt::Display for Blocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Blocked::Missing(p) => write!(f, "`{}` is gone", shown(p)),
+            Blocked::Taken(p) => write!(f, "`{}` already exists", shown(p)),
+            Blocked::NotInTrash(p) => write!(f, "`{}` is no longer in the trash", shown(p)),
+        }
+    }
+}
+
+/// Checks that `steps` can run in order now, as far as can be told without running them:
+/// what each one trashes or moves is there, where it puts something is free and in a dir
+/// that is there, and what it restores is still in the trash (asked of `trash`)
+/// Each step is checked on the filesystem as the steps before it would leave it
+/// Returns the first step that can not run, and why
+pub(crate) fn check<'a>(
+    steps: impl IntoIterator<Item = &'a Undo>,
+    trash: &Contents,
+) -> Result<(), (Undo, Blocked)> {
+    let mut disk = Simulated::default();
+    for step in steps {
+        disk.run(step, trash)
+            .map_err(|blocked| (step.clone(), blocked))?;
+    }
+    Ok(())
+}
+
+/// The filesystem as some [`Undo`] steps would leave it, without running them
+#[derive(Default)]
+struct Simulated {
+    /// What the steps did, in order
+    done: Vec<Done>,
+}
+
+enum Done {
+    /// Nothing is at the path, nor inside it
+    Gone(PathBuf),
+    /// What was at the first path (and inside it) is at the second
+    Moved(PathBuf, PathBuf),
+    /// Something is at the path, but what is inside it is not known
+    Restored(PathBuf),
+}
+
+impl Simulated {
+    /// Whether something would be at `path`, `None` if that can not be told (inside a dir that
+    /// comes back from the trash)
+    fn exists(&self, path: &Path) -> Option<bool> {
+        let mut path = path.to_path_buf();
+        // the newest step that says anything about it decides, a move sends it back to where
+        // it was before
+        for done in self.done.iter().rev() {
+            match done {
+                Done::Gone(p) if path.starts_with(p) => return Some(false),
+                Done::Moved(from, to) => {
+                    if let Ok(rest) = path.strip_prefix(to) {
+                        path = match rest.as_os_str().is_empty() {
+                            true => from.clone(),
+                            false => from.join(rest),
+                        };
+                    } else if path.starts_with(from) {
+                        return Some(false);
+                    }
+                }
+                Done::Restored(p) if path == *p => return Some(true),
+                Done::Restored(p) if path.starts_with(p) => return None,
+                _ => {}
+            }
+        }
+        Some(path.symlink_metadata().is_ok())
+    }
+
+    /// Something is (or may be) at `path`
+    fn there(&self, path: &Path) -> Result<(), Blocked> {
+        match self.exists(path) {
+            Some(false) => Err(Blocked::Missing(path.to_path_buf())),
+            _ => Ok(()),
+        }
+    }
+
+    /// The dir `path` goes in is (or may be) there
+    fn in_dir(&self, path: &Path) -> Result<(), Blocked> {
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => self.there(parent),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks that `step` can run, as [`Undo::run`] would, then does it
+    fn run(&mut self, step: &Undo, trash: &Contents) -> Result<(), Blocked> {
+        match step {
+            Undo::Trash(p) => {
+                self.there(p)?;
+                self.done.push(Done::Gone(p.clone()));
+            }
+            Undo::Restore(t) => {
+                if !trash.has(t) {
+                    return Err(Blocked::NotInTrash(t.original.clone()));
+                }
+                if self.exists(&t.original) == Some(true) {
+                    return Err(Blocked::Taken(t.original.clone()));
+                }
+                if !trash::RESTORE_MAKES_PARENTS {
+                    self.in_dir(&t.original)?;
+                }
+                self.done.push(Done::Restored(t.original.clone()));
+            }
+            Undo::Rename(s, d) => {
+                self.there(s)?;
+                // as in `Action::run`, on case insensitive filesystems `A -> a` sees `a` as taken,
+                // but it is `A` itself
+                if self.exists(d) == Some(true) && !same_file(s, d).unwrap_or(false) {
+                    return Err(Blocked::Taken(d.clone()));
+                }
+                self.in_dir(d)?;
+                self.done.push(Done::Moved(s.clone(), d.clone()));
+            }
         }
         Ok(())
     }
