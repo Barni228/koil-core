@@ -2,8 +2,9 @@ use crate::Action;
 use pathfinding::prelude::*;
 use std::{
     cmp::Ord,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     hash::Hash,
+    ops::Bound,
     path::{Path, PathBuf},
 };
 
@@ -12,6 +13,10 @@ use std::{
 /// it is used to pick a free temporary name when breaking rename cycles
 pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<Action> {
     let mut result = Vec::new();
+    // the paths an action creates or removes, which a temp path can not be
+    let used: HashSet<&Path> = (actions.iter())
+        .flat_map(|a| a.creates().into_iter().chain(a.removes()))
+        .collect();
 
     for cycle in order(actions) {
         if cycle.len() == 1 {
@@ -36,7 +41,7 @@ pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<A
             Action::Rename(from, to) => (from, to),
             _ => unreachable!(),
         };
-        let tmp = temp_path(&first_from, actions, &exists);
+        let tmp = temp_path(&first_from, &used, &exists);
         result.push(Action::Rename(first_from, tmp.clone()));
         result.extend(iter.rev());
 
@@ -49,9 +54,10 @@ pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<A
 /// `actions` in the order they can run, in groups: an action alone, or a rename cycle (like
 /// rename A to B and B to A), which can only run through a temp path (see [`plan_actions`])
 pub fn order(actions: &[Action]) -> Vec<Vec<Action>> {
+    let successors = Successors::new(actions);
     // detect all rename cycles (like rename A to B and B to A)
     // every action that is not in a cycle is its own group of 1
-    let mut groups = scc(actions, |a| successors(actions, a));
+    let mut groups = scc(actions, |a| successors.of(a));
     // when nothing else decides the order, cycles go first
     groups.sort_by_key(|group| group.len() == 1);
     let group_of: HashMap<&Action, usize> = groups
@@ -65,7 +71,7 @@ pub fn order(actions: &[Action]) -> Vec<Vec<Action>> {
     let order = topo_sort(&indexes, |&i| {
         let mut next: Vec<usize> = groups[i]
             .iter()
-            .flat_map(|a| successors(actions, a))
+            .flat_map(|a| successors.of(a))
             .map(|a| group_of[&a])
             .filter(|&j| j != i)
             .collect();
@@ -115,16 +121,11 @@ pub fn needs(actions: &[Action]) -> Vec<Vec<usize>> {
 
 /// A free path next to `from`, to temporarily move it out of the way
 /// Tries `.name.koil0`, `.name.koil1`, ... until a path that does not exist,
-/// and that no action creates or removes, is found
-fn temp_path(from: &Path, actions: &[Action], exists: impl Fn(&Path) -> bool) -> PathBuf {
+/// and that no action creates or removes (`used`), is found
+fn temp_path(from: &Path, used: &HashSet<&Path>, exists: impl Fn(&Path) -> bool) -> PathBuf {
     let dir = from.parent().unwrap_or(Path::new(""));
     let name = from.file_name().unwrap().to_string_lossy();
-    let taken = |path: &Path| {
-        exists(path)
-            || actions
-                .iter()
-                .any(|a| a.creates() == Some(path) || a.removes() == Some(path))
-    };
+    let taken = |path: &Path| exists(path) || used.contains(path);
 
     (0..)
         .map(|i| dir.join(format!(".{name}.koil{i}")))
@@ -132,27 +133,66 @@ fn temp_path(from: &Path, actions: &[Action], exists: impl Fn(&Path) -> bool) ->
         .unwrap()
 }
 
-/// this returns all actions that should happen AFTER this action
-fn successors(actions: &[Action], action: &Action) -> Vec<Action> {
-    actions
-        .iter()
-        .filter(|&a| action != a)
-        // Return true if `action` should happen before `other`
-        .filter(|&other| {
-            // If I depend on something, and `other` removes that, I go first
-            matches!((action.depends_on(), other.removes()),
-                (Some(depend), Some(removed)) if depend.starts_with(removed))
-            // If I remove something and `other` creates it, I should remove it first
-            || matches!((action.removes(), other.creates()),
-                (Some(removed), Some(created)) if created == removed)
-            // If I create something new and `other` creates something inside it, I go first
-            // (if `created` is also removed, paths inside it refer to the old one)
-            || matches!((action.creates(), other.creates().and_then(Path::parent)),
-                (Some(created), Some(parent)) if parent.starts_with(created)
-                    && !actions.iter().any(|a| a.removes() == Some(created)))
-        })
-        .cloned()
-        .collect()
+/// What actions should happen after each one, found by their paths rather than by comparing
+/// every two actions (which took 14 s to order 10,000 deletes)
+struct Successors<'a> {
+    actions: &'a [Action],
+    /// The indexes of the actions that remove each path
+    removes: HashMap<&'a Path, Vec<usize>>,
+    /// The indexes of the actions that create each path, in order, so the paths inside a dir
+    /// come right after it
+    creates: BTreeMap<&'a Path, Vec<usize>>,
+}
+
+impl<'a> Successors<'a> {
+    fn new(actions: &'a [Action]) -> Self {
+        let mut removes: HashMap<&Path, Vec<usize>> = HashMap::new();
+        let mut creates: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
+        for (i, action) in actions.iter().enumerate() {
+            if let Some(path) = action.removes() {
+                removes.entry(path).or_default().push(i);
+            }
+            if let Some(path) = action.creates() {
+                creates.entry(path).or_default().push(i);
+            }
+        }
+        Successors {
+            actions,
+            removes,
+            creates,
+        }
+    }
+
+    /// The actions that should happen AFTER `action`, in the order of the actions
+    fn of(&self, action: &Action) -> Vec<Action> {
+        let mut after: Vec<usize> = Vec::new();
+        // If I depend on something, and `other` removes that (or a dir it is in), I go first
+        if let Some(depend) = action.depends_on() {
+            for dir in depend.ancestors() {
+                after.extend(self.removes.get(dir).into_iter().flatten());
+            }
+        }
+        // If I remove something and `other` creates it, I should remove it first
+        if let Some(removed) = action.removes() {
+            after.extend(self.creates.get(removed).into_iter().flatten());
+        }
+        // If I create something new and `other` creates something inside it, I go first
+        // (if `created` is also removed, paths inside it refer to the old one)
+        if let Some(created) = action.creates()
+            && !self.removes.contains_key(created)
+        {
+            let after_it = (Bound::Excluded(created), Bound::Unbounded);
+            let inside = (self.creates.range::<Path, _>(after_it))
+                .take_while(|(path, _)| path.starts_with(created));
+            after.extend(inside.flat_map(|(_, others)| others));
+        }
+        after.sort_unstable();
+        after.dedup();
+        (after.into_iter().map(|i| &self.actions[i]))
+            .filter(|&other| other != action)
+            .cloned()
+            .collect()
+    }
 }
 
 /// A deterministic version of `pathfinding` `topological_sort`

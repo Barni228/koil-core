@@ -1,7 +1,7 @@
 use crate::Action;
 use crate::planner;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,15 +43,23 @@ impl Diff {
     /// Dirs that are neither on disk nor created in this diff, but something new is placed
     /// inside them, so they must be created too
     pub fn missing_parents(&self) -> BTreeSet<PathBuf> {
-        let afters: Vec<&PathBuf> = self.with_id.values().flat_map(|(_, a)| a).collect();
+        // a set, as thousands of paths can be moved into a new dir
+        let afters: HashSet<&Path> = (self.with_id.values())
+            .flat_map(|(_, a)| a.iter().map(PathBuf::as_path))
+            .collect();
         let mut missing = BTreeSet::new();
-        for path in self.without_id.keys().chain(afters.iter().copied()) {
+        for path in self
+            .without_id
+            .keys()
+            .map(PathBuf::as_path)
+            .chain(afters.iter().copied())
+        {
             for parent in path.ancestors().skip(1) {
                 let exists = parent.as_os_str().is_empty()
                     || parent.symlink_metadata().is_ok()
                     || self.without_id.contains_key(parent)
                     // a dir that was renamed or copied to this path
-                    || afters.contains(&&parent.to_path_buf());
+                    || afters.contains(parent);
                 // if it was added already, so were its parents
                 if exists || !missing.insert(parent.to_path_buf()) {
                     break;
