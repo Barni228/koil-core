@@ -326,7 +326,7 @@ impl Koil {
         // what user wrote in the listing, unless it is of what is not open anymore
         let mut written: BTreeMap<usize, Vec<Entry>> = BTreeMap::new();
         let mut created: HashMap<PathBuf, Entry> = HashMap::new();
-        for entry in entries.iter().filter(|e| !moved && !e.is_parent()) {
+        for entry in entries.iter().filter(|_| !moved) {
             match entry.id {
                 Some(id) => {
                     if let Some(index) = self.index_of(id) {

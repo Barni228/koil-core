@@ -283,20 +283,6 @@ fn test_sort_keeps_new_entries_last() {
 }
 
 #[test]
-fn test_sort_parent_first() {
-    let (_tmp, root) = setup();
-    let mut koil = open_sorted(&root, SortBy::Size, true);
-    let settings = Settings {
-        show_hidden: true,
-        ..koil.settings().clone()
-    };
-    koil.set_settings(settings).unwrap();
-    assert_eq!(Entry::parent(), koil.listing()[0]);
-    let listing = koil.listing();
-    assert!(koil.compare(&listing[0], &listing[1]).is_lt());
-}
-
-#[test]
 fn test_compare_is_listing_order() {
     let (_tmp, root) = setup();
     for by in [

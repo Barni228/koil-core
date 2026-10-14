@@ -431,7 +431,7 @@ fn test_nested_create_inside_file_fails() {
 
 #[test]
 fn test_invalid_names_fail() {
-    let mut names = vec!["../A", "/A", "./A", "a/../b", "a/./b", ""];
+    let mut names = vec!["..", ".", "../A", "/A", "./A", "a/../b", "a/./b", ""];
     // `\` is a separator there too, and `C:` a drive
     if cfg!(windows) {
         names.extend([r"..\A", r"\A", r"a\.\b", "C:A", "C:/A"]);
@@ -835,7 +835,6 @@ fn hidden_koil() -> Koil {
 /// The unchanged `test_dir` listing, with hidden entries shown
 fn hidden_listing(koil: &Koil) -> Vec<Entry> {
     vec![
-        Entry::parent(),
         keep(koil, "dir/"),
         keep(koil, ".hidden"),
         keep(koil, "file"),
@@ -878,23 +877,20 @@ fn test_set_show_hidden() {
 }
 
 #[test]
-fn test_parent_entry_is_ignored() {
+fn test_no_parent_entry() {
+    // not even with hidden entries shown
     let mut koil = hidden_koil();
-    // without `..`
-    koil.update(&hidden_listing(&koil)[1..]).unwrap();
-    assert_eq!(Diff::default(), koil.diff);
-    // with `..` written twice
-    let mut entries = hidden_listing(&koil);
-    entries.push(Entry::parent());
-    koil.update(&entries).unwrap();
-    assert_eq!(Diff::default(), koil.diff);
-}
-
-#[test]
-fn test_no_parent_entry_in_root() {
-    let mut koil = hidden_koil();
-    koil.open("/").unwrap();
-    assert!(!koil.listing().contains(&Entry::parent()));
+    let parent = |koil: &Koil| (koil.listing().iter()).any(|e| e.name == Path::new(".."));
+    assert!(!parent(&koil));
+    koil.open("**/*").unwrap();
+    assert!(!parent(&koil));
+    // and `..` written is not a name
+    let mut entries = koil.listing();
+    entries.push(without_id("../"));
+    assert_eq!(
+        vec![(entries.len() - 1, EntryErrorKind::InvalidName("..".into()))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
 }
 
 #[test]
@@ -902,7 +898,7 @@ fn test_hide_renamed_hidden() {
     let mut koil = hidden_koil();
     let hidden = id(&koil, ".hidden");
     let mut entries = hidden_listing(&koil);
-    entries[2] = with_id(hidden, ".renamed");
+    entries[1] = with_id(hidden, ".renamed");
     koil.update(&entries).unwrap();
 
     // the renamed entry is still shown, so updating keeps it a rename
@@ -918,7 +914,7 @@ fn test_hide_renamed_hidden() {
 fn test_hide_deleted_hidden() {
     let mut koil = hidden_koil();
     let mut entries = hidden_listing(&koil);
-    entries.remove(2);
+    entries.remove(1);
     koil.update(&entries).unwrap();
 
     // the deleted entry is not shown, and updating keeps it deleted
@@ -1314,11 +1310,10 @@ fn test_glob_edit_seen_in_dir() {
 fn test_glob_hidden() {
     let mut koil = hidden_koil();
     koil.open("**/*").unwrap();
-    let mut listing = vec![Entry::parent()];
-    listing.extend(keep_all(
+    let listing = keep_all(
         &koil,
         &["dir/", ".hidden", "dir/inside", "file", "file2", "qwerty"],
-    ));
+    );
     assert_eq!(listing, koil.listing());
 }
 
@@ -1798,7 +1793,7 @@ fn test_gitignore_hides_git_dir() {
         ..Settings::default()
     };
     let koil = temp_koil(&temp, settings, "");
-    assert_eq!(vec!["../", "src/", ".gitignore", "file"], names(&koil));
+    assert_eq!(vec!["src/", ".gitignore", "file"], names(&koil));
 }
 
 #[test]
@@ -1940,7 +1935,7 @@ fn test_update_and_open() {
     assert_eq!((vec![], None), (updated.warnings, updated.warning));
     assert_eq!(test_path("dir"), koil.current_dir());
     assert_eq!(&show_hidden(), koil.settings());
-    assert_eq!(vec!["../", "inside"], names(&koil));
+    assert_eq!(vec!["inside"], names(&koil));
     let root = test_path("");
     assert_eq!(
         vec![Action::Rename(root.join("file"), root.join("renamed"))],
@@ -2000,7 +1995,6 @@ fn test_is_pending() {
     let pending = |entry: Entry| koil.is_pending(&entry);
     assert!(!pending(keep(&koil, "file")));
     assert!(!pending(keep(&koil, "dir/")));
-    assert!(!pending(Entry::parent()));
     // renamed, moved, or new
     assert!(pending(with_id(file, "renamed")));
     assert!(pending(with_id(file, "dir/file")));

@@ -55,30 +55,11 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-impl Entry {
-    /// The `..` entry, which only opens the parent dir
-    /// [`Koil::listing`] starts with it when [`Settings::show_hidden`] is on, and
-    /// [`Koil::update`] ignores it, so it can never be changed
-    pub fn parent() -> Entry {
-        Entry {
-            id: None,
-            name: "..".into(),
-            is_dir: true,
-        }
-    }
-
-    /// Whether this is the [`Entry::parent`] entry
-    pub fn is_parent(&self) -> bool {
-        self.id.is_none() && self.name == Path::new("..")
-    }
-}
-
 /// How the listing is shown, a frontend usually lets user change these
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Show hidden entries (names starting with `.`), and [`Entry::parent`] to open the
-    /// parent dir
+    /// Show hidden entries (names starting with `.`)
     /// Hidden entries that were changed are always shown, so the change is not lost
     pub show_hidden: bool,
 
@@ -96,8 +77,8 @@ pub struct Settings {
     pub sort: Sort,
 }
 
-/// The order of [`Koil::listing`] (see [`Koil::compare`]): [`Entry::parent`], the dirs with IDs,
-/// the files with IDs, then the new entries, each sorted by [`Sort::by`], and then by name
+/// The order of [`Koil::listing`] (see [`Koil::compare`]): the dirs with IDs, the files with
+/// IDs, then the new entries, each sorted by [`Sort::by`], and then by name
 /// New entries are not on disk, so a [`SortBy`] that [`reads_metadata`](SortBy::reads_metadata)
 /// sorts them only by name
 /// `reverse` turns the order within each of those groups around, but not the groups
@@ -1297,9 +1278,9 @@ impl Koil {
 
     /// The entries of the open dir or glob, with every change made so far, which user should
     /// modify
-    /// Starts with [`Entry::parent`] if [`Settings::show_hidden`] is on, then existing entries
-    /// (dirs, then files), then new entries, each sorted as [`Settings::sort`] says (see
-    /// [`Sort`])
+    /// Existing entries (dirs, then files), then new entries, each sorted as [`Settings::sort`]
+    /// says (see [`Sort`])
+    /// It never has `..`, which a frontend opens some other way
     pub fn listing(&self) -> Vec<Entry> {
         let view = self.view();
         let in_view = |index: usize, path: &Path| view.contains(path, self.ids[index].is_dir());
@@ -1364,19 +1345,13 @@ impl Koil {
             .collect();
         sorted
             .sort_by(|(a, a_meta), (b, b_meta)| self.order(a, a_meta.as_ref(), b, b_meta.as_ref()));
-        let mut entries: Vec<Entry> = sorted.into_iter().map(|(entry, _)| entry).collect();
-
-        if self.settings.show_hidden && self.current_dir.parent().is_some() {
-            entries.insert(0, Entry::parent());
-        }
-        entries
+        sorted.into_iter().map(|(entry, _)| entry).collect()
     }
 
     /// Update the internal diff with `entries`, the listing of the open dir as user edited it
     /// An entry of the open dir that is missing is deleted, a changed name is a rename (or a
     /// move, if it is a path in another dir), an ID written more than once is a copy, and an
     /// entry without an ID is created, along with its parents that do not exist yet
-    /// [`Entry::parent`] is ignored, it can only be opened
     /// Changes made in the listings of other dirs are kept
     /// If any entry is invalid, nothing is changed, and every problem is returned
     /// Returns warnings about names that can be used, but are not recommended
@@ -1738,12 +1713,12 @@ impl Koil {
     }
 
     /// Whether applying would change `entry`, as it is written in a listing of the open dir:
-    /// it is new (but not [`Entry::parent`]), or not at the path of its ID, so it is renamed,
-    /// copied, or moved here from another dir
+    /// it is new, or not at the path of its ID, so it is renamed, copied, or moved here from
+    /// another dir
     /// A frontend can use it to mark the entries that are not on disk as they are written
     pub fn is_pending(&self, entry: &Entry) -> bool {
         match entry.id {
-            None => !entry.is_parent(),
+            None => true,
             Some(id) => self.path_of(id) != Some(self.current_dir.join(&entry.name).as_path()),
         }
     }
@@ -2088,10 +2063,9 @@ impl Koil {
         b_meta: Option<&Metadata>,
     ) -> std::cmp::Ordering {
         let group = |e: &Entry| match e.id {
-            _ if e.is_parent() => 0,
-            Some(_) if e.is_dir => 1,
-            Some(_) => 2,
-            None => 3,
+            Some(_) if e.is_dir => 0,
+            Some(_) => 1,
+            None => 2,
         };
         let Sort { by, reverse } = self.settings.sort;
         group(a).cmp(&group(b)).then_with(|| {
@@ -2231,9 +2205,6 @@ impl Koil {
         let mut without_id = Vec::new();
 
         for (i, entry) in entries.iter().enumerate() {
-            if entry.is_parent() {
-                continue;
-            }
             let index = match entry.id.map(|id| (id, self.index_of(id))) {
                 Some((_, Some(index))) => Some(index),
                 Some((id, None)) => {
