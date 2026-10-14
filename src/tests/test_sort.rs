@@ -36,9 +36,31 @@ fn setup() -> (TempDir, PathBuf) {
 
 /// Koil with `dir` open, sorted by `by` (the other way round if `reverse`)
 fn open_sorted(dir: &Path, by: SortBy, reverse: bool) -> Koil {
+    open_with(
+        dir,
+        Sort {
+            by,
+            reverse,
+            ..Sort::default()
+        },
+    )
+}
+
+/// Koil with `dir` open, sorted by `by` with the dirs and files together
+fn open_mixed(dir: &Path, by: SortBy, reverse: bool) -> Koil {
+    let sort = Sort {
+        by,
+        reverse,
+        dirs_first: false,
+    };
+    open_with(dir, sort)
+}
+
+/// Koil with `dir` open, sorted as `sort` says
+fn open_with(dir: &Path, sort: Sort) -> Koil {
     let mut koil = Koil::builder()
         .settings(Settings {
-            sort: Sort { by, reverse },
+            sort,
             ..Settings::default()
         })
         .build();
@@ -70,6 +92,43 @@ fn test_sort_by_name_reversed() {
     let (_tmp, root) = setup();
     let koil = open_sorted(&root, SortBy::Name, true);
     // dirs still come first
+    assert_eq!(
+        vec!["small/", "big/", "c", "b.txt", "a10.txt", "A.rs"],
+        names(&koil)
+    );
+}
+
+#[test]
+fn test_sort_dirs_with_files() {
+    let (_tmp, root) = setup();
+    let koil = open_mixed(&root, SortBy::Name, false);
+    assert_eq!(
+        vec!["A.rs", "a10.txt", "b.txt", "big/", "c", "small/"],
+        names(&koil)
+    );
+    let koil = open_mixed(&root, SortBy::Name, true);
+    assert_eq!(
+        vec!["small/", "c", "big/", "b.txt", "a10.txt", "A.rs"],
+        names(&koil)
+    );
+}
+
+#[test]
+fn test_sort_dirs_with_files_by_size() {
+    let (_tmp, root) = setup();
+    // a dir's size is not known, so after the files, by how many entries it has, and new
+    // entries still last, by name
+    let mut koil = open_mixed(&root, SortBy::Size, false);
+    let mut entries = koil.listing();
+    entries.extend([without_id("z"), without_id("new/"), without_id("m")]);
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        vec![
+            "A.rs", "a10.txt", "b.txt", "c", "big/", "small/", "m", "new/", "z"
+        ],
+        names(&koil)
+    );
+    let koil = open_mixed(&root, SortBy::Size, true);
     assert_eq!(
         vec!["small/", "big/", "c", "b.txt", "a10.txt", "A.rs"],
         names(&koil)
@@ -231,7 +290,7 @@ fn test_sort_changed_by_settings() {
     let settings = Settings {
         sort: Sort {
             by: SortBy::Size,
-            reverse: false,
+            ..Sort::default()
         },
         ..Settings::default()
     };
@@ -274,6 +333,7 @@ fn test_sort_keeps_new_entries_last() {
         sort: Sort {
             by: SortBy::Size,
             reverse: true,
+            ..Sort::default()
         },
         ..Settings::default()
     };
@@ -290,12 +350,18 @@ fn test_compare_is_listing_order() {
         SortBy::Natural,
         SortBy::Extension,
         SortBy::Size,
+        SortBy::Disk,
         SortBy::Modified,
         SortBy::Created,
         SortBy::Accessed,
     ] {
-        for reverse in [false, true] {
-            let mut koil = open_sorted(&root, by, reverse);
+        for (reverse, dirs_first) in [(false, true), (true, true), (false, false), (true, false)] {
+            let sort = Sort {
+                by,
+                reverse,
+                dirs_first,
+            };
+            let mut koil = open_with(&root, sort);
             let mut entries = koil.listing();
             entries.extend([without_id("new"), without_id("a/")]);
             koil.update(&entries).unwrap();
@@ -303,7 +369,7 @@ fn test_compare_is_listing_order() {
             let mut sorted = listing.clone();
             sorted.reverse();
             sorted.sort_by(|a, b| koil.compare(a, b));
-            assert_eq!(listing, sorted, "{by:?}, reverse: {reverse}");
+            assert_eq!(listing, sorted, "{sort:?}");
         }
     }
 }
@@ -325,5 +391,8 @@ fn test_settings_without_sort_load() {
     let settings: Settings = serde_json::from_str(r#"{"show_hidden": true}"#).unwrap();
     assert_eq!(Sort::default(), settings.sort);
     let sort: Sort = serde_json::from_str(r#"{"by": "size"}"#).unwrap();
-    assert_eq!((SortBy::Size, false), (sort.by, sort.reverse));
+    assert_eq!(
+        (SortBy::Size, false, true),
+        (sort.by, sort.reverse, sort.dirs_first)
+    );
 }

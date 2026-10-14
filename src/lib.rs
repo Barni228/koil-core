@@ -79,15 +79,30 @@ pub struct Settings {
 
 /// The order of [`Koil::listing`] (see [`Koil::compare`]): the dirs with IDs, the files with
 /// IDs, then the new entries, each sorted by [`Sort::by`], and then by name
+/// Without [`Sort::dirs_first`], the dirs and files with IDs are sorted together
 /// New entries are not on disk, so a [`SortBy`] that [`reads_metadata`](SortBy::reads_metadata)
 /// sorts them only by name
 /// `reverse` turns the order within each of those groups around, but not the groups
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sort {
     pub by: SortBy,
     /// The other way round: from Z to A, smallest first, oldest first
     pub reverse: bool,
+    /// Dirs before files (the default), else sorted together, like `1/`, `2.txt`, `3/`
+    /// By [`SortBy::Size`] or [`SortBy::Disk`], a dir's size is not known (only how many
+    /// entries it has), so then they go after the files
+    pub dirs_first: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Sort {
+            by: SortBy::default(),
+            reverse: false,
+            dirs_first: true,
+        }
+    }
 }
 
 /// What [`Sort`] sorts by, each in the order people usually want first
@@ -2062,14 +2077,24 @@ impl Koil {
         b: &Entry,
         b_meta: Option<&Metadata>,
     ) -> std::cmp::Ordering {
+        let Sort {
+            by,
+            reverse,
+            dirs_first,
+        } = self.settings.sort;
         let group = |e: &Entry| match e.id {
-            Some(_) if e.is_dir => 0,
+            Some(_) if e.is_dir && dirs_first => 0,
             Some(_) => 1,
             None => 2,
         };
-        let Sort { by, reverse } = self.settings.sort;
+        // a dir's size is how many entries it has, which does not compare to a file's, so
+        // sorted with the files, the dirs go after them (new entries are sorted by name)
+        let sized = matches!(by, SortBy::Size | SortBy::Disk) && !dirs_first;
+        let kind = |e: &Entry| sized && e.is_dir && e.id.is_some();
         group(a).cmp(&group(b)).then_with(|| {
-            let order = (by.compare(a, a_meta, b, b_meta)).then_with(|| a.name.cmp(&b.name));
+            let order = (kind(a).cmp(&kind(b)))
+                .then_with(|| by.compare(a, a_meta, b, b_meta))
+                .then_with(|| a.name.cmp(&b.name));
             match reverse {
                 true => order.reverse(),
                 false => order,
