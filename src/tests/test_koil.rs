@@ -2065,7 +2065,7 @@ fn test_complete() {
     assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("do"));
     assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("D"));
     assert_eq!(completion(0, &["Downloads/"]), complete("Dow"));
-    assert_eq!(none, complete("De"));
+    assert_eq!(none, complete("Dx"));
     assert_eq!(none, complete("DO"));
     let c = koil.complete("do", &Settings::default());
     assert_eq!(
@@ -2075,6 +2075,21 @@ fn test_complete() {
     // hidden ones for a part that starts with a `.`, and `..`
     assert_eq!(completion(0, &["../", ".config/"]), complete("."));
     assert_eq!(completion(0, &["../"]), complete(".."));
+
+    // if no name starts with the part, the ones that have its characters in order (`d` above
+    // gave only those that start with it, not `my dir` or `src-old`)
+    assert_eq!(completion(0, &["Downloads/"]), complete("own"));
+    assert_eq!(completion(0, &["my dir/"]), complete("mdr"));
+    assert_eq!(completion(0, &["src-old/"]), complete("srco"));
+    assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("ds"));
+    assert_eq!(completion(7, &["sub/"]), complete("my dir/ub"));
+    // with smart case too
+    assert_eq!(completion(0, &["Documents/"]), complete("De"));
+    assert_eq!(completion(0, &["Documents/", "Downloads/"]), complete("Ds"));
+    assert_eq!(none, complete("dE"));
+    // not in order, or hidden
+    assert_eq!(none, complete("crs"));
+    assert_eq!(none, complete("conf"));
 
     // in the dir before the last `/`, read like a location
     assert_eq!(completion(7, &["sub/"]), complete("my dir/"));

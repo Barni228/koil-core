@@ -212,6 +212,13 @@ fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// Whether `name` has the characters of `part` in the same order, with anything between them
+/// (`my_tools` has `myt`), see [`Koil::complete`]
+fn has_in_order(name: &str, part: &str) -> bool {
+    let mut rest = name.chars();
+    part.chars().all(|c| rest.any(|n| n == c))
+}
+
 /// What is on disk at an entry's path (of a link itself, for a link), which the listing can be
 /// sorted by (see [`Koil::metadata`])
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -473,8 +480,9 @@ pub struct Completion {
     pub start: usize,
     /// The part, as it is read (see [`Koil::read_location`]), without its quotes
     pub part: String,
-    /// The dirs in [`Completion::dir`] whose names start with the part, ignoring case unless
-    /// the part has an uppercase letter (smart case), sorted, each with a `/` after it
+    /// The dirs in [`Completion::dir`] whose names start with the part, or if none does, have
+    /// its characters in order, ignoring case unless the part has an uppercase letter (smart
+    /// case), sorted, each with a `/` after it
     pub names: Vec<String>,
 }
 
@@ -1189,6 +1197,9 @@ impl Koil {
     /// or the part starts with a `.`, and without ignored ones if
     /// [`Settings::respect_gitignore`] is on, the dirs that are new in the diff (which
     /// [`Koil::open`] can open), and `..` for a part that is `.` or `..`
+    /// If none of them starts with the part, they are the ones that have its characters in
+    /// order, with anything between them, like zsh's fuzzy `r:|?=**` matcher: `myt` gives
+    /// `my_tools`, and `own` gives `Downloads`
     /// Case is ignored unless the part has an uppercase letter, like vim's `smartcase`
     /// A name can be written as it is, even one like `a[1]`, as a location that is a dir as
     /// written is never read as a pattern
@@ -1232,16 +1243,24 @@ impl Koil {
         // smart case, like vim's `smartcase`: case is ignored unless the part has an uppercase
         // letter
         let ignore_case = !part.chars().any(char::is_uppercase);
-        let lower = part.to_lowercase();
-        let starts = |name: &&String| match ignore_case {
-            true => name.to_lowercase().starts_with(&lower),
-            false => name.starts_with(&part),
+        let as_matched = |name: &str| match ignore_case {
+            true => name.to_lowercase(),
+            false => name.to_string(),
         };
-        let names = dirs
-            .iter()
-            .filter(starts)
-            .map(|n| format!("{n}/"))
-            .collect();
+        let wanted = as_matched(&part);
+        let matched: Vec<(String, &String)> = dirs.iter().map(|n| (as_matched(n), n)).collect();
+        let names_where = |matches: fn(&str, &str) -> bool| -> Vec<String> {
+            (matched.iter())
+                .filter(|(m, _)| matches(m, &wanted))
+                .map(|(_, n)| format!("{n}/"))
+                .collect()
+        };
+        // the names that start with the part, or if none does, like zsh's fuzzy `r:|?=**`
+        // matcher, those that have its characters in order (`myt` gives `my_tools`)
+        let mut names = names_where(|name, part| name.starts_with(part));
+        if names.is_empty() {
+            names = names_where(has_in_order);
+        }
         Completion {
             dir,
             start,
