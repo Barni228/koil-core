@@ -2,7 +2,7 @@
 
 use crate::apply::Undo;
 use crate::{
-    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, to_id,
+    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, on_disk, to_id,
     with_slashes,
 };
 use serde::{Deserialize, Serialize};
@@ -374,7 +374,7 @@ impl Koil {
                 && changed
                 && *path == intent.path
                 && view.contains(path, intent.is_dir)
-                && path.symlink_metadata().is_ok()
+                && on_disk(path)
             {
                 self.current_listing.insert(index);
             }
@@ -389,7 +389,7 @@ impl Koil {
         let mut conflicts = Vec::new();
         for (&index, intent) in &intents {
             let path = self.ids[index].clone();
-            let exists = walked.contains(&path) || path.symlink_metadata().is_ok();
+            let exists = walked.contains(&path) || on_disk(&path);
             let now = exists.then_some(path);
             let in_listing = self.current_listing.contains(&index);
             // the paths user put it at elsewhere, which follow what moved on disk
@@ -587,7 +587,7 @@ impl Koil {
         let missing: Vec<usize> = (tracked.iter().copied())
             .filter(|&index| {
                 let path = self.ids[index].as_path();
-                !in_view.contains(path) && (listed(index) || path.symlink_metadata().is_err())
+                !in_view.contains(path) && (listed(index) || !on_disk(path))
             })
             .collect();
         // what koil saw when it last read, and the new paths in the view
@@ -621,7 +621,7 @@ impl Koil {
         for &index in missing.iter().filter(|index| !found.contains(index)) {
             let path = &self.ids[index];
             // still there, but out of the view now
-            if path.symlink_metadata().is_ok() {
+            if on_disk(path) {
                 continue;
             }
             let (Some(key), Some(parent)) = (key_of(&index), path.parent()) else {
@@ -646,7 +646,7 @@ impl Koil {
         for _ in 0..self.dirs_seen.len() {
             // from the root down, as the first that is gone takes the rest with it
             let first_gone = (self.dirs_seen.iter().rev())
-                .find(|(dir, _)| dir.symlink_metadata().is_err())
+                .find(|(dir, _)| !on_disk(dir))
                 .cloned();
             let Some((gone, key)) = first_gone else {
                 return;

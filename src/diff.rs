@@ -1,5 +1,4 @@
-use crate::Action;
-use crate::planner;
+use crate::{Action, on_disk, planner};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,7 +55,7 @@ impl Diff {
         {
             for parent in path.ancestors().skip(1) {
                 let exists = parent.as_os_str().is_empty()
-                    || parent.symlink_metadata().is_ok()
+                    || on_disk(parent)
                     || self.without_id.contains_key(parent)
                     // a dir that was renamed or copied to this path
                     || afters.contains(parent);
@@ -71,8 +70,7 @@ impl Diff {
 
     /// Compute actions required to resolve this diff, in the order they can run
     pub fn compute_actions(self) -> Vec<Action> {
-        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
-        planner::plan_actions(&self.actions(), |p| p.symlink_metadata().is_ok())
+        planner::plan_actions(&self.actions(), on_disk)
     }
 
     /// The actions required to resolve this diff, in no particular order, and with rename

@@ -1,5 +1,5 @@
 use crate::trash::{self, Contents, Trashed};
-use crate::{Action, shown};
+use crate::{Action, on_disk, shown};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
@@ -25,7 +25,7 @@ impl Action {
             Action::DeleteFile(n) | Action::DeleteDir(n) => Undo::Restore(trash::trash(n)?),
             Action::Rename(s, d) => {
                 // on case insensitive filesystems `a -> A` sees `A` as taken, but it is `a` itself
-                if taken(d) && !same_file(s, d)? {
+                if on_disk(d) && !same_file(s, d)? {
                     return Err(already_exists(d));
                 }
                 if inside(s, d) {
@@ -175,7 +175,7 @@ impl Simulated {
                 _ => {}
             }
         }
-        Some(path.symlink_metadata().is_ok())
+        Some(on_disk(&path))
     }
 
     /// Something is (or may be) at `path`
@@ -241,7 +241,7 @@ impl fmt::Display for Undo {
 
 /// Copy a file, dir (recursively), or symlink (the link itself) from `src` to `dst`
 fn copy(src: &Path, dst: &Path) -> io::Result<()> {
-    if taken(dst) {
+    if on_disk(dst) {
         return Err(already_exists(dst));
     }
     let file_type = src.symlink_metadata()?.file_type();
@@ -302,11 +302,6 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn same_file(_a: &Path, _b: &Path) -> io::Result<bool> {
     Ok(false)
-}
-
-/// True if something (even a broken symlink) is at `path`
-fn taken(path: &Path) -> bool {
-    path.symlink_metadata().is_ok()
 }
 
 /// True if `dst` is inside `src`, a dir (not a symlink to one), so copying or moving `src` to

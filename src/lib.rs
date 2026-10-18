@@ -1502,10 +1502,7 @@ impl Koil {
         let actions: Vec<Action> = (actions.into_iter().zip(applied))
             .filter_map(|(action, applied)| applied.then_some(action))
             .collect();
-        // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
-        self.run_actions(&planner::plan_actions(&actions, |p| {
-            p.symlink_metadata().is_ok()
-        }))
+        self.run_actions(&planner::plan_actions(&actions, on_disk))
     }
 
     /// What [`Koil::create_now`] would run to create the new file or dir at `path`: its
@@ -1541,7 +1538,7 @@ impl Koil {
         // what was created is not new anymore, even if a later create failed (a missing
         // parent is not in the diff, it is only missing)
         for action in &actions {
-            if action.path().symlink_metadata().is_ok() {
+            if on_disk(action.path()) {
                 self.diff.without_id.remove(action.path());
             }
         }
@@ -2038,9 +2035,9 @@ impl Koil {
         let walk = walker(dir, show_hidden, gitignore)
             .max_depth(Some(1))
             .build();
-        let on_disk = walk.flatten().filter(|item| item.depth() == 1);
-        let on_disk = on_disk.filter(|item| item.path().is_dir());
-        let mut names: BTreeSet<String> = on_disk
+        let dirs = walk.flatten().filter(|item| item.depth() == 1);
+        let dirs = dirs.filter(|item| item.path().is_dir());
+        let mut names: BTreeSet<String> = dirs
             .filter_map(|item| item.file_name().to_str().map(String::from))
             .collect();
         let afters = self.diff.with_id.values().flat_map(|(_, afters)| afters);
@@ -2056,7 +2053,7 @@ impl Koil {
                 continue;
             };
             let path = dir.join(name);
-            let new = path.symlink_metadata().is_err() && self.diff.creates_dir(&path);
+            let new = !on_disk(&path) && self.diff.creates_dir(&path);
             if new && (show_hidden || !name.starts_with('.')) {
                 names.insert(name.to_string());
             }
@@ -2246,7 +2243,7 @@ impl Koil {
             // what the listing shows was on disk when it was read, and is followed by `sync`
             if let Some(index) = index
                 && !self.current_listing.contains(&index)
-                && self.ids[index].symlink_metadata().is_err()
+                && !on_disk(&self.ids[index])
             {
                 let path = &self.ids[index];
                 let path = self.relative(path).unwrap_or_else(|| with_slashes(path));
@@ -2371,7 +2368,7 @@ impl Koil {
     /// [`Koil::diff`], so `path` can not be created there
     /// `index` is the ID of the entry that is written at `path`, if it has one
     fn taken(&self, path: &Path, index: Option<usize>) -> bool {
-        if path.symlink_metadata().is_err() {
+        if !on_disk(path) {
             return false;
         }
         let same = |a: &Path| a == path || same_file(a, path).unwrap_or(false);
@@ -2392,7 +2389,7 @@ impl Koil {
     fn new_names<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a std::ffi::OsStr> {
         path.ancestors()
             .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir)
-            .filter(|p| p.symlink_metadata().is_err())
+            .filter(|p| !on_disk(p))
             .filter_map(Path::file_name)
     }
 
@@ -2407,7 +2404,7 @@ impl Koil {
             .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir);
 
         for parent in parents {
-            if parent.symlink_metadata().is_ok() {
+            if on_disk(parent) {
                 if parent.is_dir() {
                     break;
                 }
@@ -2940,6 +2937,11 @@ pub(crate) fn shown(path: &Path) -> String {
     with_slashes(path).display().to_string()
 }
 
+/// Whether something is at `path`, even a broken link, as a link is not followed
+pub(crate) fn on_disk(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 /// Like [`Path::canonicalize`], but `path` does not need to exist
 /// Existing part of the path is canonicalized, the rest is normalized without touching the filesystem
 /// On Windows, it has no `\\?\` before it (which `canonicalize` adds, and frontends would show),
@@ -2955,7 +2957,7 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
             }
             c => {
                 resolved.push(c);
-                if resolved.symlink_metadata().is_ok() {
+                if on_disk(&resolved) {
                     resolved = dunce::canonicalize(&resolved)?;
                 }
             }

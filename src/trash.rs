@@ -1,6 +1,6 @@
 //! Moving paths to the system trash, and restoring them from it
 
-use crate::shown;
+use crate::{on_disk, shown};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ pub fn trash(path: &Path) -> io::Result<Trashed> {
 
 /// Move `trashed` back to where it was, never overwrites an existing path
 pub fn restore(trashed: &Trashed) -> io::Result<()> {
-    if trashed.original.symlink_metadata().is_ok() {
+    if on_disk(&trashed.original) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("`{}` already exists", shown(&trashed.original)),
@@ -59,6 +59,7 @@ fn not_in_trash(trashed: &Trashed) -> io::Error {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{Trashed, not_in_trash};
+    use crate::on_disk;
     use crate::sync::FileKey;
     use objc2_foundation::{NSFileManager, NSURL};
     use std::path::{Path, PathBuf};
@@ -94,7 +95,7 @@ mod platform {
     fn in_trash(trashed: &Trashed) -> bool {
         match trashed.stamp {
             Some(stamp) => FileKey::at(&trashed.id) == Some(stamp),
-            None => trashed.id.symlink_metadata().is_ok(),
+            None => on_disk(&trashed.id),
         }
     }
 
