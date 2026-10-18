@@ -2,8 +2,7 @@
 
 use crate::apply::Undo;
 use crate::{
-    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, on_disk,
-    rebase, to_id, with_slashes,
+    Entry, Id, Koil, Metadata, Prune, Settings, View, Warning, on_disk, rebase, to_id, with_slashes,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -289,38 +288,11 @@ impl Koil {
 impl Koil {
     /// See [`Koil::sync`], which runs it on a copy, as it is left half done if it fails
     fn sync_with(&mut self, entries: &[Entry]) -> io::Result<Synced> {
-        let mut result = Synced::default();
         self.follow_dir();
         let (old_view, old_listing) = (self.view(), self.current_listing.clone());
-        // gone: its closest parent, as after an apply
-        if !self.is_dir(&self.current_dir) {
-            let dir = (self.current_dir.ancestors())
-                .find(|p| self.is_dir(p))
-                .ok_or(io::Error::from(io::ErrorKind::NotFound))?
-                .to_path_buf();
-            result.warning = Some(Warning::DirNotFound {
-                requested: std::mem::replace(&mut self.current_dir, dir.clone()),
-                opened: dir,
-            });
-            self.pattern = None;
-            result.moved = true;
-        }
-        let paths = loop {
-            match self.read_view(&self.view()) {
-                Ok(paths) => break paths,
-                // as `reopen` does
-                Err(OpenError::OverLimit(error)) => {
-                    result.warning = Some(Warning::OverLimit {
-                        error,
-                        opened: self.current_dir.clone(),
-                    });
-                    self.pattern = None;
-                    result.moved = true;
-                }
-                Err(error) => return Err(io_error(error)),
-            }
-        };
-        let moved = result.moved;
+        let (paths, warning) = self.read_or_fall_back()?;
+        // something else than what was open is open now
+        let moved = warning.is_some();
         let dir = self.current_dir.clone();
 
         // what user wrote in the listing, unless it is of what is not open anymore
@@ -363,7 +335,6 @@ impl Koil {
         // on disk, as the walk just read them
         let walked: HashSet<PathBuf> = paths.iter().map(|(p, _)| p.clone()).collect();
         self.list(paths);
-        self.see_dirs();
         // a changed entry stays, even if it is out of the view now (like one that git ignores
         // now), so it is not taken for deleted in the next update
         let view = self.view();
@@ -520,9 +491,12 @@ impl Koil {
             }
         }
 
-        result.edits = edits;
-        result.conflicts = conflicts;
-        Ok(result)
+        Ok(Synced {
+            edits,
+            conflicts,
+            moved,
+            warning,
+        })
     }
 
     /// What user wants done with `index` (see [`Intent`]), from what they `written` in the

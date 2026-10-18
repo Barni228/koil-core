@@ -1158,7 +1158,9 @@ impl Koil {
         }
         // in a copy, so nothing changes if it fails
         let mut opened = self.clone();
-        opened.open_at(dir, pattern)?;
+        opened.current_dir = dir;
+        opened.pattern = pattern;
+        opened.read_listing()?;
         *self = opened;
         Ok(())
     }
@@ -1825,63 +1827,58 @@ impl Koil {
 
     /// Open [`Koil::location`] again, so it shows what is on disk now
     /// Does nothing if nothing was opened yet
-    /// If the open pattern goes over [`Limits`] now, its base dir is opened instead
+    /// If the open dir is gone, or the open pattern goes over [`Limits`] now, something else is
+    /// opened instead (see [`Koil::read_or_fall_back`])
     fn reopen(&mut self) -> io::Result<Option<Warning>> {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(None);
         }
         // not parsed again, so a pattern stays a glob or a regex, even if the settings changed
-        match self.open_at(self.current_dir.clone(), self.pattern.clone()) {
-            Err(OpenError::OverLimit(error)) => {
-                self.pattern = None;
-                self.read_listing().map_err(io_error)?;
-                Ok(Some(Warning::OverLimit {
-                    error,
-                    opened: self.current_dir.clone(),
-                }))
-            }
-            result => result.map_err(io_error),
-        }
-    }
-
-    /// Open `pattern` (a valid one) inside `base`, or just `base` if there is no pattern
-    /// See [`Koil::open`], which checks that `base` is a dir first, so only when reopening can
-    /// it be gone: then its closest parent that is a dir is opened instead, with a warning
-    fn open_at(
-        &mut self,
-        base: PathBuf,
-        pattern: Option<Pattern>,
-    ) -> Result<Option<Warning>, OpenError> {
-        let dir = base
-            .ancestors()
-            .find(|p| self.is_dir(p))
-            .ok_or(io::Error::from(io::ErrorKind::NotFound))?
-            .to_path_buf();
-        let found = dir == base;
-        let warning = (!found).then(|| Warning::DirNotFound {
-            requested: base,
-            opened: dir.clone(),
-        });
-
-        self.current_dir = dir;
-        // the pattern is relative to its base dir, so it can not be used in another dir
-        self.pattern = pattern.filter(|_| found);
-        self.read_listing()?;
+        let (paths, warning) = self.read_or_fall_back()?;
+        self.list(paths);
         Ok(warning)
     }
 
     /// Read [`Koil::current_listing`] for the open dir or pattern from the filesystem
     fn read_listing(&mut self) -> Result<(), OpenError> {
-        self.current_listing.clear();
         let paths = self.read_view(&self.view())?;
         self.list(paths);
-        self.see_dirs();
         Ok(())
+    }
+
+    /// [`Koil::read_view`] of the open view, but if the open dir is gone (like after an
+    /// apply), its closest parent that is a dir is opened instead, and if the open pattern goes
+    /// over [`Limits`], its base dir is, with a warning that says so
+    /// [`Koil::open`] checks both first, so only reading what is open again can fall back
+    fn read_or_fall_back(&mut self) -> io::Result<(Walked, Option<Warning>)> {
+        let mut warning = None;
+        if !self.is_dir(&self.current_dir) {
+            let dir = (self.current_dir.ancestors())
+                .find(|p| self.is_dir(p))
+                .ok_or(io::Error::from(io::ErrorKind::NotFound))?
+                .to_path_buf();
+            warning = Some(Warning::DirNotFound {
+                requested: std::mem::replace(&mut self.current_dir, dir.clone()),
+                opened: dir,
+            });
+            // the pattern is relative to its base dir, so it can not be used in another dir
+            self.pattern = None;
+        }
+        match self.read_view(&self.view()) {
+            Err(OpenError::OverLimit(error)) => {
+                // a plain dir has no limits
+                self.pattern = None;
+                let paths = self.read_view(&self.view()).map_err(io_error)?;
+                let opened = self.current_dir.clone();
+                Ok((paths, Some(Warning::OverLimit { error, opened })))
+            }
+            result => Ok((result.map_err(io_error)?, warning)),
+        }
     }
 
     /// Every path on disk that `view` shows (see [`Koil::walk`]), with what is there, nothing
     /// if [`Koil::current_dir`] is a new dir that is not created yet
-    fn read_view(&self, view: &View) -> Result<Vec<(PathBuf, Option<Seen>)>, OpenError> {
+    fn read_view(&self, view: &View) -> Result<Walked, OpenError> {
         match self.current_dir.is_dir() {
             true => self.walk(view),
             false => Ok(Vec::new()),
@@ -1889,10 +1886,14 @@ impl Koil {
     }
 
     /// Make `paths` (read by [`Koil::read_view`]) [`Koil::current_listing`], giving new IDs to
-    /// the ones koil has not seen, and remember what is at each
+    /// the ones koil has not seen, and remember what is at each, and what
+    /// [`Koil::current_dir`] and the dirs it is in are (see [`Koil::dirs_seen`])
     /// A changed entry in the view stays too, even if it is hidden, so it is not taken for
     /// deleted in the next update
-    fn list(&mut self, paths: Vec<(PathBuf, Option<Seen>)>) {
+    fn list(&mut self, paths: Walked) {
+        self.dirs_seen = (self.current_dir.ancestors())
+            .filter_map(|dir| Some((dir.to_path_buf(), FileKey::at(dir)?)))
+            .collect();
         self.current_listing.clear();
         // a pattern can show thousands of paths, so they are not searched for in `ids` one by one
         let found: Vec<(Option<usize>, PathBuf, Option<Seen>)> = {
@@ -1923,20 +1924,12 @@ impl Koil {
         }
     }
 
-    /// Remember what [`Koil::current_dir`] and the dirs it is in are on disk (see
-    /// [`Koil::dirs_seen`])
-    fn see_dirs(&mut self) {
-        self.dirs_seen = (self.current_dir.ancestors())
-            .filter_map(|dir| Some((dir.to_path_buf(), FileKey::at(dir)?)))
-            .collect();
-    }
-
     /// Every path on disk that `view` shows, without hidden entries if they are not shown,
     /// and without ignored paths if [`Settings::respect_gitignore`] is on, and what is at each
     /// (`None` if it can not be read)
     /// Fails if [`Koil::current_dir`] can not be read, but dirs inside it that can not be read
     /// are skipped, or if a pattern goes over [`Limits`]
-    fn walk(&self, view: &View) -> Result<Vec<(PathBuf, Option<Seen>)>, OpenError> {
+    fn walk(&self, view: &View) -> Result<Walked, OpenError> {
         fs::read_dir(&self.current_dir)?;
         let max_depth = match &self.pattern {
             None => Some(1),
@@ -2405,6 +2398,10 @@ impl Koil {
         Ok(())
     }
 }
+
+/// Paths read from disk, with what is at each (`None` if it can not be read), see
+/// [`Koil::walk`]
+type Walked = Vec<(PathBuf, Option<Seen>)>;
 
 /// Which paths a listing shows
 #[derive(Clone)]
