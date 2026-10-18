@@ -997,6 +997,11 @@ fn test_glob_patterns() {
         vec![PathBuf::from("file"), "file2".into()],
         glob_names("{file,file2}")
     );
+    // an empty option, as a shell expands it
+    assert_eq!(
+        vec![PathBuf::from("file"), "file2".into()],
+        glob_names("file{,2}")
+    );
     assert_eq!(vec![PathBuf::from("file2")], glob_names("file?"));
     assert_eq!(Vec::<PathBuf>::new(), glob_names("*.rs"));
     // `\` escapes, also on Windows, where only `/` splits a pattern
@@ -1345,8 +1350,86 @@ fn test_glob_invalid() {
             "{glob} should be invalid"
         );
     }
+    // globset reads `[[:digit:]]` as a class of `[:digt` and a `]`, so it is an error
+    for (glob, class) in [("[[:digit:]]*", "digit"), ("[![:alpha:]_]x", "alpha")] {
+        assert!(
+            matches!(
+                koil.open(glob),
+                Err(OpenError::InvalidGlob { source: GlobError::PosixClass(c), .. }) if c == class
+            ),
+            "{glob} should be invalid"
+        );
+    }
+    let error = koil.open("[[:digit:]]").unwrap_err();
+    let source = std::error::Error::source(&error).unwrap().to_string();
+    assert!(source.contains("`[0-9]`"), "{source}");
+    // but not quoted, or a name that is not a class's
+    assert!(koil.clone().open(r#""[[:digit:]]"*"#).is_ok());
+    assert!(koil.clone().open("[[:made:]]").is_ok());
     // nothing changed
     assert_eq!(test_dir_listing(&koil), koil.listing());
+}
+
+/// A temp dir with hidden entries: `.env`, `.envrc`, `a.rs`, `.config/` (with `x` and
+/// `.y`), `src/` (with `.env`, `main.rs` and `.hide/z.rs`) and `.git/` (with `x.rs` and
+/// `.env`)
+fn hidden_temp_dir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let files = [
+        ".env",
+        ".envrc",
+        "a.rs",
+        ".config/x",
+        ".config/.y",
+        "src/.env",
+        "src/main.rs",
+        "src/.hide/z.rs",
+        ".git/x.rs",
+        ".git/.env",
+    ];
+    for file in files {
+        let path = temp.path().join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    temp
+}
+
+#[test]
+fn test_glob_dotfiles() {
+    let temp = hidden_temp_dir();
+    let listed = |settings: Settings, glob: &str| names(&temp_koil(&temp, settings, glob));
+    let hidden_off = |glob| listed(Settings::default(), glob);
+    // as in a shell, a wildcard never matches a hidden name
+    assert_eq!(vec!["a.rs"], hidden_off("*"));
+    assert_eq!(vec!["a.rs", "src/main.rs"], hidden_off("**/*.rs"));
+    assert_eq!(Vec::<String>::new(), hidden_off("*/.y"));
+    // but a part that starts with a `.` does
+    assert_eq!(vec![".env", ".envrc"], hidden_off(".*"));
+    assert_eq!(vec![".config/", ".git/"], hidden_off(".*/"));
+    assert_eq!(vec![".env", ".envrc"], hidden_off(".env{,rc}"));
+    assert_eq!(vec![".env", ".envrc"], hidden_off("{.env,.envrc}"));
+    assert_eq!(vec![".hide/z.rs"], hidden_off("src/.*/*.rs"));
+    // only where it is: `**` does not go through hidden dirs (nor into `.git`)
+    assert_eq!(vec![".env", "src/.env"], hidden_off("**/.env"));
+    assert_eq!(vec!["src/.env"], hidden_off("*/.env"));
+    assert_eq!(
+        vec![".config/", ".git/", ".config/x", ".git/x.rs"],
+        hidden_off(".*/*")
+    );
+    // and with hidden entries shown, a wildcard matches them too
+    let show_hidden = Settings {
+        show_hidden: true,
+        ..Settings::default()
+    };
+    assert_eq!(
+        vec![".env", ".envrc", "a.rs"],
+        listed(show_hidden.clone(), "*")
+    );
+    assert_eq!(
+        vec![".env", ".git/.env", "src/.env"],
+        listed(show_hidden, "**/.env")
+    );
 }
 
 #[test]

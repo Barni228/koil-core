@@ -84,13 +84,19 @@ temporary name.
   dir at once. Names are shown relative to the base dir. Dirs that nothing inside can match
   are never searched, and a pattern that matches or has to search too much (`Limits`) stops
   early, instead of reading every path.
+- **Globs match dirs with their `/`.** A dir is matched as it is listed, with a `/` after
+  it, so unlike in a shell, `*` matches only files, `*/` only dirs, and `{*,*/}` both. As
+  in a shell, a wildcard never matches a hidden name, but a part that starts with a `.`
+  does (`.*`, `**/.env`), even while hidden entries are hidden, and `**` does not go
+  through hidden dirs. An option in braces can be empty (`.env{,rc}`). POSIX classes like
+  `[[:digit:]]` are not supported, and are an error rather than something else.
 - **Paths as a shell reads them.** A path can be quoted (`"my dir"`, `'my dir'`) or escaped
   (`my\ dir`, except on Windows, where `\` is a separator), like one copied from a terminal.
   What is quoted is never special in a pattern, so `"[draft]"*.md` is every file starting
   with `[draft]`.
 - **Hidden and ignored files.** Hidden entries and entries ignored by git can be hidden or
   shown (`Settings`). A hidden entry is still shown while it has pending changes, so a
-  change is never lost.
+  change is never lost, and a glob shows the ones it names with a `.` (see above).
 - **Sorting.** The listing can be sorted by name, by name as people sort it (`a2` before
   `a10`), by extension, size, size on disk (`disk_size`), or when entries were modified,
   created or accessed, either way round (`Settings::sort`). Dirs stay first. `metadata` gives what it is sorted by, for

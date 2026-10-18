@@ -11,6 +11,7 @@ use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf, is_separator};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -414,22 +415,18 @@ impl Pattern {
     fn matcher(&self) -> Result<Matcher, OpenError> {
         match self {
             Pattern::Glob(glob) => {
-                // globset reads `**/` as `**`, so a trailing `/` is matched apart
-                let (rest, slash) = match glob.strip_suffix('/') {
-                    Some(rest) => (rest, true),
-                    None => (glob.as_str(), false),
+                let invalid = |source| OpenError::InvalidGlob {
+                    glob: glob.clone(),
+                    source,
                 };
-                GlobBuilder::new(rest)
-                    .literal_separator(true)
-                    // globset's default is off on Windows, where `\` is a separator, but
-                    // patterns use only `/`
-                    .backslash_escape(true)
+                if let Some(name) = posix_class(glob) {
+                    return Err(invalid(GlobError::PosixClass(name)));
+                }
+                let (rest, slash) = split_slash(glob);
+                glob_builder(rest)
                     .build()
                     .map(|g| Matcher::Glob(g.compile_matcher(), slash))
-                    .map_err(|source| OpenError::InvalidGlob {
-                        glob: glob.clone(),
-                        source,
-                    })
+                    .map_err(|source| invalid(source.into()))
             }
             Pattern::Regex(regex) => {
                 let invalid = |source| OpenError::InvalidRegex {
@@ -879,7 +876,7 @@ pub enum OpenError {
     InvalidGlob {
         glob: String,
         #[source]
-        source: globset::Error,
+        source: GlobError,
     },
 
     #[error("`{regex}` is not a valid regex")]
@@ -891,6 +888,36 @@ pub enum OpenError {
 
     #[error(transparent)]
     OverLimit(#[from] OverLimit),
+}
+
+/// Why a glob is not valid, see [`OpenError::InvalidGlob`]
+#[derive(Debug, thiserror::Error)]
+pub enum GlobError {
+    #[error(transparent)]
+    Syntax(#[from] globset::Error),
+
+    /// The name of a POSIX class, like `digit` in `[[:digit:]]`, which globset does not
+    /// support: it reads it as a class of `[:digt` and a `]`
+    #[error("{}", posix_message(.0))]
+    PosixClass(String),
+}
+
+/// What [`GlobError::PosixClass`] says for the class `name`
+fn posix_message(name: &str) -> String {
+    let range = match name {
+        "digit" => "0-9",
+        "alpha" => "a-zA-Z",
+        "alnum" => "a-zA-Z0-9",
+        "upper" => "A-Z",
+        "lower" => "a-z",
+        "xdigit" => "0-9a-fA-F",
+        _ => {
+            return format!(
+                "POSIX classes are not supported, write the characters of `[[:{name}:]]` instead"
+            );
+        }
+    };
+    format!("POSIX classes are not supported, write `[{range}]` instead of `[[:{name}:]]`")
 }
 
 /// Why [`Koil::update_and_open`] failed, nothing was changed
@@ -1989,11 +2016,17 @@ impl Koil {
             Some(_) => None,
         };
         let (hidden, gitignore) = (self.settings.show_hidden, self.settings.respect_gitignore);
-        let walk = walker(&self.current_dir, hidden, gitignore)
+        // a glob with a part that starts with a `.` shows the hidden entries that part matches
+        let dots = match &self.pattern {
+            Some(Pattern::Glob(glob)) if !hidden => Dots::new(glob),
+            _ => None,
+        };
+        let walk = walker(&self.current_dir, hidden || dots.is_some(), gitignore)
             .max_depth(max_depth)
             .build_parallel();
 
         let prune = Prune::new(view);
+        let base = self.current_dir.as_path();
         let (pattern, limits, settings) = (self.pattern.as_ref(), self.limits, &self.settings);
         let paths = Mutex::new(Vec::new());
         let (searched, matched) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -2009,10 +2042,18 @@ impl Koil {
                     return WalkState::Continue;
                 }
                 let is_dir = item.file_type().is_some_and(|t| t.is_dir());
-                let skip_inside =
-                    is_dir && prune.as_ref().is_some_and(|p| p.skips_inside(item.path()));
+                // with `dots`, the walk has the hidden entries too, and they say which to take
+                let (dots_show, dots_enter) = match &dots {
+                    Some(dots) => dots.walks(&item, base, is_dir),
+                    None => (true, true),
+                };
+                if !dots_show && !dots_enter {
+                    return WalkState::Skip;
+                }
+                let skip_inside = is_dir
+                    && (!dots_enter || prune.as_ref().is_some_and(|p| p.skips_inside(item.path())));
                 let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
-                let matches = match view.contains(item.path(), is_dir) {
+                let matches = match dots_show && view.contains(item.path(), is_dir) {
                     true => {
                         // here, on the walk's threads, as it reads the disk again (and a dir's
                         // entries, when sorting by size)
@@ -2509,6 +2550,292 @@ fn match_text(path: &Path, is_dir: bool) -> String {
         text.push('/');
     }
     text
+}
+
+/// `glob` without its trailing `/`, and whether it had one, which makes it match only dirs:
+/// globset reads `**/` as `**`, so a trailing `/` is matched apart
+fn split_slash(glob: &str) -> (&str, bool) {
+    match glob.strip_suffix('/') {
+        Some(rest) => (rest, true),
+        None => (glob, false),
+    }
+}
+
+/// A builder of `glob` as koil reads globs
+fn glob_builder(glob: &str) -> GlobBuilder<'_> {
+    let mut builder = GlobBuilder::new(glob);
+    builder
+        .literal_separator(true)
+        // globset's default is off on Windows, where `\` is a separator, but patterns use
+        // only `/`
+        .backslash_escape(true)
+        // `a{,.txt}` is `a` or `a.txt`, as a shell expands it
+        .empty_alternates(true);
+    builder
+}
+
+/// A piece of a glob, as globset reads it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobPiece<'a> {
+    /// A `[...]` class, with its brackets (a `\` in it is a plain character)
+    Class(&'a str),
+    /// `\` and the character it escapes
+    Escaped(&'a str),
+    /// `{`
+    Open,
+    /// `,`, which is a plain character outside `{...}`
+    Comma,
+    /// `}`
+    Close,
+    /// `/`
+    Slash,
+    /// Any other character
+    Char(&'a str),
+}
+
+impl GlobPiece<'_> {
+    fn text(&self) -> &str {
+        match self {
+            GlobPiece::Class(text) | GlobPiece::Escaped(text) | GlobPiece::Char(text) => text,
+            GlobPiece::Open => "{",
+            GlobPiece::Comma => ",",
+            GlobPiece::Close => "}",
+            GlobPiece::Slash => "/",
+        }
+    }
+}
+
+/// The pieces of `glob`, `None` if a class is never closed (which globset rejects)
+fn glob_pieces(glob: &str) -> Option<Vec<GlobPiece<'_>>> {
+    let mut pieces = Vec::new();
+    let mut chars = glob.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' => {
+                // `!` or `^` negates it, and a `]` first is in it
+                chars.next_if(|&(_, c)| c == '!' || c == '^');
+                chars.next_if(|&(_, c)| c == ']');
+                chars.find(|&(_, c)| c == ']')?;
+            }
+            _ => {}
+        }
+        let end = chars.peek().map_or(glob.len(), |&(i, _)| i);
+        let text = &glob[start..end];
+        pieces.push(match c {
+            '\\' => GlobPiece::Escaped(text),
+            '[' => GlobPiece::Class(text),
+            '{' => GlobPiece::Open,
+            ',' => GlobPiece::Comma,
+            '}' => GlobPiece::Close,
+            '/' => GlobPiece::Slash,
+            _ => GlobPiece::Char(text),
+        });
+    }
+    Some(pieces)
+}
+
+/// The name of the first POSIX class in `glob`, like `digit` in `[[:digit:]]`, see
+/// [`GlobError::PosixClass`]
+fn posix_class(glob: &str) -> Option<String> {
+    const NAMES: [&str; 12] = [
+        "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+        "upper", "xdigit",
+    ];
+    glob_pieces(glob)?.into_iter().find_map(|piece| {
+        let GlobPiece::Class(class) = piece else {
+            return None;
+        };
+        // globset ends the class at the `]` of its `:]`
+        let inside = class.strip_suffix(":]")?;
+        let name = &inside[inside.rfind("[:")? + 2..];
+        NAMES.contains(&name).then(|| name.to_string())
+    })
+}
+
+/// The most globs [`expand_braces`] makes, a glob with more does not show hidden entries
+/// (see [`Dots`])
+const MAX_EXPANDED: usize = 64;
+
+/// The globs that the `{...}` in `pieces` stand for, as a shell expands them, each without
+/// braces, `None` if they are more than [`MAX_EXPANDED`], or a brace is not closed
+/// It reads from `at`, up to the `,` or `}` that ends it, if it is inside braces (not `top`)
+fn expand_braces<'a>(
+    pieces: &[GlobPiece<'a>],
+    at: &mut usize,
+    top: bool,
+) -> Option<Vec<Vec<GlobPiece<'a>>>> {
+    let mut globs = vec![Vec::new()];
+    while let Some(&piece) = pieces.get(*at) {
+        let options = match piece {
+            GlobPiece::Comma | GlobPiece::Close if !top => return Some(globs),
+            GlobPiece::Open => {
+                *at += 1;
+                let mut options = Vec::new();
+                loop {
+                    options.extend(expand_braces(pieces, at, false)?);
+                    let end = *pieces.get(*at)?;
+                    *at += 1;
+                    if end == GlobPiece::Close {
+                        break options;
+                    }
+                }
+            }
+            piece => {
+                *at += 1;
+                vec![vec![piece]]
+            }
+        };
+        if globs.len() * options.len() > MAX_EXPANDED {
+            return None;
+        }
+        globs = (globs.iter())
+            .flat_map(|glob| {
+                options
+                    .iter()
+                    .map(move |option| [glob.as_slice(), option].concat())
+            })
+            .collect();
+    }
+    Some(globs)
+}
+
+/// Which hidden entries (names starting with `.`) a glob shows while they are not shown (see
+/// [`Settings::show_hidden`]): as in a shell, a hidden name is matched only by a part of the
+/// glob that starts with a `.` itself, never by a wildcard (`.*`, `.config/*`, `**/.env`),
+/// and `**` does not go through hidden dirs
+/// A walk of the glob then has the hidden entries too (see [`Koil::walk`]), and this says
+/// which to take
+struct Dots {
+    /// The parts of each glob its `{...}` stand for (see [`expand_braces`])
+    globs: Vec<Vec<DotPart>>,
+    /// Whether the glob ends with a `/`, so it matches only dirs (see [`split_slash`])
+    slash: bool,
+}
+
+/// A part of a glob between `/`
+enum DotPart {
+    /// `**`, any number of dirs that are not hidden
+    Dirs,
+    /// One name, and whether the part starts with a `.`, so it can match a hidden one
+    Name(GlobMatcher, bool),
+}
+
+impl Dots {
+    /// `None` if no part of `glob` starts with a `.`, so it shows no hidden entries, or if it
+    /// is not read here: its `{...}` stand for over [`MAX_EXPANDED`] globs, or a class has a
+    /// `/` in it
+    fn new(glob: &str) -> Option<Dots> {
+        let (rest, slash) = split_slash(glob);
+        let pieces = glob_pieces(rest)?;
+        let globs: Vec<Vec<DotPart>> = (expand_braces(&pieces, &mut 0, true)?.iter())
+            .map(|pieces| Dots::parts(pieces))
+            .collect::<Option<_>>()?;
+        let has_dot = (globs.iter().flatten()).any(|part| matches!(part, DotPart::Name(_, true)));
+        has_dot.then_some(Dots { globs, slash })
+    }
+
+    /// The parts of a glob without braces, `None` if a class has a `/` in it
+    fn parts(pieces: &[GlobPiece]) -> Option<Vec<DotPart>> {
+        let mut parts = vec![String::new()];
+        for piece in pieces {
+            match piece {
+                // an escaped `/` still only matches a `/`
+                GlobPiece::Slash | GlobPiece::Escaped("\\/") => parts.push(String::new()),
+                GlobPiece::Class(class) if class.contains('/') => return None,
+                piece => parts.last_mut().unwrap().push_str(piece.text()),
+            }
+        }
+        (parts.iter())
+            .map(|part| match part.as_str() {
+                "**" => Some(DotPart::Dirs),
+                part => {
+                    let glob = glob_builder(part).build().ok()?.compile_matcher();
+                    Some(DotPart::Name(
+                        glob,
+                        part.starts_with('.') || part.starts_with("\\."),
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// Whether a walk that has hidden entries (see [`walker`]) takes `item`, in the base dir
+    /// `base`: shows it, and goes inside it if it is a dir (as a walk without them does for an
+    /// entry that is not hidden, nor in a hidden dir)
+    fn walks(&self, item: &ignore::DirEntry, base: &Path, is_dir: bool) -> (bool, bool) {
+        let hidden = |name: &OsStr| name.as_encoded_bytes().starts_with(b".");
+        // a name can not start with a `.` that this hides
+        if !hidden(item.file_name()) && hidden_attribute(item) {
+            return (false, false);
+        }
+        let path = item.path().strip_prefix(base).unwrap_or(item.path());
+        if !path.components().any(|c| hidden(c.as_os_str())) {
+            return (true, true);
+        }
+        let mut names: Vec<_> = (path.components())
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        let enters = is_dir
+            && (self.globs.iter())
+                .any(|parts| Dots::states(parts, &names)[..parts.len()].contains(&true));
+        // as for [`match_text`], a dir has a `/` after it, which a `*` matches with nothing
+        if is_dir && !self.slash {
+            names.push("".into());
+        }
+        let shows = (is_dir || !self.slash)
+            && (self.globs.iter()).any(|parts| Dots::states(parts, &names)[parts.len()]);
+        (shows, enters)
+    }
+
+    /// Which of `parts` can come next after `names` (`parts.len()` if they all matched)
+    fn states(parts: &[DotPart], names: &[impl AsRef<str>]) -> Vec<bool> {
+        // a `**` can match no dirs, so the part after it can come next too
+        let past_dirs = |states: &mut Vec<bool>| {
+            for (i, part) in parts.iter().enumerate() {
+                if states[i] && matches!(part, DotPart::Dirs) {
+                    states[i + 1] = true;
+                }
+            }
+        };
+        let mut states = vec![false; parts.len() + 1];
+        states[0] = true;
+        past_dirs(&mut states);
+        for name in names {
+            let name = name.as_ref();
+            let hidden = name.starts_with('.');
+            let mut next = vec![false; parts.len() + 1];
+            for (i, part) in parts.iter().enumerate().filter(|&(i, _)| states[i]) {
+                match part {
+                    DotPart::Dirs if !hidden => next[i] = true,
+                    DotPart::Name(glob, dot) if (*dot || !hidden) && glob.is_match(name) => {
+                        next[i + 1] = true;
+                    }
+                    _ => {}
+                }
+            }
+            past_dirs(&mut next);
+            states = next;
+        }
+        states
+    }
+}
+
+/// Whether Windows hides `item` by its attributes, as [`walker`] does without hidden entries
+#[cfg(windows)]
+fn hidden_attribute(item: &ignore::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    /// `FILE_ATTRIBUTE_HIDDEN`
+    const HIDDEN: u32 = 0x2;
+    (item.metadata()).is_ok_and(|m| m.file_attributes() & HIDDEN != 0)
+}
+
+/// Whether Windows hides `item` by its attributes, never elsewhere
+#[cfg(not(windows))]
+fn hidden_attribute(_item: &ignore::DirEntry) -> bool {
+    false
 }
 
 /// Which dirs a walk of a pattern does not need to enter, since nothing inside them can match
