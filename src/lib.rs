@@ -2942,6 +2942,16 @@ pub(crate) fn on_disk(path: &Path) -> bool {
     path.symlink_metadata().is_ok()
 }
 
+/// `path` with its start `from` replaced by `to`, `None` if it is neither `from` nor inside it
+pub(crate) fn rebase(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    // `join` with nothing would add a separator at the end
+    Some(match rest.as_os_str().is_empty() {
+        true => to.to_path_buf(),
+        false => to.join(rest),
+    })
+}
+
 /// Like [`Path::canonicalize`], but `path` does not need to exist
 /// Existing part of the path is canonicalized, the rest is normalized without touching the filesystem
 /// On Windows, it has no `\\?\` before it (which `canonicalize` adds, and frontends would show),

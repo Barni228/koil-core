@@ -1,5 +1,5 @@
 use crate::trash::{self, Contents, Trashed};
-use crate::{Action, on_disk, shown};
+use crate::{Action, on_disk, rebase, shown};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
@@ -94,6 +94,15 @@ impl Undo {
             Undo::Rename(s, d) => vec![s, d],
         }
     }
+
+    /// [`Undo::paths`], to change them
+    pub(crate) fn paths_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            Undo::Trash(p) => vec![p],
+            Undo::Restore(t) => vec![&mut t.original],
+            Undo::Rename(s, d) => vec![s, d],
+        }
+    }
 }
 
 /// Why an [`Undo`] step can not run now (see [`check`])
@@ -161,11 +170,8 @@ impl Simulated {
             match done {
                 Done::Gone(p) if path.starts_with(p) => return Some(false),
                 Done::Moved(from, to) => {
-                    if let Ok(rest) = path.strip_prefix(to) {
-                        path = match rest.as_os_str().is_empty() {
-                            true => from.clone(),
-                            false => from.join(rest),
-                        };
+                    if let Some(back) = rebase(&path, to, from) {
+                        path = back;
                     } else if path.starts_with(from) {
                         return Some(false);
                     }

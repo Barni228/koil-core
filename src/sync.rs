@@ -2,8 +2,8 @@
 
 use crate::apply::Undo;
 use crate::{
-    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, on_disk, to_id,
-    with_slashes,
+    Entry, Id, Koil, Metadata, OpenError, Prune, Settings, View, Warning, io_error, on_disk,
+    rebase, to_id, with_slashes,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -668,15 +668,8 @@ impl Koil {
     /// be inside it, so they are not all looked at (a thousand files renamed at once took a
     /// second)
     fn repoint(&mut self, from: &Path, to: &Path, index: Option<usize>) {
-        let moved = |path: &Path| -> Option<PathBuf> {
-            let rest = path.strip_prefix(from).ok()?;
-            Some(match rest.as_os_str().is_empty() {
-                true => to.to_path_buf(),
-                false => to.join(rest),
-            })
-        };
         let follow = |path: &mut PathBuf| {
-            if let Some(new) = moved(path) {
+            if let Some(new) = rebase(path, from, to) {
                 *path = new;
             }
         };
@@ -688,7 +681,7 @@ impl Koil {
                     .cloned()
                     .collect();
                 for path in &mut self.ids {
-                    if let Some(new) = moved(path)
+                    if let Some(new) = rebase(path, from, to)
                         && !taken.contains(&new)
                     {
                         *path = new;
@@ -712,16 +705,8 @@ impl Koil {
         for applied in &mut self.undo {
             follow(&mut applied.dir);
         }
-        for step in self.undo.iter_mut().flat_map(|applied| &mut applied.steps) {
-            match step {
-                Undo::Trash(path) => follow(path),
-                Undo::Restore(trashed) => follow(&mut trashed.original),
-                Undo::Rename(a, b) => {
-                    follow(a);
-                    follow(b);
-                }
-            }
-        }
+        let steps = self.undo.iter_mut().flat_map(|applied| &mut applied.steps);
+        steps.flat_map(Undo::paths_mut).for_each(follow);
     }
 
     /// Resolve a [`ConflictKind::Renamed`]: it stays where it is on disk (`to`), and the rest
