@@ -20,9 +20,9 @@ use std::{fmt, fs, io};
 use typed_builder::TypedBuilder;
 
 pub mod apply;
-pub mod diff;
+mod diff;
 mod names;
-pub mod planner;
+mod planner;
 mod sync;
 pub mod trash;
 
