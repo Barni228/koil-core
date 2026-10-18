@@ -4,7 +4,7 @@ use diff::Diff;
 #[test]
 fn test_diff_delete() {
     let mut diff = Diff::default();
-    diff.add_before(0, "poppy".into());
+    diff.set_before(0, "poppy".into());
     assert_eq!(vec![delete("poppy")], diff.compute_actions())
 }
 
@@ -18,7 +18,7 @@ fn test_diff_add() {
 #[test]
 fn test_diff_move() {
     let mut diff = Diff::default();
-    diff.add_before(0, "before".into());
+    diff.set_before(0, "before".into());
     diff.push_after(0, "src/before".into());
     assert_eq!(vec![rename("before", "src/before")], diff.compute_actions())
 }
@@ -26,7 +26,7 @@ fn test_diff_move() {
 #[test]
 fn test_diff_copy() {
     let mut diff = Diff::default();
-    diff.add_before(0, "file".into());
+    diff.set_before(0, "file".into());
     diff.push_after(0, "file".into());
     diff.push_after(0, "file2".into());
     assert_eq!(vec![copy("file", "file2")], diff.compute_actions())
@@ -35,7 +35,7 @@ fn test_diff_copy() {
 #[test]
 fn test_diff_rename_and_copy() {
     let mut diff = Diff::default();
-    diff.add_before(0, "A".into());
+    diff.set_before(0, "A".into());
     diff.push_after(0, "B".into());
     diff.push_after(0, "C".into());
     assert_eq!(
@@ -47,7 +47,7 @@ fn test_diff_rename_and_copy() {
 #[test]
 fn test_diff_push_after_twice() {
     let mut diff = Diff::default();
-    diff.add_before(0, "A".into());
+    diff.set_before(0, "A".into());
     diff.push_after(0, "B".into());
     diff.push_after(0, "B".into());
     assert_eq!(vec![rename("A", "B")], diff.compute_actions())
@@ -59,7 +59,7 @@ fn test_diff_creates_dir() {
     diff.without_id.insert("new".into(), true);
     diff.without_id.insert("file".into(), false);
     diff.without_id.insert("a/b/c".into(), false);
-    diff.add_before(0, "A".into());
+    diff.set_before(0, "A".into());
     diff.push_after(0, "moved/A".into());
 
     // created as a dir

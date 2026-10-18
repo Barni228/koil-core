@@ -691,7 +691,6 @@ impl Action {
             Action::DeleteFile(n) | Action::DeleteDir(n) => Some(n),
             Action::Rename(s, _) | Action::Copy(s, _) => Some(s),
             Action::CreateFile(n) | Action::CreateDir(n) => n.parent(),
-            // Action::CreateFile(_) | Action::CreateDir(_) => None,
         }
     }
 
@@ -2277,7 +2276,7 @@ impl Koil {
         // if something existed before, but does not exist now, tell the diff that it used to exist
         for &index in &self.current_listing {
             if !with_id.contains_key(&index) {
-                self.diff.add_before_from(index, &self.ids);
+                self.diff.set_before(index, self.ids[index].clone());
             }
         }
 
@@ -2305,16 +2304,14 @@ impl Koil {
 
             // If this ID came from current listing, just update before and after
             if self.current_listing.contains(&index) {
-                self.diff.add_before_from(index, &self.ids);
+                self.diff.set_before(index, self.ids[index].clone());
 
-            // If this ID did NOT come from current listing (came from another folder) AND
-            // If we are the first ppl to know about this ID being involved in some actions
+            // If this ID came from another folder, and no change was made to it there yet
             } else if !self.diff.with_id.contains_key(&index) {
-                // tell diff_before about this ID
-                self.diff.add_before_from(index, &self.ids);
+                self.diff.set_before(index, self.ids[index].clone());
 
-                // tell diff_after that this ID still exists in the place where it came from
-                // (since if it didn't exist there, then that folder would already add it to diff_before)
+                // it still exists where it came from (if it did not, that folder's listing
+                // would have changed it already)
                 self.diff.push_after(index, self.ids[index].to_path_buf());
             }
 

@@ -464,7 +464,7 @@ impl Koil {
                 Some(now) => {
                     // the next update renames it from where it is now, not copies it
                     if !in_listing {
-                        self.diff.with_id.entry(index).or_default().0 = now.clone();
+                        self.diff.set_before(index, now.clone());
                     }
                     conflicts.push(conflict(ConflictKind::Renamed, Some(now)));
                 }

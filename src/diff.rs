@@ -12,15 +12,9 @@ pub struct Diff {
 }
 
 impl Diff {
-    /// Add a before value for this index
-    pub fn add_before(&mut self, index: usize, before_path: PathBuf) {
+    /// Set the path this index had before, keeping its afters
+    pub fn set_before(&mut self, index: usize, before_path: PathBuf) {
         self.with_id.entry(index).or_default().0 = before_path;
-    }
-
-    /// Add a before value for this index
-    /// Basically `add_before(index, paths[index])`
-    pub fn add_before_from(&mut self, index: usize, paths: &[PathBuf]) {
-        self.add_before(index, paths[index].clone());
     }
 
     /// Add an after value for this index, if it is not there already
@@ -109,7 +103,7 @@ impl Diff {
                 after.swap_remove(i);
             // if the original name no longer exists, then there was a rename
             } else {
-                // TODO: make the logic of detecting to who we renamed smarter
+                // the last one, which `sync` relies on (see `keep_on_disk`)
                 let renamed_to = after.pop().unwrap();
                 actions.push(Action::Rename(before.clone(), renamed_to));
             }
