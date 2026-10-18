@@ -246,9 +246,7 @@ impl Metadata {
     /// sort by that
     fn new(path: &Path, meta: &fs::Metadata, settings: &Settings) -> Metadata {
         let is_dir = meta.is_dir() || meta.file_type().is_symlink() && path.is_dir();
-        let shown = |name: &std::ffi::OsStr| {
-            settings.show_hidden || !name.as_encoded_bytes().starts_with(b".")
-        };
+        let shown = |name: &OsStr| settings.show_hidden || !is_hidden(name);
         let by = settings.sort.by;
         let entries = (is_dir && matches!(by, SortBy::Size | SortBy::Disk))
             .then(|| fs::read_dir(path).ok())
@@ -2045,7 +2043,7 @@ impl Koil {
             };
             let path = dir.join(name);
             let new = !on_disk(&path) && self.diff.creates_dir(&path);
-            if new && (show_hidden || !name.starts_with('.')) {
+            if new && (show_hidden || !is_hidden(name)) {
                 names.insert(name.to_string());
             }
         }
@@ -2197,7 +2195,8 @@ impl Koil {
 
     /// Fail if there are changes that are not applied yet
     fn check_nothing_pending(&self) -> Result<(), KoilError> {
-        if self.compute_actions().is_empty() {
+        // planning only puts them in order
+        if self.diff.clone().actions().is_empty() {
             Ok(())
         } else {
             Err(KoilError::PendingChanges)
@@ -2697,13 +2696,12 @@ impl Dots {
     /// `base`: shows it, and goes inside it if it is a dir (as a walk without them does for an
     /// entry that is not hidden, nor in a hidden dir)
     fn walks(&self, item: &ignore::DirEntry, base: &Path, is_dir: bool) -> (bool, bool) {
-        let hidden = |name: &OsStr| name.as_encoded_bytes().starts_with(b".");
         // a name can not start with a `.` that this hides
-        if !hidden(item.file_name()) && hidden_attribute(item) {
+        if !is_hidden(item.file_name()) && hidden_attribute(item) {
             return (false, false);
         }
         let path = item.path().strip_prefix(base).unwrap_or(item.path());
-        if !path.components().any(|c| hidden(c.as_os_str())) {
+        if !path.components().any(is_hidden) {
             return (true, true);
         }
         let mut names: Vec<_> = (path.components())
@@ -2736,7 +2734,7 @@ impl Dots {
         past_dirs(&mut states);
         for name in names {
             let name = name.as_ref();
-            let hidden = name.starts_with('.');
+            let hidden = is_hidden(name);
             let mut next = vec![false; parts.len() + 1];
             for (i, part) in parts.iter().enumerate().filter(|&(i, _)| states[i]) {
                 match part {
@@ -2924,6 +2922,11 @@ pub fn with_slashes(path: &Path) -> PathBuf {
 /// `path` as koil's messages show it, see [`with_slashes`]
 pub(crate) fn shown(path: &Path) -> String {
     with_slashes(path).display().to_string()
+}
+
+/// Whether `name` is hidden, as it starts with a `.`
+fn is_hidden(name: impl AsRef<OsStr>) -> bool {
+    name.as_ref().as_encoded_bytes().starts_with(b".")
 }
 
 /// Whether something is at `path`, even a broken link, as a link is not followed
