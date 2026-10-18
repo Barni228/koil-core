@@ -1507,25 +1507,13 @@ impl Koil {
     /// what was not picked (create the new dir it goes into)
     pub fn apply_only(&mut self, picked: &[Action]) -> Result<Report, KoilError> {
         let picked: HashSet<&Action> = picked.iter().collect();
-        let changes = self.changes();
-        let mut applied: Vec<bool> = changes.iter().map(|c| picked.contains(&c.action)).collect();
-        let mut needed_by = vec![Vec::new(); changes.len()];
-        for (i, change) in changes.iter().enumerate() {
-            for &j in &change.needs {
-                needed_by[j].push(i);
-            }
-        }
-        let mut left_out: Vec<usize> = (0..changes.len()).filter(|&i| !applied[i]).collect();
-        while let Some(j) = left_out.pop() {
-            for &i in &needed_by[j] {
-                if applied[i] {
-                    applied[i] = false;
-                    left_out.push(i);
-                }
-            }
-        }
-        let actions: Vec<Action> = (changes.into_iter().zip(applied))
-            .filter_map(|(change, applied)| applied.then_some(change.action))
+        let (actions, needs): (Vec<Action>, Vec<Vec<usize>>) = (self.changes().into_iter())
+            .map(|c| (c.action, c.needs))
+            .unzip();
+        let mut applied: Vec<bool> = actions.iter().map(|a| picked.contains(a)).collect();
+        without_unmet(&needs, &mut applied);
+        let actions: Vec<Action> = (actions.into_iter().zip(applied))
+            .filter_map(|(action, applied)| applied.then_some(action))
             .collect();
         // symlink_metadata().is_ok() checks if path OR SYMLINK exists there
         self.run_actions(&planner::plan_actions(&actions, |p| {
@@ -1539,28 +1527,19 @@ impl Koil {
     /// [`KoilError::NeedsChanges`] if it needs changes that are not creates (see
     /// [`Change::needs`]), like the rename that moves away what is at `path` now
     pub fn create_steps(&self, path: &Path) -> Result<Vec<Action>, KoilError> {
-        let changes = self.changes();
+        let (actions, needs): (Vec<Action>, Vec<Vec<usize>>) = (self.changes().into_iter())
+            .map(|c| (c.action, c.needs))
+            .unzip();
         let creates = |action: &Action| matches!(action, Action::CreateFile(p) | Action::CreateDir(p) if p == path);
-        let first = (changes.iter())
-            .position(|c| creates(&c.action))
+        let first = (actions.iter())
+            .position(creates)
             .ok_or_else(|| KoilError::NotNew(path.to_path_buf()))?;
-        let mut needed = vec![false; changes.len()];
-        needed[first] = true;
-        let mut todo = vec![first];
-        while let Some(i) = todo.pop() {
-            for &j in &changes[i].needs {
-                if !matches!(changes[j].action, Action::CreateDir(_)) {
-                    return Err(KoilError::NeedsChanges(path.to_path_buf()));
-                }
-                if !needed[j] {
-                    needed[j] = true;
-                    todo.push(j);
-                }
-            }
+        let needed = with_needs(&needs, first);
+        if (needed.iter()).any(|&i| i != first && !matches!(actions[i], Action::CreateDir(_))) {
+            return Err(KoilError::NeedsChanges(path.to_path_buf()));
         }
-        Ok((changes.into_iter().zip(needed))
-            .filter_map(|(change, needed)| needed.then_some(change.action))
-            .collect())
+        // in the order they run
+        Ok(needed.into_iter().map(|i| actions[i].clone()).collect())
     }
 
     /// Create the new file or dir at `path` on disk now, with the new dirs it is in (see
@@ -1627,13 +1606,7 @@ impl Koil {
         let undoable = (self.undo.iter().zip(&needs).enumerate())
             .map(|(i, (applied, direct))| {
                 // with every apply it needs, newest first, as they would be undone
-                let mut with = BTreeSet::from([i]);
-                let mut todo = direct.clone();
-                while let Some(j) = todo.pop() {
-                    if with.insert(j) {
-                        todo.extend(&needs[j]);
-                    }
-                }
+                let with = with_needs(&needs, i);
                 let steps = with.iter().rev().flat_map(|&j| &self.undo[j].steps);
                 Undoable {
                     applied: applied.clone(),
@@ -1658,22 +1631,7 @@ impl Koil {
         self.check_nothing_pending()?;
         let picked: HashSet<&Applied> = picked.iter().collect();
         let mut undone: Vec<bool> = self.undo.iter().map(|a| picked.contains(a)).collect();
-        let needs = self.undo_needs();
-        let mut needed_by = vec![Vec::new(); needs.len()];
-        for (i, needs) in needs.iter().enumerate() {
-            for &j in needs {
-                needed_by[j].push(i);
-            }
-        }
-        let mut left_out: Vec<usize> = (0..undone.len()).filter(|&i| !undone[i]).collect();
-        while let Some(j) = left_out.pop() {
-            for &i in &needed_by[j] {
-                if undone[i] {
-                    undone[i] = false;
-                    left_out.push(i);
-                }
-            }
-        }
+        without_unmet(&self.undo_needs(), &mut undone);
         // newest first, which also keeps the indexes of the rest as they are while each goes
         let order: Vec<usize> = (0..undone.len()).rev().filter(|&i| undone[i]).collect();
         if order.is_empty() {
@@ -2890,6 +2848,40 @@ fn io_error(error: OpenError) -> io::Error {
 
 fn to_id(index: usize) -> Id {
     Id(index as u64)
+}
+
+/// Leave out of `picked` every item that needs one that is not picked, also through others,
+/// where `needs` are the items each needs directly (see [`Change::needs`] and
+/// [`Undoable::needs`])
+fn without_unmet(needs: &[Vec<usize>], picked: &mut [bool]) {
+    let mut needed_by = vec![Vec::new(); needs.len()];
+    for (i, needs) in needs.iter().enumerate() {
+        for &j in needs {
+            needed_by[j].push(i);
+        }
+    }
+    let mut left_out: Vec<usize> = (0..picked.len()).filter(|&i| !picked[i]).collect();
+    while let Some(j) = left_out.pop() {
+        for &i in &needed_by[j] {
+            if picked[i] {
+                picked[i] = false;
+                left_out.push(i);
+            }
+        }
+    }
+}
+
+/// `from` and every item it needs, also through others, where `needs` are the items each
+/// needs directly
+fn with_needs(needs: &[Vec<usize>], from: usize) -> BTreeSet<usize> {
+    let mut with = BTreeSet::from([from]);
+    let mut todo = needs[from].clone();
+    while let Some(j) = todo.pop() {
+        if with.insert(j) {
+            todo.extend(&needs[j]);
+        }
+    }
+    with
 }
 
 /// `name` as a path relative to the listing's dir, `None` if it is empty, absolute (or
