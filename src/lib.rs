@@ -1149,20 +1149,7 @@ impl Koil {
     /// fails with [`OpenError::NotFound`], or [`OpenError::NotADirectory`] if it is a file
     /// This never adds changes, new dirs must be written in the listing
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
-        let Location { dir, pattern, .. } = self.read_location(location, self.settings.regex);
-        if let Some(pattern) = &pattern {
-            pattern.matcher()?;
-        }
-        if !self.is_dir(&dir) {
-            return Err(self.not_a_dir(&dir));
-        }
-        // in a copy, so nothing changes if it fails
-        let mut opened = self.clone();
-        opened.current_dir = dir;
-        opened.pattern = pattern;
-        opened.read_listing()?;
-        *self = opened;
-        Ok(())
+        self.atomically(|koil| koil.open_in_place(location.as_ref()))
     }
 
     /// What [`Koil::open`] would open for `location`, with a pattern read as a regex if
@@ -1395,21 +1382,13 @@ impl Koil {
     /// If any entry is invalid, nothing is changed, and every problem is returned
     /// Returns warnings about names that can be used, but are not recommended
     pub fn update(&mut self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
-        let mut updated = self.clone();
-        let (mut errors, mut warnings) = updated.update_entries(entries);
-        errors.sort_by_key(|e| e.entry);
-        warnings.sort_by_key(|w| w.entry);
-        if !errors.is_empty() {
-            return Err(UpdateError { errors, warnings });
-        }
-        *self = updated;
-        Ok(warnings)
+        self.atomically(|koil| koil.update_entries(entries))
     }
 
     /// What [`Koil::update`] would return for `entries`, without changing anything
     /// A frontend can use it to show problems while user is still editing
     pub fn check(&self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
-        self.clone().update(entries)
+        self.clone().update_entries(entries)
     }
 
     /// [`Koil::update`] with `entries`, then use `settings`, then [`Koil::open`] `location`
@@ -1425,14 +1404,15 @@ impl Koil {
         settings: Settings,
         location: Option<&Path>,
     ) -> Result<Updated, UpdateOpenError> {
+        // in a copy, so nothing changes if it fails
         let mut updated = self.clone();
-        let warnings = updated.update(entries)?;
+        let warnings = updated.update_entries(entries)?;
         let mut warning = None;
         match location {
             // not read again first, as the location is read with them right away
             Some(location) => {
                 updated.settings = settings;
-                updated.open(location)?;
+                updated.open_in_place(location)?;
             }
             None if settings != updated.settings => {
                 warning = updated.set_settings(settings).map_err(OpenError::from)?;
@@ -1720,6 +1700,28 @@ impl Koil {
 
 // Private functions
 impl Koil {
+    /// Run `change` on a copy, which is kept only if it works, so nothing changes if it fails
+    fn atomically<T, E>(&mut self, change: impl FnOnce(&mut Koil) -> Result<T, E>) -> Result<T, E> {
+        let mut copy = self.clone();
+        let result = change(&mut copy)?;
+        *self = copy;
+        Ok(result)
+    }
+
+    /// See [`Koil::open`], which runs it on a copy, as it is left half done if it fails
+    fn open_in_place(&mut self, location: &Path) -> Result<(), OpenError> {
+        let Location { dir, pattern, .. } = self.read_location(location, self.settings.regex);
+        if let Some(pattern) = &pattern {
+            pattern.matcher()?;
+        }
+        if !self.is_dir(&dir) {
+            return Err(self.not_a_dir(&dir));
+        }
+        self.current_dir = dir;
+        self.pattern = pattern;
+        self.read_listing()
+    }
+
     /// Run `actions` in order, then refresh, see [`Koil::apply`]
     fn run_actions(&mut self, actions: &[Action]) -> Result<Report, KoilError> {
         let result = self.run(actions);
@@ -2201,9 +2203,8 @@ impl Koil {
         usize::try_from(id.0).ok().filter(|&i| i < self.ids.len())
     }
 
-    /// See [`Koil::update`]
-    /// Returns every error and warning found, if there are errors, `self` is left half updated
-    fn update_entries(&mut self, entries: &[Entry]) -> (Vec<EntryError>, Vec<EntryWarning>) {
+    /// See [`Koil::update`], which runs it on a copy, as it is left half updated if it fails
+    fn update_entries(&mut self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
         let mut errors = Vec::new();
         let mut error = |entry, kind| errors.push(EntryError { entry, kind });
 
@@ -2342,7 +2343,12 @@ impl Koil {
             }
         }
 
-        (errors, warnings)
+        errors.sort_by_key(|e| e.entry);
+        warnings.sort_by_key(|w| w.entry);
+        match errors.is_empty() {
+            true => Ok(warnings),
+            false => Err(UpdateError { errors, warnings }),
+        }
     }
 
     /// Whether something is at `path` on disk, which is not deleted or moved away in

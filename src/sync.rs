@@ -211,11 +211,7 @@ impl Koil {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(Synced::default());
         }
-        // in a copy, so nothing changes if it fails
-        let mut synced = self.clone();
-        let result = synced.sync_with(entries)?;
-        *self = synced;
-        Ok(result)
+        self.atomically(|koil| koil.sync_with(entries))
     }
 
     /// Take the other way in `conflict`, which [`Koil::sync`] returned (see
