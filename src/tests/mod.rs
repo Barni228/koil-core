@@ -1,4 +1,7 @@
 use super::*;
+use crate::pattern::expand_commas;
+use crate::sort::natural_order;
+use std::fs;
 
 fn add(f: &str) -> Action {
     Action::CreateFile(f.into())

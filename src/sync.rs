@@ -1,9 +1,8 @@
 //! Following what changes on disk while koil has a dir open, see [`Koil::sync`]
 
 use crate::apply::Undo;
-use crate::{
-    Entry, Id, Koil, Metadata, Prune, Settings, View, Warning, on_disk, rebase, to_id, with_slashes,
-};
+use crate::pattern::{Prune, View};
+use crate::{Entry, Id, Koil, Metadata, Settings, Warning, on_disk, rebase, to_id, with_slashes};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
