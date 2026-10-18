@@ -289,19 +289,11 @@ pub fn disk_size(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
 
 #[cfg(windows)]
 pub fn disk_size(path: &Path, _meta: &fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
     };
-    // as in `same_file`: a dir can be opened, and a link is opened itself
-    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
-    // reading it needs no access to the file
-    let file = fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FLAGS)
-        .open(path)
-        .ok()?;
+    let file = apply::open_itself(path).ok()?;
     // SAFETY: all zeros is a valid `FILE_STANDARD_INFO` (numbers, and `false`)
     let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: the handle is open while `file` is, and `info` is as big as the size given

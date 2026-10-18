@@ -287,22 +287,24 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
 
 #[cfg(windows)]
 pub(crate) fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    // opened here, as `same_file::is_same_file` follows links (and so would let `link` be
+    // renamed onto the file it points to), and compared by volume serial and file index
+    let handle = |path: &Path| same_file::Handle::from_file(open_itself(path)?);
+    Ok(handle(a)? == handle(b)?)
+}
+
+/// Open what is at `path` only to read its information, which needs no access to the file:
+/// a dir too, and a link itself, not what it points to (like `symlink_metadata`)
+#[cfg(windows)]
+pub(crate) fn open_itself(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_BACKUP_SEMANTICS, which opening a dir needs, and FILE_FLAG_OPEN_REPARSE_POINT,
-    // which opens a link itself, not what it points to (like `symlink_metadata`)
+    // which opens a link itself
     const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
-    // opened here, as `same_file::is_same_file` follows links (and so would let `link` be
-    // renamed onto the file it points to)
-    let handle = |path: &Path| {
-        // reading its information needs no access to the file
-        let file = fs::OpenOptions::new()
-            .access_mode(0)
-            .custom_flags(FLAGS)
-            .open(path)?;
-        // compares the volume serial and file index
-        same_file::Handle::from_file(file)
-    };
-    Ok(handle(a)? == handle(b)?)
+    fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FLAGS)
+        .open(path)
 }
 
 #[cfg(not(any(unix, windows)))]
