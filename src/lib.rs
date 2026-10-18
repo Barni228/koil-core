@@ -1353,8 +1353,9 @@ impl Koil {
 
         let mut entries = Vec::new();
 
-        // IDs from current listing
-        for &index in &self.current_listing {
+        // IDs from current listing, and changed IDs from other folders
+        let others = (self.diff.with_id.keys()).filter(|i| !self.current_listing.contains(i));
+        for &index in self.current_listing.iter().chain(others) {
             match self.diff.with_id.get(&index) {
                 Some((_before, afters)) => entries.extend(
                     afters
@@ -1364,20 +1365,6 @@ impl Koil {
                 ),
                 None => entries.push(entry(index, &self.ids[index])),
             }
-        }
-
-        // IDs from other folders
-        for (&index, (_before, afters)) in &self.diff.with_id {
-            // if it is in current_listing, then I already added it above
-            if self.current_listing.contains(&index) {
-                continue;
-            }
-            entries.extend(
-                afters
-                    .iter()
-                    .filter(|p| in_view(index, p))
-                    .map(|p| entry(index, p)),
-            );
         }
 
         // dirs that are created because something new is inside them are shown too
