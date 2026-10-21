@@ -103,14 +103,17 @@ pub struct Conflict {
     /// The ID it is about
     pub id: Id,
     /// Its path before it changed on disk
+    #[serde(with = "crate::serde_path")]
     pub from: PathBuf,
     /// Its path on disk now, `None` if it is gone
+    #[serde(with = "crate::serde_path::option")]
     pub to: Option<PathBuf>,
     pub is_dir: bool,
     /// Its entries in the listing, as they were given to `sync`, but the ones that are still at
     /// `from` (for [`ConflictKind::Taken`], the entries user wrote at its path)
     pub listed: Vec<Entry>,
     /// The paths user put it at in the listings of other dirs
+    #[serde(with = "crate::serde_path::many")]
     pub elsewhere: Vec<PathBuf>,
 }
 

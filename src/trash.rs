@@ -15,9 +15,11 @@ pub(crate) const RESTORE_MAKES_PARENTS: bool = cfg!(all(unix, not(target_os = "m
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Trashed {
     /// Where it was before it was trashed
+    #[serde(with = "crate::serde_path")]
     pub original: PathBuf,
     /// Where to find it in the trash
     /// On macOS it is the path inside the trash, on other systems it is [`trash::TrashItem::id`]
+    #[serde(with = "crate::serde_path")]
     id: PathBuf,
     /// What tells it apart from what is trashed later at `id`, which is free again once the
     /// trash is emptied (see `platform::Stamp`), so that is never restored in its place

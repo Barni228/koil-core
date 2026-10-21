@@ -3,6 +3,7 @@ use pathfinding::prelude::*;
 use std::{
     cmp::Ord,
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsString,
     hash::Hash,
     ops::Bound,
     path::{Path, PathBuf},
@@ -172,12 +173,15 @@ pub fn needs(actions: &[Action]) -> Vec<Vec<usize>> {
 /// or by an action that creates or removes it) is found
 fn temp_path(from: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
     let dir = from.parent().unwrap_or(Path::new(""));
-    let name = from.file_name().unwrap().to_string_lossy();
-
-    (0..)
-        .map(|i| dir.join(format!(".{name}.koil{i}")))
-        .find(|path| !taken(path))
-        .unwrap()
+    // as it is, which may not be Unicode
+    let name = from.file_name().unwrap();
+    let temp = |i: usize| {
+        let mut temp = OsString::from(".");
+        temp.push(name);
+        temp.push(format!(".koil{i}"));
+        dir.join(temp)
+    };
+    (0..).map(temp).find(|path| !taken(path)).unwrap()
 }
 
 /// What actions should happen after each one, found by their paths rather than by comparing

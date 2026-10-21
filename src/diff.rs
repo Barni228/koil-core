@@ -1,14 +1,74 @@
+use crate::serde_path::Repr;
 use crate::{Action, on_disk, planner};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Each ID, with the path it had before, and the paths it has after
+type WithId = HashMap<usize, (PathBuf, Vec<PathBuf>)>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diff {
     /// ID, which points to the name it had before, and names that now it has after
-    pub with_id: HashMap<usize, (PathBuf, Vec<PathBuf>)>,
+    #[serde(with = "with_id")]
+    pub with_id: WithId,
     /// A new path without ID, true if it is a directory
+    #[serde(with = "without_id")]
     pub without_id: HashMap<PathBuf, bool>,
+}
+
+/// [`Diff::with_id`], with its paths as [`crate::serde_path`] keeps them
+mod with_id {
+    use super::*;
+
+    pub(super) fn serialize<S: Serializer>(
+        with_id: &WithId,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let kept = with_id.iter().map(|(index, (before, afters))| {
+            let afters: Vec<Repr> = afters.iter().map(|p| Repr::from(p.as_path())).collect();
+            (index, (Repr::from(before.as_path()), afters))
+        });
+        serializer.collect_map(kept)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WithId, D::Error> {
+        let kept = HashMap::<usize, (Repr, Vec<Repr>)>::deserialize(deserializer)?;
+        let paths = kept.into_iter().map(|(index, (before, afters))| {
+            let afters = afters.into_iter().map(PathBuf::from).collect();
+            (index, (before.into(), afters))
+        });
+        Ok(paths.collect())
+    }
+}
+
+/// [`Diff::without_id`] as pairs, with its paths as [`crate::serde_path`] keeps them: one that
+/// is not Unicode can not be a key in JSON
+mod without_id {
+    use super::*;
+
+    pub(super) fn serialize<S: Serializer>(
+        without_id: &HashMap<PathBuf, bool>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            without_id
+                .iter()
+                .map(|(p, is_dir)| (Repr::from(p.as_path()), is_dir)),
+        )
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<PathBuf, bool>, D::Error> {
+        let kept = Vec::<(Repr, bool)>::deserialize(deserializer)?;
+        Ok(kept
+            .into_iter()
+            .map(|(p, is_dir)| (p.into(), is_dir))
+            .collect())
+    }
 }
 
 impl Diff {
@@ -23,6 +83,14 @@ impl Diff {
         if !afters.contains(&after_path) {
             afters.push(after_path);
         }
+    }
+
+    /// Whether this diff changes nothing: every ID is only at the path it had (or not in it at
+    /// all), and nothing is new
+    pub fn is_empty(&self) -> bool {
+        self.without_id.is_empty()
+            && (self.with_id.values())
+                .all(|(before, afters)| afters.as_slice() == [before.as_path()])
     }
 
     /// Return true if `path` is a dir that does not exist yet, but will after this diff

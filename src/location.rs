@@ -13,7 +13,8 @@ pub struct Location {
     /// The dir to open, or the base dir of [`Location::pattern`], absolute
     /// It does not have to exist, opening it then fails
     pub dir: PathBuf,
-    /// The pattern of the paths to show, relative to [`Location::dir`], `None` for a dir
+    /// The pattern of the paths to show, relative to [`Location::dir`](field@Location::dir),
+    /// `None` for a dir
     pub pattern: Option<Pattern>,
     /// Where the pattern starts in the location as written (a byte index), `None` for a dir
     pub pattern_start: Option<usize>,

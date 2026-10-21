@@ -66,11 +66,14 @@ impl fmt::Display for Action {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Undo {
     /// Move a created path to the trash
-    Trash(PathBuf),
+    Trash(#[serde(with = "crate::serde_path")] PathBuf),
     /// Move a trashed path back from the trash
     Restore(Trashed),
     /// `mv <src> <dst>`
-    Rename(PathBuf, PathBuf),
+    Rename(
+        #[serde(with = "crate::serde_path")] PathBuf,
+        #[serde(with = "crate::serde_path")] PathBuf,
+    ),
 }
 
 impl Undo {
@@ -105,15 +108,15 @@ impl Undo {
     }
 }
 
-/// Why an [`Undo`] step can not run now (see [`check`])
+/// Why an [`Undo`] step can not run now (see [`Undoable::blocked`](crate::Undoable::blocked))
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Blocked {
     /// Nothing is at the path it trashes or moves, or the dir it puts something in is gone
-    Missing(PathBuf),
+    Missing(#[serde(with = "crate::serde_path")] PathBuf),
     /// Something is already at the path it puts something at
-    Taken(PathBuf),
+    Taken(#[serde(with = "crate::serde_path")] PathBuf),
     /// What it restores is no longer in the trash (it was emptied)
-    NotInTrash(PathBuf),
+    NotInTrash(#[serde(with = "crate::serde_path")] PathBuf),
 }
 
 impl fmt::Display for Blocked {

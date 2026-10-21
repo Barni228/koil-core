@@ -20,6 +20,7 @@ mod location;
 mod names;
 mod pattern;
 mod planner;
+mod serde_path;
 mod sort;
 mod sync;
 pub mod trash;
@@ -55,6 +56,7 @@ pub struct Entry {
     /// Path relative to the open dir
     /// [`Koil::listing`] only gives plain names, but [`Koil::update`] also takes nested paths
     /// like `dir/A`
+    #[serde(with = "serde_path")]
     pub name: PathBuf,
     /// Whether this entry is a directory
     /// [`Koil::update`] only uses it for new entries, an existing entry keeps its type
@@ -173,6 +175,7 @@ pub struct Applied {
     pub time: SystemTime,
     /// The dir that was open ([`Koil::current_dir`]), so a frontend can show its paths
     /// relative to it
+    #[serde(with = "serde_path")]
     pub dir: PathBuf,
     /// The steps that revert it, in the order they run
     pub steps: Vec<Undo>,
@@ -217,6 +220,7 @@ pub struct Koil {
     settings: Settings,
 
     #[builder(via_mutators)]
+    #[serde(with = "serde_path::many")]
     /// Ignore every path in this set
     ignore: HashSet<PathBuf>,
 
@@ -227,6 +231,7 @@ pub struct Koil {
 
     // Private fields
     #[builder(default, setter(skip))]
+    #[serde(with = "serde_path::many")]
     /// All IDs, pointing to their corresponding path
     ids: Vec<PathBuf>,
 
@@ -235,6 +240,7 @@ pub struct Koil {
     current_listing: HashSet<usize>,
 
     #[builder(default, setter(skip))]
+    #[serde(with = "serde_path")]
     /// The currently open directory, or the base dir of [`Koil::pattern`]
     current_dir: PathBuf,
 
@@ -299,6 +305,22 @@ impl Koil {
     /// This never adds changes, new dirs must be written in the listing
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
         self.atomically(|koil| koil.open_in_place(location.as_ref()))
+    }
+
+    /// [`Koil::open`] `location` with `settings`, as one step: if it fails, nothing changes,
+    /// the settings neither. Unlike [`Koil::set_settings`] and then `open`, what is open now is
+    /// not read again with them first
+    /// This is how a frontend opens something when it has no listing to read (it shows
+    /// something else), see [`Koil::update_and_open`] for when it has
+    pub fn open_with<P: AsRef<Path>>(
+        &mut self,
+        location: P,
+        settings: Settings,
+    ) -> Result<(), OpenError> {
+        self.atomically(|koil| {
+            koil.settings = settings;
+            koil.open_in_place(location.as_ref())
+        })
     }
 
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
@@ -458,6 +480,12 @@ impl Koil {
     /// The actions that [`Koil::apply`] would run to do what user did, in order
     pub fn compute_actions(&self) -> Vec<Action> {
         self.diff.clone().compute_actions()
+    }
+
+    /// Whether there are changes to apply (see [`Koil::compute_actions`]), from the changes
+    /// alone, without reading the disk or planning them
+    pub fn has_changes(&self) -> bool {
+        !self.diff.is_empty()
     }
 
     /// What applying would change, one [`Change`] per action, in the order they run
@@ -703,6 +731,35 @@ impl Koil {
             None => true,
             Some(id) => self.path_of(id) != Some(self.current_dir.join(&entry.name).as_path()),
         }
+    }
+
+    /// `entry` as a frontend reads it back from a listing it showed as text, which can not
+    /// show a name that is not Unicode (only on Linux, or a malformed name on Windows) but as
+    /// `to_string_lossy` does, with `�`: each part of its name that is how the part of its ID's
+    /// path in the same place from the end is shown, is that part, so a line user did not
+    /// change is not read as a rename (`a�` is the `a\xff` it shows), nor one moved elsewhere
+    /// (`dir/a�`)
+    pub fn read_shown(&self, mut entry: Entry) -> Entry {
+        let Some(path) = entry.id.and_then(|id| self.path_of(id)) else {
+            return entry;
+        };
+        // almost every path
+        if path.to_str().is_some() {
+            return entry;
+        }
+        let mut parts: Vec<&OsStr> = entry.name.components().map(|c| c.as_os_str()).collect();
+        let mut shown = false;
+        for (part, real) in parts.iter_mut().rev().zip(path.components().rev()) {
+            let real = real.as_os_str();
+            if real.to_str().is_none() && part.to_str() == Some(&real.to_string_lossy()) {
+                *part = real;
+                shown = true;
+            }
+        }
+        if shown {
+            entry.name = parts.iter().collect();
+        }
+        entry
     }
 }
 
@@ -980,11 +1037,9 @@ impl Koil {
 
     /// Fail if there are changes that are not applied yet
     fn check_nothing_pending(&self) -> Result<(), KoilError> {
-        // planning only puts them in order
-        if self.diff.clone().actions().is_empty() {
-            Ok(())
-        } else {
-            Err(KoilError::PendingChanges)
+        match self.has_changes() {
+            false => Ok(()),
+            true => Err(KoilError::PendingChanges),
         }
     }
 

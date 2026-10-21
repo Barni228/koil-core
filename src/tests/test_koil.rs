@@ -1,5 +1,6 @@
 use super::*;
 use diff::Diff;
+use std::ffi::OsString;
 
 /// Path to `s` inside `test_dir`, after a `/`, which a pattern's base dir needs on Windows
 fn test_path(s: &str) -> PathBuf {
@@ -2063,6 +2064,38 @@ fn test_update_and_open_changes_nothing_if_it_fails() {
 }
 
 #[test]
+fn test_open_with() {
+    let mut koil = test_koil();
+    koil.open_with("dir", show_hidden()).unwrap();
+    assert_eq!(test_path("dir"), koil.current_dir());
+    assert_eq!(&show_hidden(), koil.settings());
+    // and if it can not be opened, the settings stay too
+    let before = koil.save_state();
+    let result = koil.open_with("nope", Settings::default());
+    assert!(matches!(result, Err(OpenError::NotFound(_))));
+    assert_eq!(before, koil.save_state());
+}
+
+#[test]
+fn test_has_changes() {
+    let mut koil = test_koil();
+    assert!(!koil.has_changes());
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "renamed");
+    koil.update(&entries).unwrap();
+    assert!(koil.has_changes());
+    // renamed back, it changes nothing
+    koil.update(&test_dir_listing(&koil)).unwrap();
+    assert!(!koil.has_changes());
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+    // only a new dir
+    let mut entries = test_dir_listing(&koil);
+    entries.push(without_id("new/"));
+    koil.update(&entries).unwrap();
+    assert!(koil.has_changes());
+}
+
+#[test]
 fn test_relative() {
     let koil = test_koil();
     let inside = koil.relative(&test_path("dir/inside"));
@@ -2308,5 +2341,143 @@ fn test_changes() {
             (Action::CreateDir(test_path("new/nested")), vec![3]),
             (Action::CreateFile(test_path("new/nested/file")), vec![3, 4]),
         ]
+    );
+}
+
+// ── paths that are not Unicode ───────────────────────────────────────────────
+
+/// `start` and a part that is not Unicode, as a name can be on Linux (a byte that is not
+/// UTF-8), or on Windows (a lone surrogate)
+fn not_unicode(start: &str) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec([start.as_bytes(), b"\xff"].concat())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = start.encode_utf16().collect();
+        wide.push(0xd800);
+        OsString::from_wide(&wide)
+    }
+}
+
+/// `test_koil()`, with an ID listed in it whose name is not Unicode, and that ID (no such
+/// file can be made on macOS, whose filesystem keeps only UTF-8 names)
+fn koil_with_name_not_unicode(name: &Path) -> (Koil, Id) {
+    let mut koil = test_koil();
+    koil.ids.push(koil.current_dir().join(name));
+    koil.current_listing.insert(koil.ids.len() - 1);
+    let id = to_id(koil.ids.len() - 1);
+    (koil, id)
+}
+
+#[test]
+fn test_state_with_paths_not_unicode() {
+    let mut koil = test_koil();
+    let path = koil.current_dir().join(not_unicode("a"));
+    koil.ids.push(path.clone());
+    koil.diff.without_id.insert(path.clone(), false);
+    koil.diff
+        .with_id
+        .insert(0, (path.clone(), vec![path.clone()]));
+    koil.undo.push(Applied {
+        time: SystemTime::UNIX_EPOCH,
+        dir: path.clone(),
+        steps: vec![Undo::Trash(path.clone()), Undo::Rename(path.clone(), path)],
+    });
+    let loaded = Koil::load_state(&koil.save_state()).unwrap();
+    assert_eq!(koil.ids, loaded.ids);
+    assert_eq!(koil.diff, loaded.diff);
+    assert_eq!(koil.undo, loaded.undo);
+}
+
+#[test]
+fn test_unicode_paths_are_strings() {
+    // as serde keeps them, so what was saved before reads the same
+    let applied = Applied {
+        time: SystemTime::UNIX_EPOCH,
+        dir: "/a".into(),
+        steps: vec![Undo::Rename("/a/b".into(), "/a/c".into())],
+    };
+    let json = serde_json::to_value(&applied).unwrap();
+    assert_eq!("/a", json["dir"]);
+    assert_eq!(
+        serde_json::json!(["/a/b", "/a/c"]),
+        json["steps"][0]["Rename"]
+    );
+}
+
+#[test]
+fn test_conflict_with_path_not_unicode() {
+    // a frontend hands it back to `resolve`
+    let path = test_path("").join(not_unicode("a"));
+    let conflict = Conflict {
+        kind: ConflictKind::Gone,
+        id: Id(0),
+        from: path.clone(),
+        to: Some(path.clone()),
+        is_dir: false,
+        listed: vec![with_id(Id(0), "a")],
+        elsewhere: vec![path],
+    };
+    let json = serde_json::to_string(&conflict).unwrap();
+    assert_eq!(conflict, serde_json::from_str(&json).unwrap());
+}
+
+#[test]
+fn test_read_shown() {
+    let name = not_unicode("a");
+    let shown = name.to_string_lossy().into_owned();
+    let (koil, a) = koil_with_name_not_unicode(Path::new(&name));
+    let read = |entry: Entry| koil.read_shown(entry).name;
+    // as it was shown, alone or in another dir
+    assert_eq!(PathBuf::from(&name), read(with_id(a, &shown)));
+    assert_eq!(
+        Path::new("dir").join(&name),
+        read(with_id(a, &format!("dir/{shown}")))
+    );
+    assert!(!koil.is_pending(&koil.read_shown(with_id(a, &shown))));
+    // renamed, or new
+    assert_eq!(PathBuf::from("b"), read(with_id(a, "b")));
+    assert_eq!(PathBuf::from(&shown), read(without_id(&shown)));
+    // an ID whose path is Unicode, as written
+    let file = id(&koil, "file");
+    assert_eq!(PathBuf::from(&shown), read(with_id(file, &shown)));
+}
+
+#[test]
+fn test_read_shown_dir_part() {
+    // a pattern's names are paths, whose dirs can be what is not Unicode
+    let dir = not_unicode("d");
+    let shown = dir.to_string_lossy().into_owned();
+    let (koil, f) = koil_with_name_not_unicode(&Path::new(&dir).join("f"));
+    let read = |name: &str| koil.read_shown(with_id(f, name)).name;
+    assert_eq!(Path::new(&dir).join("f"), read(&format!("{shown}/f")));
+    assert_eq!(Path::new(&dir).join("g"), read(&format!("{shown}/g")));
+    assert_eq!(PathBuf::from("x/f"), read("x/f"));
+}
+
+#[test]
+fn test_unchanged_name_not_unicode() {
+    // shown with `�`, and read back as it was shown, it changes nothing
+    let name = not_unicode("a");
+    let (mut koil, a) = koil_with_name_not_unicode(Path::new(&name));
+    let shown = with_id(a, &name.to_string_lossy());
+    let mut entries = test_dir_listing(&koil);
+    entries.push(koil.read_shown(shown.clone()));
+    koil.update(&entries).unwrap();
+    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+    // as it was shown, it would be renamed
+    entries.pop();
+    entries.push(shown);
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        vec![Action::Rename(
+            test_path("").join(&name),
+            test_path(&name.to_string_lossy())
+        )],
+        koil.compute_actions()
     );
 }
