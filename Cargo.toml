@@ -6,7 +6,7 @@ rust-version = "1.88"
 authors = ["Andrii Pukhalyk <pukhalyk1@gmail.com>"]
 description = "Edit a directory as a list of entries, like oil.nvim"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Barni228/koil-core"
 keywords = ["filesystem", "rename", "oil", "file-manager", "bulk-rename"]
 categories = ["filesystem"]
@@ -14,8 +14,7 @@ include = [
     "/src",
     "!/src/tests",
     "/README.md",
-    "/LICENSE-MIT",
-    "/LICENSE-APACHE",
+    "/LICENSE",
 ]
 
 [dependencies]
