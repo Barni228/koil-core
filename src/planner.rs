@@ -65,6 +65,9 @@ fn plan(actions: &[Action], exists: &dyn Fn(&Path) -> bool, breaks: usize) -> Ve
 /// One whose source is inside a path another one removes (like moving `a/x` to `a` while `a`
 /// is deleted, or renamed) goes out of that path first, next to its outermost one, so it can
 /// be removed: the deepest such source, so nothing else in the cycle is inside it
+/// Else, a copy of a dir that another action of the cycle changes inside (like moving what is
+/// at the copy's path into the dir copied, which has to go first) is copied to the temp path
+/// first, next to where it goes (or to its source, if the cycle makes the dir it goes in)
 /// Else it is a cycle of renames (like swapping two names), broken at its first
 /// `None` for a cycle that can not be broken this way
 fn break_at(cycle: &[Action]) -> Option<(usize, &Path)> {
@@ -90,6 +93,24 @@ fn break_at(cycle: &[Action]) -> Option<(usize, &Path)> {
         .max_by(|&(i, _), &(j, _)| (depth(i).cmp(&depth(j))).then_with(|| cycle[j].cmp(&cycle[i])));
     if deepest.is_some() {
         return deepest;
+    }
+    // a copy that something in its source has to go before (see `Successors::of`)
+    let changes_inside = |source: &Path| {
+        let inside = |p: &Path| p != source && p.starts_with(source);
+        (cycle.iter()).any(|a| a.removes().is_some_and(inside) || a.creates().is_some_and(inside))
+    };
+    let copy = (0..cycle.len())
+        .filter(|&i| matches!(&cycle[i], Action::Copy(source, _) if changes_inside(source)))
+        .min_by(|&i, &j| cycle[i].cmp(&cycle[j]));
+    if let Some(i) = copy
+        && let Action::Copy(source, to) = &cycle[i]
+    {
+        let made = |dir: &Path| cycle.iter().any(|a| a.creates() == Some(dir));
+        let next_to = match to.ancestors().skip(1).any(made) {
+            true => source,
+            false => to,
+        };
+        return Some((i, next_to));
     }
     let renames = cycle.iter().all(|a| matches!(a, Action::Rename(_, _)));
     let first = (0..cycle.len()).min_by(|&i, &j| cycle[i].cmp(&cycle[j]))?;
@@ -188,16 +209,16 @@ fn temp_path(from: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
 /// every two actions (which took 14 s to order 10,000 deletes)
 struct Successors<'a> {
     actions: &'a [Action],
-    /// The indexes of the actions that remove each path
-    removes: HashMap<&'a Path, Vec<usize>>,
-    /// The indexes of the actions that create each path, in order, so the paths inside a dir
+    /// The indexes of the actions that remove each path, in order, so the paths inside a dir
     /// come right after it
+    removes: BTreeMap<&'a Path, Vec<usize>>,
+    /// The indexes of the actions that create each path, in order, like `removes`
     creates: BTreeMap<&'a Path, Vec<usize>>,
 }
 
 impl<'a> Successors<'a> {
     fn new(actions: &'a [Action]) -> Self {
-        let mut removes: HashMap<&Path, Vec<usize>> = HashMap::new();
+        let mut removes: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
         let mut creates: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
         for (i, action) in actions.iter().enumerate() {
             if let Some(path) = action.removes() {
@@ -232,10 +253,15 @@ impl<'a> Successors<'a> {
         if let Some(created) = action.creates()
             && !self.removes.contains_key(created)
         {
-            let after_it = (Bound::Excluded(created), Bound::Unbounded);
-            let inside = (self.creates.range::<Path, _>(after_it))
-                .take_while(|(path, _)| path.starts_with(created));
-            after.extend(inside.flat_map(|(_, others)| others));
+            after.extend(inside(&self.creates, created));
+        }
+        // If I copy a dir and `other` changes what is inside it, I go first: a copy is of its
+        // source as it is on disk, which is what a frontend can make it from before the rest
+        // is applied (see `Koil::create_now`), not as the changes leave it, which depends on
+        // what the user did first
+        if let Action::Copy(source, _) = action {
+            after.extend(inside(&self.removes, source));
+            after.extend(inside(&self.creates, source));
         }
         after.sort_unstable();
         after.dedup();
@@ -244,6 +270,18 @@ impl<'a> Successors<'a> {
             .cloned()
             .collect()
     }
+}
+
+/// The indexes of the actions in `paths` (`Successors::removes` or `creates`) at a path inside
+/// `dir`, not `dir` itself
+fn inside<'a>(
+    paths: &'a BTreeMap<&Path, Vec<usize>>,
+    dir: &'a Path,
+) -> impl Iterator<Item = usize> + 'a {
+    let after_it = (Bound::Excluded(dir), Bound::Unbounded);
+    (paths.range::<Path, _>(after_it))
+        .take_while(move |(path, _)| path.starts_with(dir))
+        .flat_map(|(_, actions)| actions.iter().copied())
 }
 
 /// A deterministic version of `pathfinding` `topological_sort`

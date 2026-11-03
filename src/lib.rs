@@ -531,41 +531,73 @@ impl Koil {
         self.run_actions(&planner::plan_actions(&actions, on_disk))
     }
 
-    /// What [`Koil::create_now`] would run to create the new file or dir at `path`: its
-    /// create, after those of the new dirs it is in, in order
-    /// Fails with [`KoilError::NotNew`] if the changes do not create `path`, and with
-    /// [`KoilError::NeedsChanges`] if it needs changes that are not creates (see
-    /// [`Change::needs`]), like the rename that moves away what is at `path` now
-    pub fn create_steps(&self, path: &Path) -> Result<Vec<Action>, KoilError> {
+    /// What [`Koil::create_now`] would run to make the new files, dirs or copies at `paths`:
+    /// their creates and copies, after the creates of the new dirs they are in, and the copies
+    /// of a dir they go in (which copy it as it is on disk, see [`Koil::copies_of`]), in order
+    /// Fails with [`KoilError::NotNew`] if the changes do not create or copy to one of `paths`,
+    /// and with [`KoilError::NeedsChanges`] if one needs changes that are not creates or copies
+    /// (see [`Change::needs`]), like the rename that moves away what is at its path now
+    pub fn create_steps(&self, paths: &[impl AsRef<Path>]) -> Result<Vec<Action>, KoilError> {
         let (actions, needs): (Vec<Action>, Vec<Vec<usize>>) = (self.changes().into_iter())
             .map(|c| (c.action, c.needs))
             .unzip();
-        let creates = |action: &Action| matches!(action, Action::CreateFile(p) | Action::CreateDir(p) if p == path);
-        let first = (actions.iter())
-            .position(creates)
-            .ok_or_else(|| KoilError::NotNew(path.to_path_buf()))?;
-        let needed = with_needs(&needs, first);
-        if (needed.iter()).any(|&i| i != first && !matches!(actions[i], Action::CreateDir(_))) {
-            return Err(KoilError::NeedsChanges(path.to_path_buf()));
+        let mut picked = vec![false; actions.len()];
+        for path in paths {
+            let path = path.as_ref();
+            let makes = |action: &Action| match action {
+                Action::CreateFile(p) | Action::CreateDir(p) | Action::Copy(_, p) => p == path,
+                _ => false,
+            };
+            let first = (actions.iter())
+                .position(makes)
+                .ok_or_else(|| KoilError::NotNew(path.to_path_buf()))?;
+            let mut todo = vec![first];
+            while let Some(i) = todo.pop() {
+                if picked[i] {
+                    continue;
+                }
+                if !matches!(actions[i], Action::CreateDir(_) | Action::Copy(..)) && i != first {
+                    return Err(KoilError::NeedsChanges(path.to_path_buf()));
+                }
+                picked[i] = true;
+                todo.extend(&needs[i]);
+                let Some(made) = actions[i].creates() else {
+                    continue;
+                };
+                // the copies of a dir it goes in, which applying runs first
+                let copied = |a: &Action| matches!(a, Action::Copy(s, _) if made != s.as_path() && made.starts_with(s));
+                todo.extend((0..actions.len()).filter(|&j| copied(&actions[j])));
+            }
         }
         // in the order they run
-        Ok(needed.into_iter().map(|i| actions[i].clone()).collect())
+        let steps = (actions.into_iter().zip(picked))
+            .filter_map(|(action, picked)| picked.then_some(action));
+        Ok(steps.collect())
     }
 
-    /// Create the new file or dir at `path` on disk now, with the new dirs it is in (see
-    /// [`Koil::create_steps`]), rather than when the changes are applied, so a frontend can
-    /// open a new file to write in it
+    /// Make the new files, dirs or copies at `paths` on disk now, with the new dirs they are in
+    /// (see [`Koil::create_steps`]), rather than when the changes are applied, so a frontend
+    /// can open a new file to write in it, or a copy to change it apart from what it copies
     /// Unlike [`Koil::apply_only`], every other change stays pending. The open dir is read
-    /// again, so its listing shows what was created as on disk (with an ID), and it can be
-    /// reverted with [`Koil::undo`], like an apply
-    pub fn create_now(&mut self, path: &Path) -> Result<Report, KoilError> {
-        let actions = self.create_steps(path)?;
+    /// again, so its listing shows what was made as on disk (with an ID, a copy's own), and it
+    /// can be reverted with [`Koil::undo`], like an apply
+    pub fn create_now(&mut self, paths: &[impl AsRef<Path>]) -> Result<Report, KoilError> {
+        let actions = self.create_steps(paths)?;
         let result = self.run(&actions);
-        // what was created is not new anymore, even if a later create failed (a missing
+        // what was made is not new or a copy anymore, even if a later step failed (a missing
         // parent is not in the diff, it is only missing)
         for action in &actions {
-            if on_disk(action.path()) {
-                self.diff.without_id.remove(action.path());
+            match action {
+                Action::CreateFile(path) | Action::CreateDir(path) if on_disk(path) => {
+                    self.diff.without_id.remove(path);
+                }
+                Action::Copy(source, path) if on_disk(path) => {
+                    let copied = self.diff.with_id.values_mut().filter(|(b, _)| b == source);
+                    for (_, afters) in copied {
+                        afters.retain(|p| p != path);
+                    }
+                }
+                _ => {}
             }
         }
         let reopened = self.reopen();
@@ -574,6 +606,34 @@ impl Koil {
             changes: actions.len(),
             warning: reopened?,
         })
+    }
+
+    /// What applying copies to `path`, if it does: `path` is written with the ID of a file (or
+    /// dir) that stays where it is, or is renamed to another of its paths
+    /// A frontend opens it only once it is copied (with [`Koil::create_now`]), as a new file,
+    /// rather than open the file it copies: what it changes there, the copy would get too
+    pub fn copied_from(&self, path: &Path) -> Option<PathBuf> {
+        (self.diff.clone().actions().into_iter()).find_map(|action| match action {
+            Action::Copy(source, to) if to == path => Some(source),
+            _ => None,
+        })
+    }
+
+    /// Where applying copies `path`, or a dir it is in, sorted: a copy is of what is on disk
+    /// when it is made, so a frontend makes these copies first (with [`Koil::create_now`])
+    /// before it lets user change the file at `path`, or they would get what user changes
+    /// Applying copies a dir before the changes inside it, so what the changes do inside a dir,
+    /// the copies of it never get
+    pub fn copies_of(&self, path: &Path) -> Vec<PathBuf> {
+        let actions = self.diff.clone().actions().into_iter();
+        let mut copies: Vec<PathBuf> = actions
+            .filter_map(|action| match action {
+                Action::Copy(source, to) if path.starts_with(&source) => Some(to),
+                _ => None,
+            })
+            .collect();
+        copies.sort();
+        copies
     }
 
     /// The steps that [`Koil::undo`] would run to revert the last apply, in order

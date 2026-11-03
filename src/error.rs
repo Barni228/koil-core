@@ -79,7 +79,7 @@ pub enum KoilError {
     NothingToUndo,
 
     /// [`Koil::create_now`](crate::Koil::create_now) was given a path that the changes do not
-    /// create
+    /// create or copy to
     #[error("`{}` is not new", shown(.0))]
     NotNew(PathBuf),
 

@@ -752,6 +752,56 @@ fn test_copy_with_add_and_delete() {
     );
 }
 
+#[test]
+fn test_copy_before_changes_inside() {
+    // a dir is copied as it is on disk, before what changes inside it, which ran first by its
+    // order alone (delete, rename) or after (create, copy)
+    let inside = [
+        delete("A/x"),
+        rename("A/x", "A/y"),
+        rename("A/x", "x"),
+        rename("x", "A/x"),
+        add("A/new"),
+        add_dir("A/new"),
+        copy("A/x", "A/y"),
+        copy("x", "A/x"),
+    ];
+    for change in inside {
+        assert_eq!(
+            vec![copy("A", "B"), change.clone()],
+            plan_actions(&[change.clone(), copy("A", "B")]),
+            "{change:?}"
+        );
+    }
+    // not what is next to it
+    assert_eq!(
+        vec![delete("AB/x"), copy("A", "B")],
+        plan_actions(&[copy("A", "B"), delete("AB/x")])
+    );
+}
+
+#[test]
+fn test_copy_to_a_path_moved_into_it() {
+    // `B` goes into `A` after the copy of `A` is made, which then can not go to `B` yet
+    assert_eq!(
+        vec![
+            copy("A", ".B.koil0"),
+            rename("B", "A/B"),
+            rename(".B.koil0", "B")
+        ],
+        plan_actions(&[copy("A", "B"), rename("B", "A/B")])
+    );
+    // the dir the copy goes in is made from inside `A`, so the copy waits next to `A`
+    assert_eq!(
+        vec![
+            copy("A", ".A.koil0"),
+            rename("A/x", "N"),
+            rename(".A.koil0", "N/B")
+        ],
+        plan_actions(&[copy("A", "N/B"), rename("A/x", "N")])
+    );
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 // --- path / directory rename ordering ------------------------------------
@@ -970,6 +1020,14 @@ fn test_output_does_not_depend_on_input_order() {
             delete("P"),
             copy("A", "Z"),
             rename("D", "E"),
+        ],
+        // a copy of a dir, a swap inside it, and a path moved into it from where it goes
+        vec![
+            copy("A", "B"),
+            rename("A/x", "A/y"),
+            rename("A/y", "A/x"),
+            rename("B", "A/B"),
+            delete("A/z"),
         ],
     ];
 

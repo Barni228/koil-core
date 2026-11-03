@@ -558,8 +558,8 @@ fn test_create_now() {
         Action::CreateDir(dir.join("new")),
         Action::CreateFile(new.clone()),
     ];
-    assert_eq!(created, koil.create_steps(&new).unwrap());
-    assert_eq!(2, koil.create_now(&new).unwrap().changes);
+    assert_eq!(created, koil.create_steps(&[&new]).unwrap());
+    assert_eq!(2, koil.create_now(&[&new]).unwrap().changes);
     let expected: BTreeMap<PathBuf, Option<String>> = [
         [("a", Some("a")), ("b", Some("b"))].as_slice(),
         &DIR,
@@ -612,14 +612,170 @@ fn test_create_now_needs_other_changes() {
     koil.update(&entries).unwrap();
     let actions = koil.compute_actions();
     for name in ["a", "dir2/new"] {
-        let result = koil.create_now(&dir.join(name));
+        let result = koil.create_now(&[dir.join(name)]);
         assert!(matches!(result, Err(KoilError::NeedsChanges(_))));
     }
-    let result = koil.create_now(&dir.join("b"));
+    let result = koil.create_now(&[dir.join("b")]);
     assert!(matches!(result, Err(KoilError::NotNew(_))));
     // nothing changed
     assert_eq!(before, snapshot(temp.path()));
     assert_eq!(actions, koil.compute_actions());
+}
+
+/// What [`snapshot`] gives for `paths`
+fn tree(paths: &[(&str, Option<&str>)]) -> BTreeMap<PathBuf, Option<String>> {
+    (paths.iter())
+        .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
+        .collect()
+}
+
+#[test]
+fn test_copy_now() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+    let dir = koil.current_dir().to_path_buf();
+    let a = id(&koil, "a");
+
+    // `a` is copied to `copy` and `new/a`, and renamed to `renamed` (the last of its lines)
+    let entries = [
+        with_id(a, "copy"),
+        with_id(a, "new/a"),
+        with_id(a, "renamed"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    let copy = dir.join("copy");
+    assert_eq!(Some(dir.join("a")), koil.copied_from(&copy));
+    assert_eq!(None, koil.copied_from(&dir.join("renamed")));
+    assert_eq!(None, koil.copied_from(&dir.join("b")));
+    assert_eq!(
+        vec![copy.clone(), dir.join("new/a")],
+        koil.copies_of(&dir.join("a"))
+    );
+    assert!(koil.copies_of(&dir.join("b")).is_empty());
+
+    // a copy is made on its own, with the new dir it goes in
+    let steps = vec![
+        Action::CreateDir(dir.join("new")),
+        Action::Copy(dir.join("a"), dir.join("new/a")),
+    ];
+    assert_eq!(steps, koil.create_steps(&[dir.join("new/a")]).unwrap());
+    assert_eq!(1, koil.create_now(&[&copy]).unwrap().changes);
+    assert_eq!(None, koil.copied_from(&copy));
+    assert_eq!(vec![dir.join("new/a")], koil.copies_of(&dir.join("a")));
+    let mut pending = koil.compute_actions();
+    pending.sort();
+    let mut expected = vec![
+        Action::CreateDir(dir.join("new")),
+        Action::Copy(dir.join("a"), dir.join("new/a")),
+        Action::Rename(dir.join("a"), dir.join("renamed")),
+    ];
+    expected.sort();
+    assert_eq!(expected, pending);
+
+    // it is a file of its own, with an ID of its own: what changes in `a` it does not get
+    let listing = koil.listing();
+    assert!(listing.contains(&keep(&koil, "copy")));
+    assert_ne!(Some(a), koil.id_of(&copy));
+    fs::write(dir.join("a"), "changed").unwrap();
+    koil.apply().unwrap();
+    let after = [
+        [
+            ("b", Some("b")),
+            ("copy", Some("a")),
+            ("new", None),
+            ("new/a", Some("changed")),
+            ("renamed", Some("changed")),
+        ]
+        .as_slice(),
+        &DIR,
+    ]
+    .concat();
+    assert_eq!(tree(&after), snapshot(temp.path()));
+
+    // undone like two applies
+    fs::write(dir.join("renamed"), "a").unwrap();
+    fs::write(dir.join("new/a"), "a").unwrap();
+    koil.undo().unwrap();
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+#[test]
+fn test_copy_dir_now() {
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    let dir = koil.current_dir().to_path_buf();
+
+    // `dir/x` is renamed, and a new file goes in `dir`, which is copied
+    koil.open("dir").unwrap();
+    let entries = [
+        with_id(id(&koil, "x"), "x2"),
+        keep(&koil, "sub/"),
+        without_id("new"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.open(temp.path()).unwrap();
+    let entries = [
+        keep(&koil, "a"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "dir"), "dir2/"),
+    ];
+    koil.update(&entries).unwrap();
+    // a file in `dir`, or in a dir in it, goes into the copy as it is now
+    let copies = vec![dir.join("dir2")];
+    assert_eq!(copies, koil.copies_of(&dir.join("dir/x")));
+    assert_eq!(copies, koil.copies_of(&dir.join("dir/sub/y")));
+    assert_eq!(copies, koil.copies_of(&dir.join("dir")));
+    // creating `new` now makes the copy first, which applying would make without it
+    let steps = vec![
+        Action::Copy(dir.join("dir"), dir.join("dir2")),
+        Action::CreateFile(dir.join("dir/new")),
+    ];
+    assert_eq!(steps, koil.create_steps(&[dir.join("dir/new")]).unwrap());
+
+    // the copy is of `dir` as it is on disk, without the changes inside it
+    koil.apply().unwrap();
+    let after = [
+        [("a", Some("a")), ("b", Some("b"))].as_slice(),
+        &[("dir", None), ("dir/new", Some("")), ("dir/x2", Some("x"))],
+        &[("dir/sub", None), ("dir/sub/y", Some("y"))],
+        &[
+            ("dir2", None),
+            ("dir2/sub", None),
+            ("dir2/sub/y", Some("y")),
+        ],
+        &[("dir2/x", Some("x"))],
+    ]
+    .concat();
+    assert_eq!(tree(&after), snapshot(temp.path()));
+}
+
+#[test]
+fn test_copy_to_a_path_moved_into_it() {
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+
+    // `b` goes into `dir`, which is copied to `b`
+    let entries = [
+        keep(&koil, "a"),
+        with_id(id(&koil, "b"), "dir/b"),
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "dir"), "b/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let after = [
+        [("a", Some("a")), ("b", None), ("b/x", Some("x"))].as_slice(),
+        &[("b/sub", None), ("b/sub/y", Some("y"))],
+        &DIR,
+        &[("dir/b", Some("b"))],
+    ]
+    .concat();
+    assert_eq!(tree(&after), snapshot(temp.path()));
 }
 
 #[test]
