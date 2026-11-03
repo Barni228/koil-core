@@ -1,5 +1,5 @@
 use crate::serde_path::Repr;
-use crate::{Action, on_disk, planner};
+use crate::{Action, on_disk, planner, rebase};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,11 +103,13 @@ impl Diff {
 
     /// Dirs that are neither on disk nor created in this diff, but something new is placed
     /// inside them, so they must be created too
+    /// A file that is moved away or deleted is not on disk then, so a dir is made where it was
     pub fn missing_parents(&self) -> BTreeSet<PathBuf> {
         // a set, as thousands of paths can be moved into a new dir
         let afters: HashSet<&Path> = (self.with_id.values())
             .flat_map(|(_, a)| a.iter().map(PathBuf::as_path))
             .collect();
+        let gone = self.gone_files();
         let mut missing = BTreeSet::new();
         for path in self
             .without_id
@@ -117,7 +119,7 @@ impl Diff {
         {
             for parent in path.ancestors().skip(1) {
                 let exists = parent.as_os_str().is_empty()
-                    || on_disk(parent)
+                    || on_disk(parent) && !gone.contains(parent)
                     || self.without_id.contains_key(parent)
                     // a dir that was renamed or copied to this path
                     || afters.contains(parent);
@@ -130,9 +132,18 @@ impl Diff {
         missing
     }
 
+    /// The files this diff moves away or deletes, which have nothing inside, so what is put
+    /// inside one goes in a new dir made there (see [`planner::order`])
+    fn gone_files(&self) -> HashSet<&Path> {
+        (self.with_id.values())
+            .filter(|(before, afters)| !afters.contains(before) && !before.is_dir())
+            .map(|(before, _)| before.as_path())
+            .collect()
+    }
+
     /// Compute actions required to resolve this diff, in the order they can run
     pub fn compute_actions(self) -> Vec<Action> {
-        planner::plan_actions(&self.actions(), on_disk)
+        planner::plan_actions(&self.actions(), on_disk, Path::is_dir)
     }
 
     /// The actions required to resolve this diff, in no particular order, and with rename
@@ -183,5 +194,87 @@ impl Diff {
         }
 
         actions
+    }
+}
+
+/// What a [`Diff`] does to the paths it changes, to check a path written in a listing against
+/// the rest of it (see [`Diff::outcome`])
+pub struct Outcome<'a> {
+    /// The paths it makes or leaves a file at
+    pub files: HashSet<&'a Path>,
+    /// The files it moves away or deletes, see [`Diff::gone_files`]
+    pub gone: HashSet<&'a Path>,
+    /// The dirs it deletes
+    deleted: HashSet<&'a Path>,
+    /// Where each dir it renames goes, as [`Diff::actions`] picks it
+    renamed: HashMap<&'a Path, &'a Path>,
+}
+
+impl Diff {
+    /// See [`Outcome`]
+    pub fn outcome(&self) -> Outcome<'_> {
+        let mut files: HashSet<&Path> = (self.without_id.iter())
+            .filter(|(_, is_dir)| !**is_dir)
+            .map(|(path, _)| path.as_path())
+            .collect();
+        let mut deleted = HashSet::new();
+        let mut renamed = HashMap::new();
+        for (before, afters) in self.with_id.values() {
+            if !before.is_dir() {
+                files.extend(afters.iter().map(PathBuf::as_path));
+                continue;
+            }
+            match afters.last() {
+                None => {
+                    deleted.insert(before.as_path());
+                }
+                Some(to) if !afters.contains(before) => {
+                    renamed.insert(before.as_path(), to.as_path());
+                }
+                _ => {}
+            }
+        }
+        Outcome {
+            files,
+            gone: self.gone_files(),
+            deleted,
+            renamed,
+        }
+    }
+}
+
+impl Outcome<'_> {
+    /// Where the rename of `path` takes it, `None` if it is not renamed
+    pub fn renamed_to(&self, path: &Path) -> Option<&Path> {
+        self.renamed.get(path).copied()
+    }
+
+    /// Each path that what is written at `path` is at while the changes are applied, `path`
+    /// first: a path inside a dir that is renamed is inside the old one, so it goes with it
+    /// (see [`planner::plan_actions`]), the deepest dir first
+    pub fn carried(&self, path: &Path) -> Vec<PathBuf> {
+        let mut at = vec![path.to_path_buf()];
+        // each rename carries it at most once, unless dirs are moved into each other
+        for _ in 0..self.renamed.len() {
+            let last = at.last().unwrap();
+            let renamed = |dir: &Path| Some((dir.to_path_buf(), *self.renamed.get(dir)?));
+            let Some((dir, to)) = last.ancestors().skip(1).find_map(renamed) else {
+                break;
+            };
+            let next = rebase(last, &dir, to).unwrap();
+            at.push(next);
+        }
+        at
+    }
+
+    /// The deleted dir that what is written at `path` goes into, also by being in a dir that
+    /// is moved into it, `None` if it goes into none
+    pub fn deleted_around(&self, path: &Path) -> Option<&Path> {
+        if self.deleted.is_empty() {
+            return None;
+        }
+        (self.carried(path).iter())
+            .find_map(|p| p.ancestors().skip(1).find_map(|d| self.deleted.get(d)))
+            .copied()
     }
 }

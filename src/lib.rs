@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use crate::apply::{Blocked, Undo, inside, same_file};
-use crate::diff::Diff;
+use crate::diff::{Diff, Outcome};
 use crate::error::io_error;
 use crate::pattern::{View, Walked};
 use crate::sync::{FileKey, Seen};
@@ -494,11 +494,11 @@ impl Koil {
     /// A frontend can show them to confirm, and apply only the ones user picks with
     /// [`Koil::apply_only`], picking what each needs along with it
     pub fn changes(&self) -> Vec<Change> {
-        let actions: Vec<Action> = planner::order(&self.diff.clone().actions())
+        let actions: Vec<Action> = planner::order(&self.diff.clone().actions(), Path::is_dir)
             .into_iter()
             .flatten()
             .collect();
-        let needs = planner::needs(&actions);
+        let needs = planner::needs(&actions, Path::is_dir);
         (actions.into_iter().zip(needs))
             .map(|(action, needs)| Change { action, needs })
             .collect()
@@ -528,7 +528,7 @@ impl Koil {
         let actions: Vec<Action> = (actions.into_iter().zip(applied))
             .filter_map(|(action, applied)| applied.then_some(action))
             .collect();
-        self.run_actions(&planner::plan_actions(&actions, on_disk))
+        self.run_actions(&planner::plan_actions(&actions, on_disk, Path::is_dir))
     }
 
     /// What [`Koil::create_now`] would run to make the new files, dirs or copies at `paths`:
@@ -551,8 +551,8 @@ impl Koil {
             let first = (actions.iter())
                 .position(makes)
                 .ok_or_else(|| KoilError::NotNew(path.to_path_buf()))?;
-            let mut todo = vec![first];
-            while let Some(i) = todo.pop() {
+            let mut stack = vec![first];
+            while let Some(i) = stack.pop() {
                 if picked[i] {
                     continue;
                 }
@@ -560,13 +560,13 @@ impl Koil {
                     return Err(KoilError::NeedsChanges(path.to_path_buf()));
                 }
                 picked[i] = true;
-                todo.extend(&needs[i]);
+                stack.extend(&needs[i]);
                 let Some(made) = actions[i].creates() else {
                     continue;
                 };
                 // the copies of a dir it goes in, which applying runs first
                 let copied = |a: &Action| matches!(a, Action::Copy(s, _) if made != s.as_path() && made.starts_with(s));
-                todo.extend((0..actions.len()).filter(|&j| copied(&actions[j])));
+                stack.extend((0..actions.len()).filter(|&j| copied(&actions[j])));
             }
         }
         // in the order they run
@@ -1171,6 +1171,26 @@ impl Koil {
             .without_id
             .retain(|p, &mut is_dir| !view.contains(p, is_dir));
 
+        // what is left was written in other listings (or as a nested name, which no listing of
+        // this view shows): each path it creates, and the index of the ID it creates it with
+        let elsewhere: HashMap<PathBuf, Option<usize>> = (self.diff.with_id.iter())
+            .flat_map(|(&index, (before, afters))| {
+                let created = afters.iter().filter(move |p| *p != before);
+                created.map(move |p| (p.clone(), Some(index)))
+            })
+            .chain(self.diff.without_id.keys().map(|p| (p.clone(), None)))
+            .collect();
+        // the dirs it is in, which must be dirs
+        let mut around_elsewhere: HashSet<&Path> = HashSet::new();
+        for path in elsewhere.keys() {
+            for dir in path.ancestors().skip(1) {
+                // if it was added already, so were the dirs it is in
+                if !around_elsewhere.insert(dir) {
+                    break;
+                }
+            }
+        }
+
         // if something existed before, but does not exist now, tell the diff that it used to exist
         for &index in &self.current_listing {
             if !with_id.contains_key(&index) {
@@ -1221,21 +1241,49 @@ impl Koil {
             }
         }
 
+        let outcome = self.diff.outcome();
         let mut warnings = Vec::new();
         for (i, path, index) in written {
             let mut error = |kind| errors.push(EntryError { entry: i, kind });
             // `dir/A` also means create `dir/`, if it does not exist yet, so it can not be a file
-            if let Err(parent) = self.check_parents(&path) {
+            if let Err(parent) = self.check_parents(&path, &outcome) {
                 error(EntryErrorKind::NotADirectory(parent));
+            }
+            // something else is written there, which applying would create and then fail to
+            // put this at (writing the same new entry again is the same create)
+            let written_elsewhere = elsewhere.get(&path).is_some_and(|&by| by != index);
+            if written_elsewhere {
+                error(EntryErrorKind::AlreadyExists(self.name(&path)));
             }
             // the name did not change
             if index.is_some_and(|index| self.ids[index] == path) {
                 continue;
             }
-            if self.taken(&path, index) {
+            if !written_elsewhere && self.taken(&path, index) {
                 error(EntryErrorKind::AlreadyExists(self.name(&path)));
             }
-            if index.is_some_and(|index| inside(&self.ids[index], &path)) {
+            // a file that is not on disk yet, which something written elsewhere is inside (if it
+            // is on disk, that is inside what is there now)
+            let is_dir = match index {
+                Some(index) => self.ids[index].is_dir(),
+                None => self.diff.without_id.get(&path) == Some(&true),
+            };
+            if !is_dir && around_elsewhere.contains(path.as_path()) && !on_disk(&path) {
+                error(EntryErrorKind::NotADirectory(self.name(&path)));
+            }
+            if let Some(dir) = outcome.deleted_around(&path) {
+                let dir = self.relative(dir).unwrap_or_else(|| with_slashes(dir));
+                error(EntryErrorKind::IntoDeleted(dir));
+            }
+            // a dir moved into itself, also through dirs moved into it, which it then goes with
+            // again and again (a copy goes before them, and stays where it is)
+            let into_itself = index.is_some_and(|index| {
+                let before = &self.ids[index];
+                inside(before, &path)
+                    || outcome.renamed_to(before) == Some(path.as_path())
+                        && (outcome.carried(&path).iter()).any(|p| inside(before, p))
+            });
+            if into_itself {
                 error(EntryErrorKind::IntoItself(self.name(&path)));
             }
             for problem in self.new_names(&path).flat_map(names::check) {
@@ -1285,24 +1333,25 @@ impl Koil {
             .filter_map(Path::file_name)
     }
 
-    /// Check that no parent of `path` (inside [`Koil::current_dir`]) is a file, on disk or
-    /// created in [`Koil::diff`]
+    /// Check that no parent of `path` (inside [`Koil::current_dir`]) is a file, on disk (and
+    /// not moved away or deleted, then a dir is made there) or one that [`Koil::diff`] makes (new,
+    /// renamed or copied there), see `outcome` of it
     /// Fails with the parent (relative to [`Koil::current_dir`]) that is a file
     /// Parents that do not exist yet are created by [`Diff::compute_actions`]
-    fn check_parents(&self, path: &Path) -> Result<(), PathBuf> {
+    fn check_parents(&self, path: &Path, outcome: &Outcome) -> Result<(), PathBuf> {
         let parents = path
             .ancestors()
             .skip(1)
             .take_while(|p| p.starts_with(&self.current_dir) && *p != self.current_dir);
 
         for parent in parents {
-            if on_disk(parent) {
+            if on_disk(parent) && !outcome.gone.contains(parent) {
                 if parent.is_dir() {
                     break;
                 }
                 return Err(self.name(parent));
             }
-            if self.diff.without_id.get(parent) == Some(&false) {
+            if outcome.files.contains(parent) {
                 return Err(self.name(parent));
             }
         }
@@ -1339,10 +1388,10 @@ fn without_unmet(needs: &[Vec<usize>], picked: &mut [bool]) {
 /// needs directly
 fn with_needs(needs: &[Vec<usize>], from: usize) -> BTreeSet<usize> {
     let mut with = BTreeSet::from([from]);
-    let mut todo = needs[from].clone();
-    while let Some(j) = todo.pop() {
+    let mut stack = needs[from].clone();
+    while let Some(j) = stack.pop() {
         if with.insert(j) {
-            todo.extend(&needs[j]);
+            stack.extend(&needs[j]);
         }
     }
     with

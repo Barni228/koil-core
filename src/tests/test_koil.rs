@@ -428,6 +428,105 @@ fn test_nested_create_inside_file_fails() {
         vec![(5, EntryErrorKind::NotADirectory("new".into()))],
         errors(update_test_dir(&["new", "new/A"]))
     );
+    // `X` is a file renamed or copied there
+    let not_a_dir = |name: &str| EntryErrorKind::NotADirectory(name.into());
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "X");
+    entries.push(without_id("X/A"));
+    assert_eq!(
+        vec![(4, not_a_dir("X"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    let mut entries = test_dir_listing(&koil);
+    entries.push(with_id(id(&koil, "file"), "X"));
+    entries[3] = with_id(id(&koil, "qwerty"), "X/qwerty");
+    assert_eq!(
+        vec![(3, not_a_dir("X"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // `file` is moved away, but another file is moved there
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "f2");
+    entries[2] = with_id(id(&koil, "file2"), "file");
+    entries.push(without_id("file/A"));
+    assert_eq!(
+        vec![(4, not_a_dir("file"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+}
+
+#[test]
+fn test_nested_create_where_a_file_was() {
+    // `file` is moved away or deleted, so a dir is made there for what is inside it
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "f2");
+    entries.push(without_id("file/A"));
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        vec![
+            Action::Rename(test_path("file"), test_path("f2")),
+            Action::CreateDir(test_path("file")),
+            Action::CreateFile(test_path("file/A")),
+        ],
+        koil.compute_actions()
+    );
+    // which the listing shows as a new dir
+    let new_dir = koil
+        .listing()
+        .into_iter()
+        .find(|e| e.name == Path::new("file"));
+    assert_eq!(Some(without_id("file/")), new_dir);
+
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries.remove(1);
+    entries[2] = with_id(id(&koil, "qwerty"), "file/qwerty");
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        vec![
+            Action::DeleteFile(test_path("file")),
+            Action::CreateDir(test_path("file")),
+            Action::Rename(test_path("qwerty"), test_path("file/qwerty")),
+        ],
+        koil.compute_actions()
+    );
+}
+
+#[test]
+fn test_nested_create_inside_file_written_elsewhere() {
+    let not_a_dir = |name: &str| EntryErrorKind::NotADirectory(name.into());
+    // the file is written first, and what is inside it after
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "dir/sub");
+    koil.update(&entries).unwrap();
+    let mut entries = koil.listing();
+    entries.push(without_id("dir/sub/A"));
+    assert_eq!(
+        vec![(3, not_a_dir("dir/sub"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // what is inside it first, and the file after, which the error is about then
+    let mut koil = update_test_dir(&["dir/sub/A"]).unwrap();
+    let mut entries = koil.listing();
+    entries.push(without_id("dir/sub"));
+    assert_eq!(
+        vec![(4, not_a_dir("dir/sub"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    let mut entries = koil.listing();
+    entries[1] = with_id(id(&koil, "file"), "dir/sub");
+    assert_eq!(
+        vec![(1, not_a_dir("dir/sub"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // but it can be a dir
+    let mut entries = koil.listing();
+    entries.push(without_id("dir/sub/"));
+    koil.update(&entries).unwrap();
 }
 
 #[test]
@@ -712,6 +811,58 @@ fn test_already_exists() {
 }
 
 #[test]
+fn test_already_written_elsewhere() {
+    let exists = |name: &str| EntryErrorKind::AlreadyExists(name.into());
+    // `dir/A` is new, but the listing of `test_dir` does not show it, so it can be written
+    // again, which would make two things at one path, and fail halfway through an apply
+    let mut koil = update_test_dir(&["dir/A"]).unwrap();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file"), "dir/A"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    assert_eq!(
+        vec![(1, exists("dir/A"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // the same with a rename first, and something new written after
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "dir/"),
+        with_id(id(&koil, "file"), "dir/A"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    koil.update(&entries).unwrap();
+    let mut entries = test_dir_listing(&koil);
+    entries.retain(|e| e.name != Path::new("file"));
+    entries.push(without_id("dir/A"));
+    assert_eq!(
+        vec![(3, exists("dir/A"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // and in the listing of `dir`, which shows it
+    let mut koil = update_test_dir(&["dir/A"]).unwrap();
+    koil.open(test_path("dir")).unwrap();
+    let entries = [keep(&koil, "inside"), without_id("A")];
+    assert_eq!(koil.listing(), entries);
+    koil.update(&entries).unwrap();
+
+    // what was already written there, written again
+    let mut koil = update_test_dir(&["dir/A"]).unwrap();
+    let mut entries = test_dir_listing(&koil);
+    entries.push(without_id("dir/A"));
+    koil.update(&entries).unwrap();
+    let mut koil = test_koil();
+    let mut entries = test_dir_listing(&koil);
+    entries[1] = with_id(id(&koil, "file"), "dir/A");
+    koil.update(&entries).unwrap();
+    koil.update(&entries).unwrap();
+}
+
+#[test]
 fn test_not_already_exists() {
     // deleted, then created again
     let mut koil = test_koil();
@@ -817,6 +968,132 @@ fn test_into_itself() {
     let mut entries = test_dir_listing(&koil);
     entries.push(with_id(id(&koil, "dir"), "dir2/"));
     koil.update(&entries).unwrap();
+}
+
+#[test]
+fn test_into_itself_through_other_moves() {
+    let into_itself = |name: &str| EntryErrorKind::IntoItself(name.into());
+    let temp = tempfile::tempdir().unwrap();
+    for dir in ["A", "B", "C"] {
+        fs::create_dir(temp.path().join(dir)).unwrap();
+    }
+    let mut koil = Koil::default();
+    koil.open(temp.path()).unwrap();
+    // each goes into the other, and then with it, again and again
+    let entries = [
+        with_id(id(&koil, "A"), "B/A/"),
+        with_id(id(&koil, "B"), "A/B/"),
+        keep(&koil, "C/"),
+    ];
+    assert_eq!(
+        vec![(0, into_itself("B/A")), (1, into_itself("A/B"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // but a copy is made before the dirs move, so it stays where it is
+    let entries = [
+        keep(&koil, "A/"),
+        with_id(id(&koil, "A"), "B/A/"),
+        with_id(id(&koil, "B"), "A/B/"),
+        keep(&koil, "C/"),
+    ];
+    koil.check(&entries).unwrap();
+
+    // also when one of them is written in another listing: `A` in `B`, `B` in `C`, and `C`
+    // in `A`, where it is a copy while it is still in the listing above
+    let a = id(&koil, "A");
+    let b = id(&koil, "B");
+    let entries = [with_id(a, "B/A/"), with_id(b, "C/B/"), keep(&koil, "C/")];
+    koil.update(&entries).unwrap();
+    let c = id(&koil, "C");
+    koil.open(temp.path().join("A")).unwrap();
+    koil.update(&[with_id(c, "C/")]).unwrap();
+    // and a move once it is not
+    koil.open(temp.path()).unwrap();
+    let entries = [with_id(a, "B/A/"), with_id(b, "C/B/")];
+    assert_eq!(
+        vec![(0, into_itself("B/A")), (1, into_itself("C/B"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+}
+
+#[test]
+fn test_into_deleted() {
+    let into_deleted = |name: &str| EntryErrorKind::IntoDeleted(name.into());
+    // new, moved, or copied into a deleted dir, where it would go to the trash with it
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        with_id(id(&koil, "qwerty"), "dir/qwerty"),
+        with_id(id(&koil, "file"), "dir/file"),
+        without_id("dir/A"),
+    ];
+    assert_eq!(
+        vec![
+            (2, into_deleted("dir")),
+            (3, into_deleted("dir")),
+            (4, into_deleted("dir"))
+        ],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // or into a dir moved into it
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("A")).unwrap();
+    fs::create_dir(temp.path().join("B")).unwrap();
+    fs::write(temp.path().join("x"), "").unwrap();
+    let mut koil = Koil::default();
+    koil.open(temp.path()).unwrap();
+    let entries = [
+        with_id(id(&koil, "A"), "B/A/"),
+        with_id(id(&koil, "x"), "A/x"),
+    ];
+    assert_eq!(
+        vec![(0, into_deleted("B")), (1, into_deleted("B"))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+
+    // in the listing of the dir, after it is deleted in the one above
+    let mut koil = test_koil();
+    let entries = [
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.open("dir").unwrap();
+    let entries = [keep(&koil, "inside"), without_id("A")];
+    let dir = with_slashes(&test_path("dir"));
+    assert_eq!(
+        vec![(1, EntryErrorKind::IntoDeleted(dir))],
+        errors(koil.update(&entries).map(|_| koil.clone()))
+    );
+    // what is there can still be kept, or copied out of it
+    koil.update(&[keep(&koil, "inside")]).unwrap();
+    let inside = id(&koil, "inside");
+    koil.open("..").unwrap();
+    let mut entries = test_dir_listing(&koil);
+    entries[0] = with_id(inside, "inside");
+    koil.update(&entries).unwrap();
+
+    // written in it first, and deleted with it after, which is what deleting it means
+    let mut koil = test_koil();
+    koil.open("dir").unwrap();
+    koil.update(&[keep(&koil, "inside"), without_id("A")])
+        .unwrap();
+    koil.open("..").unwrap();
+    let entries = [
+        keep(&koil, "file"),
+        keep(&koil, "file2"),
+        keep(&koil, "qwerty"),
+    ];
+    koil.update(&entries).unwrap();
+    assert_eq!(
+        vec![
+            Action::CreateFile(test_path("dir/A")),
+            Action::DeleteDir(test_path("dir"))
+        ],
+        koil.compute_actions()
+    );
 }
 
 // ── hidden entries ───────────────────────────────────────────────────────────

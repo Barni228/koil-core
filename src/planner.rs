@@ -12,14 +12,24 @@ use std::{
 /// Order `actions` so they can be run one after another
 /// `exists` should return true if a path is already taken on the filesystem,
 /// it is used to pick a free temporary name when breaking cycles
-pub fn plan_actions(actions: &[Action], exists: impl Fn(&Path) -> bool) -> Vec<Action> {
-    plan(actions, &exists, actions.len())
+/// `is_dir` should return true if a path that an action renames is a dir (see [`order`])
+pub fn plan_actions(
+    actions: &[Action],
+    exists: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Vec<Action> {
+    plan(actions, &exists, &is_dir, actions.len())
 }
 
 /// See [`plan_actions`], breaking at most `breaks` more cycles: each break takes an action out
 /// of one, so the changes never need more, but actions that no diff makes (two renames of
 /// one path) could make cycles without end
-fn plan(actions: &[Action], exists: &dyn Fn(&Path) -> bool, breaks: usize) -> Vec<Action> {
+fn plan(
+    actions: &[Action],
+    exists: &dyn Fn(&Path) -> bool,
+    is_dir: &dyn Fn(&Path) -> bool,
+    breaks: usize,
+) -> Vec<Action> {
     let mut result = Vec::new();
     // the paths an action creates or removes, which a temp path can not be
     let used: HashSet<&Path> = (actions.iter())
@@ -27,7 +37,7 @@ fn plan(actions: &[Action], exists: &dyn Fn(&Path) -> bool, breaks: usize) -> Ve
         .collect();
     let taken = |path: &Path| exists(path) || used.contains(path);
 
-    for cycle in order(actions) {
+    for cycle in order(actions, is_dir) {
         if cycle.len() == 1 {
             result.extend(cycle);
             continue;
@@ -52,9 +62,15 @@ fn plan(actions: &[Action], exists: &dyn Fn(&Path) -> bool, breaks: usize) -> Ve
             Action::Copy(from, to) => (Action::Copy(from, tmp.clone()), to),
             _ => unreachable!("break_at only breaks a rename or a copy"),
         };
-        rest.push(Action::Rename(tmp, last));
+        // the temp path is not on disk yet, but is what is moved there
+        let moved_dir = is_dir(first.path());
+        let is_dir = |path: &Path| match path == tmp {
+            true => moved_dir,
+            false => is_dir(path),
+        };
+        rest.push(Action::Rename(tmp.clone(), last));
         result.push(first);
-        result.extend(plan(&rest, &taken, breaks - 1));
+        result.extend(plan(&rest, &taken, &is_dir, breaks - 1));
     }
 
     result
@@ -123,8 +139,12 @@ fn break_at(cycle: &[Action]) -> Option<(usize, &Path)> {
 /// `actions` in the order they can run, in groups: an action alone, or a cycle (like rename A
 /// to B and B to A, or delete `a` and move `a/x` to `a`), which can only run through a temp
 /// path (see [`plan_actions`])
-pub fn order(actions: &[Action]) -> Vec<Vec<Action>> {
-    let successors = Successors::new(actions);
+/// `is_dir` says whether a path that an action renames is a dir (a deleted one's kind is in its
+/// action): what is put inside a dir that is removed is inside the old one, so it goes first,
+/// and moves (or goes to the trash) with it, but a file has nothing inside, so what is put
+/// inside one that is removed is inside the new dir made there, after it
+pub fn order(actions: &[Action], is_dir: impl Fn(&Path) -> bool) -> Vec<Vec<Action>> {
+    let successors = Successors::new(actions, is_dir);
     // detect all cycles (like rename A to B and B to A)
     // every action that is not in a cycle is its own group of 1
     let mut groups = scc(actions, |a| successors.of(a));
@@ -161,16 +181,19 @@ pub fn order(actions: &[Action]) -> Vec<Vec<Action>> {
 /// removes the path it creates (which is taken until then), and the ones that create a new dir
 /// it creates something in, as [`plan_actions`] runs them first
 /// Only what each needs directly, so in a chain of renames, the first needs only the second
-pub fn needs(actions: &[Action]) -> Vec<Vec<usize>> {
+/// `is_dir` says whether a path that an action renames is a dir (see [`order`])
+pub fn needs(actions: &[Action], is_dir: impl Fn(&Path) -> bool) -> Vec<Vec<usize>> {
+    let files = removed_files(actions, is_dir);
     // at most one action removes or creates a path, as an ID has one path, and update rejects
     // two entries with one name
     let removed: HashMap<&Path, usize> = (actions.iter().enumerate())
         .filter_map(|(i, a)| Some((a.removes()?, i)))
         .collect();
-    // if a created path is also removed, paths inside it refer to the old one
+    // if a created path is also removed, paths inside it refer to the old one, unless it is a
+    // file, which has nothing inside
     let created: HashMap<&Path, usize> = (actions.iter().enumerate())
         .filter_map(|(i, a)| Some((a.creates()?, i)))
-        .filter(|(path, _)| !removed.contains_key(path))
+        .filter(|(path, _)| !removed.contains_key(path) || files.contains(path))
         .collect();
     (actions.iter().enumerate())
         .map(|(i, action)| {
@@ -214,10 +237,12 @@ struct Successors<'a> {
     removes: BTreeMap<&'a Path, Vec<usize>>,
     /// The indexes of the actions that create each path, in order, like `removes`
     creates: BTreeMap<&'a Path, Vec<usize>>,
+    /// The paths of `removes` that are files, see [`removed_files`]
+    files: HashSet<&'a Path>,
 }
 
 impl<'a> Successors<'a> {
-    fn new(actions: &'a [Action]) -> Self {
+    fn new(actions: &'a [Action], is_dir: impl Fn(&Path) -> bool) -> Self {
         let mut removes: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
         let mut creates: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
         for (i, action) in actions.iter().enumerate() {
@@ -232,15 +257,30 @@ impl<'a> Successors<'a> {
             actions,
             removes,
             creates,
+            files: removed_files(actions, is_dir),
         }
     }
 
     /// The actions that should happen AFTER `action`, in the order of the actions
     fn of(&self, action: &Action) -> Vec<Action> {
         let mut after: Vec<usize> = Vec::new();
+        // what I put inside a file that `other` removes goes in the new dir made there
+        let in_new = |dir: &Path| {
+            self.files.contains(dir)
+                && action
+                    .creates()
+                    .is_some_and(|c| c != dir && c.starts_with(dir))
+        };
         // If I depend on something, and `other` removes that (or a dir it is in), I go first
         if let Some(depend) = action.depends_on() {
-            for dir in depend.ancestors() {
+            for dir in depend.ancestors().filter(|dir| !in_new(dir)) {
+                after.extend(self.removes.get(dir).into_iter().flatten());
+            }
+        }
+        // If I put something inside a dir that `other` removes, I go first: it is inside the old
+        // dir, which takes it along (as a new file's parent, which it depends on, does above)
+        if let Some(created) = action.creates() {
+            for dir in created.ancestors().skip(1).filter(|dir| !in_new(dir)) {
                 after.extend(self.removes.get(dir).into_iter().flatten());
             }
         }
@@ -249,9 +289,10 @@ impl<'a> Successors<'a> {
             after.extend(self.creates.get(removed).into_iter().flatten());
         }
         // If I create something new and `other` creates something inside it, I go first
-        // (if `created` is also removed, paths inside it refer to the old one)
+        // (if `created` is also removed, paths inside it refer to the old one, unless it is a
+        // file, which has nothing inside)
         if let Some(created) = action.creates()
-            && !self.removes.contains_key(created)
+            && (!self.removes.contains_key(created) || self.files.contains(created))
         {
             after.extend(inside(&self.creates, created));
         }
@@ -270,6 +311,18 @@ impl<'a> Successors<'a> {
             .cloned()
             .collect()
     }
+}
+
+/// The paths that `actions` remove that are files, by the action that deletes one, and by
+/// `is_dir` for one that is renamed
+fn removed_files(actions: &[Action], is_dir: impl Fn(&Path) -> bool) -> HashSet<&Path> {
+    (actions.iter())
+        .filter_map(|action| match action {
+            Action::DeleteFile(path) => Some(path.as_path()),
+            Action::Rename(path, _) if !is_dir(path) => Some(path.as_path()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The indexes of the actions in `paths` (`Successors::removes` or `creates`) at a path inside

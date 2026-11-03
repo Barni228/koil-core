@@ -170,6 +170,55 @@ fn test_undo_move_into_other_dir() {
 }
 
 #[test]
+fn test_undo_move_into_renamed_dir() {
+    // `a` and a copy of `b` go into the old `dir`, and with it to `dir2`, as a new file would
+    check_undo(
+        |koil| {
+            vec![
+                keep(koil, "b"),
+                with_id(id(koil, "dir"), "dir2/"),
+                with_id(id(koil, "a"), "dir/a"),
+                with_id(id(koil, "b"), "dir/b"),
+            ]
+        },
+        &[
+            ("b", Some("b")),
+            ("dir2", None),
+            ("dir2/a", Some("a")),
+            ("dir2/b", Some("b")),
+            ("dir2/sub", None),
+            ("dir2/sub/y", Some("y")),
+            ("dir2/x", Some("x")),
+        ],
+    );
+}
+
+#[test]
+fn test_undo_new_dir_where_a_file_was() {
+    // `a` is moved away, and a dir is made where it was for `a/new`
+    check_undo(
+        |koil| {
+            vec![
+                with_id(id(koil, "a"), "a2"),
+                keep(koil, "b"),
+                keep(koil, "dir/"),
+                without_id("a/new"),
+            ]
+        },
+        &[
+            ("a", None),
+            ("a/new", Some("")),
+            ("a2", Some("a")),
+            ("b", Some("b")),
+            ("dir", None),
+            ("dir/sub", None),
+            ("dir/sub/y", Some("y")),
+            ("dir/x", Some("x")),
+        ],
+    );
+}
+
+#[test]
 fn test_undo_last_apply_first() {
     let temp = test_temp_dir();
     let before = snapshot(temp.path());

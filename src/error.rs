@@ -210,12 +210,20 @@ pub enum EntryErrorKind {
         first: usize,
     },
 
-    /// A parent of the entry is a file, so nothing can be inside it
+    /// A parent of the entry is a file, so nothing can be inside it, or the entry is a file
+    /// that something is written inside in another listing (or as a nested name like `dir/A`)
     #[error("`{}` is not a directory", .0.display())]
     NotADirectory(PathBuf),
 
+    /// The entry is new, copied or moved into this dir (or into a dir moved into it), which is
+    /// deleted: it would be made, and then go to the trash with the dir
+    #[error("`{}` is deleted, so nothing can go into it", shown(.0))]
+    IntoDeleted(PathBuf),
+
     /// Something that is not deleted or moved away is already at this path, maybe hidden or
     /// ignored, or with a name that only differs in case on a filesystem that ignores case
+    /// Or something else is written at this path where this listing does not show it (in the
+    /// listing of another dir, or as a nested name like `dir/A`), which applying would create
     #[error("`{}` already exists", .0.display())]
     AlreadyExists(PathBuf),
 

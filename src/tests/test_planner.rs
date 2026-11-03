@@ -1,8 +1,19 @@
 use super::*;
 
-/// [`planner::plan_actions`], as if nothing exists on the filesystem
+/// [`planner::plan_actions`], as if nothing exists on the filesystem, and every path that is
+/// renamed is a dir (what is put inside one is inside the old one)
 fn plan_actions(actions: &[Action]) -> Vec<Action> {
-    planner::plan_actions(actions, |_| false)
+    planner::plan_actions(actions, |_| false, |_| true)
+}
+
+/// [`planner::order`], where every path that is renamed is a dir
+fn order(actions: &[Action]) -> Vec<Vec<Action>> {
+    planner::order(actions, |_| true)
+}
+
+/// [`planner::needs`], where every path that is renamed is a dir
+fn needs(actions: &[Action]) -> Vec<Vec<usize>> {
+    planner::needs(actions, |_| true)
 }
 
 #[test]
@@ -728,11 +739,13 @@ fn test_copy_dst_blocked_by_chain() {
     );
 }
 
-// TODO: this is very weird (B gets overwritten, should not happen)
-// whoever is validating stuff should check for this, so it panics
 #[test]
 fn test_copy_dst_blocked_by_cycle() {
     // swap B<->C; copy A->B; swap must resolve before copy lands in B
+    // No diff makes two actions that create `B`, as `update` rejects writing two things at one
+    // path (`Duplicate`, or `AlreadyExists` when the other is written in another listing), and
+    // the planner never panics on what a diff does not make: the copy runs last, and fails
+    // rather than overwrite `B`, as an action never overwrites what is at its path
     assert_eq!(
         vec![
             rename("B", ".B.koil0"),
@@ -830,6 +843,60 @@ fn test_add_child_before_renaming_parent_dir() {
     assert_eq!(
         vec![add("A/B"), rename("A", "C")],
         plan_actions(&[add("A/B"), rename("A", "C")])
+    );
+}
+
+#[test]
+fn test_move_into_dir_before_renaming_it() {
+    // what goes into `A` goes into the old `A`, and with it to `C`, as a new file does, which
+    // ran after by the actions' order alone (and failed, as `A` was gone)
+    for into in [rename("X", "A/X"), copy("X", "A/X"), add("A/X")] {
+        assert_eq!(
+            vec![into.clone(), rename("A", "C")],
+            plan_actions(&[rename("A", "C"), into.clone()]),
+            "{into:?}"
+        );
+    }
+    // and into a deleted one, goes to the trash with it (`update` rejects it)
+    assert_eq!(
+        vec![rename("X", "A/X"), Action::DeleteDir("A".into())],
+        plan_actions(&[Action::DeleteDir("A".into()), rename("X", "A/X")])
+    );
+}
+
+#[test]
+fn test_new_dir_where_a_file_was() {
+    // a file has nothing inside, so what goes inside one that is moved away or deleted goes in
+    // the new dir made there, after it
+    let is_dir = |path: &Path| path != Path::new("f");
+    for removed in [rename("f", "g"), delete("f")] {
+        let planned = vec![
+            removed.clone(),
+            add_dir("f"),
+            rename("X", "f/X"),
+            copy("Y", "f/Y"),
+            add("f/x"),
+        ];
+        let mut actions = planned.clone();
+        actions.reverse();
+        assert_eq!(
+            planned,
+            planner::plan_actions(&actions, |_| false, is_dir),
+            "{removed:?}"
+        );
+        // what is inside needs the dir, which needs the file out of the way
+        let needs = planner::needs(&planned, is_dir);
+        assert_eq!(needs, [vec![], vec![0], vec![1], vec![1], vec![1]]);
+    }
+    // or a dir renamed there
+    let actions = [rename("f", "g"), rename("D", "f"), add("f/x")];
+    assert_eq!(
+        actions.to_vec(),
+        planner::plan_actions(
+            &[add("f/x"), rename("D", "f"), rename("f", "g")],
+            |_| false,
+            is_dir
+        )
     );
 }
 
@@ -1065,7 +1132,7 @@ fn test_temp_skips_existing_paths() {
             rename("B", "A"),
             rename(".A.koil2", "B")
         ],
-        planner::plan_actions(&[rename("A", "B"), rename("B", "A")], taken)
+        planner::plan_actions(&[rename("A", "B"), rename("B", "A")], taken, |_| true)
     );
 }
 
@@ -1091,7 +1158,7 @@ fn test_order_keeps_cycles() {
             vec![delete("E")],
             vec![rename("C", "D")]
         ],
-        planner::order(&[
+        order(&[
             delete("E"),
             rename("C", "D"),
             rename("B", "A"),
@@ -1103,26 +1170,26 @@ fn test_order_keeps_cycles() {
 #[test]
 fn test_needs_swap() {
     // each frees the path the other one takes
-    let needs = planner::needs(&[rename("A", "B"), rename("B", "A")]);
+    let needs = needs(&[rename("A", "B"), rename("B", "A")]);
     assert_eq!(needs, [vec![1], vec![0]]);
 }
 
 #[test]
 fn test_needs_chain() {
     // only directly, `A -> B` needs `C -> D` through `B -> C`
-    let needs = planner::needs(&[rename("A", "B"), rename("B", "C"), rename("C", "D")]);
+    let needs = needs(&[rename("A", "B"), rename("B", "C"), rename("C", "D")]);
     assert_eq!(needs, [vec![1], vec![2], vec![]]);
 }
 
 #[test]
 fn test_needs_delete() {
-    let needs = planner::needs(&[delete("B"), rename("A", "B"), copy("C", "D")]);
+    let needs = needs(&[delete("B"), rename("A", "B"), copy("C", "D")]);
     assert_eq!(needs, [vec![], vec![0], vec![]]);
 }
 
 #[test]
 fn test_needs_new_dirs() {
-    let needs = planner::needs(&[
+    let needs = needs(&[
         add_dir("new"),
         add_dir("new/nested"),
         add("new/nested/file"),
@@ -1148,7 +1215,7 @@ fn test_needs_new_dirs() {
 #[test]
 fn test_needs_independent() {
     // a copy and a rename of one path, and a move out of a deleted dir, run in either order
-    let needs = planner::needs(&[
+    let needs = needs(&[
         copy("A", "B"),
         rename("A", "C"),
         delete("dir"),
@@ -1160,6 +1227,6 @@ fn test_needs_independent() {
 #[test]
 fn test_needs_dir_taken_again() {
     // `P/new` goes into the old `P`, before it is renamed, so it does not need `R -> P`
-    let needs = planner::needs(&[rename("P", "Q"), rename("R", "P"), add("P/new")]);
+    let needs = needs(&[rename("P", "Q"), rename("R", "P"), add("P/new")]);
     assert_eq!(needs, [vec![], vec![0], vec![]]);
 }
