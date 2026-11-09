@@ -122,6 +122,11 @@ koil works on Linux, macOS and Windows. It uses the
 macOS it calls `NSFileManager` itself, because it has to know where the trashed item went
 to restore it.
 
+On Windows, the drives are a listing of their own (`shows_drives`), at `/`, which `..` of a
+drive's root (`C:/..`) opens: each drive's root, which can be opened from there, but not
+renamed, moved or copied. A drive's name alone (`C:`) is its root, and `complete` gives the
+drives too (`t` gives `T:/`).
+
 ## License
 
 [MIT](LICENSE)

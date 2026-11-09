@@ -1,6 +1,7 @@
 //! The patterns a listing can show (see [`Pattern`]), and walking the open dir to find what
 //! they match
 
+use crate::drives::{is_drive_root, is_drives};
 use crate::sync::Seen;
 use crate::{GlobError, Koil, OpenError, OverLimit, is_hidden};
 use globset::{GlobBuilder, GlobMatcher};
@@ -124,6 +125,7 @@ impl View {
     /// Whether `path` is shown in the listing
     pub(crate) fn contains(&self, path: &Path, is_dir: bool) -> bool {
         match &self.matcher {
+            None if is_drives(&self.base) => is_drive_root(path),
             None => path.parent() == Some(&self.base),
             Some(matcher) => path
                 .strip_prefix(&self.base)

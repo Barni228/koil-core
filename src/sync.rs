@@ -208,10 +208,15 @@ impl Koil {
     /// dir it was in; if it is gone, its closest parent is opened ([`Synced::moved`])
     /// What changed against what user changed is returned in [`Synced::conflicts`], and stays
     /// as its [`ConflictKind`] says until [`Koil::resolve`]
+    /// In the drives (see [`Koil::shows_drives`]), it adds the drives that came, and removes
+    /// the entries of those that went
     /// If reading fails, nothing changes
     pub fn sync(&mut self, entries: &[Entry]) -> io::Result<Synced> {
         if self.current_dir.as_os_str().is_empty() {
             return Ok(Synced::default());
+        }
+        if self.shows_drives() {
+            return Ok(self.sync_drives(entries));
         }
         self.atomically(|koil| koil.sync_with(entries))
     }
@@ -258,8 +263,10 @@ impl Koil {
     /// What a frontend should watch, to call [`Koil::sync`] when something there changes on
     /// disk: the open dir (and what is inside its dirs, for a pattern), the dir it is in (so
     /// its rename is seen), and the dirs of the changes made in other listings
+    /// Nothing in the drives (see [`Koil::shows_drives`]): a drive that comes or goes is no
+    /// change in a dir
     pub fn watched(&self) -> Watched {
-        if self.current_dir.as_os_str().is_empty() {
+        if self.current_dir.as_os_str().is_empty() || self.shows_drives() {
             return Watched::default();
         }
         let view = self.view();

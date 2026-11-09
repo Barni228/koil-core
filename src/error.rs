@@ -103,6 +103,11 @@ pub enum OpenError {
     #[error("`{}` is a file, not a directory", shown(.0))]
     NotADirectory(PathBuf),
 
+    /// A pattern (as read) whose base is the drives (see
+    /// [`Koil::shows_drives`](crate::Koil::shows_drives)), which are no dir to search
+    #[error("A pattern can not search the drives, start it with one, like `C:/{0}`")]
+    PatternInDrives(String),
+
     #[error("`{glob}` is not a valid glob pattern")]
     InvalidGlob {
         glob: String,
@@ -249,6 +254,18 @@ pub enum EntryErrorKind {
     /// allow, a reserved name, or a `.` at the end, which it would remove
     #[error("{0}")]
     WindowsName(EntryWarningKind),
+
+    /// The ID of a drive's root (the path), which is in no dir, written anywhere but at its
+    /// own name in the listing of the drives (see
+    /// [`Koil::shows_drives`](crate::Koil::shows_drives)): it can not be renamed, moved or
+    /// copied
+    #[error("`{}` is a drive, which can not be renamed, moved or copied", shown(.0))]
+    Drive(PathBuf),
+
+    /// An entry in the listing of the drives that is not one of them (by its name, as
+    /// written): new, or another ID moved there
+    #[error("`{}` is not a drive, and only the drives can be here", shown(.0))]
+    NotADrive(PathBuf),
 }
 
 /// Something about one of the entries given to [`Koil::update`](crate::Koil::update) that is

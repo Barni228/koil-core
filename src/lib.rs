@@ -2,6 +2,7 @@
 
 use crate::apply::{Blocked, Undo, inside, same_file};
 use crate::diff::{Diff, Outcome};
+use crate::drives::{drive_name, is_drive_root, is_drives};
 use crate::error::io_error;
 use crate::pattern::{View, Walked};
 use crate::sync::{FileKey, Seen};
@@ -15,6 +16,7 @@ use typed_builder::TypedBuilder;
 
 pub mod apply;
 mod diff;
+mod drives;
 mod error;
 mod location;
 mod names;
@@ -25,6 +27,7 @@ mod sort;
 mod sync;
 pub mod trash;
 
+pub use drives::in_drives;
 pub use error::{
     EntryError, EntryErrorKind, EntryWarning, EntryWarningKind, GlobError, KoilError, OpenError,
     OverLimit, UpdateError, UpdateOpenError, Warning,
@@ -302,6 +305,8 @@ impl Koil {
     /// see [`Koil::read_location`]
     /// The dir (or the base dir of the pattern) must be on disk or new in the diff, else it
     /// fails with [`OpenError::NotFound`], or [`OpenError::NotADirectory`] if it is a file
+    /// On Windows, `..` of a drive's root (`C:/..`) and `/` open the drives, see
+    /// [`Koil::shows_drives`], and a drive's name alone (`C:`) is its root
     /// This never adds changes, new dirs must be written in the listing
     pub fn open<P: AsRef<Path>>(&mut self, location: P) -> Result<(), OpenError> {
         self.atomically(|koil| koil.open_in_place(location.as_ref()))
@@ -325,6 +330,8 @@ impl Koil {
 
     /// The currently open directory as an absolute path, or the base dir of [`Koil::pattern`]
     /// Names of entries are relative to it
+    /// It is `/` while the drives are open, which is no dir on disk (see
+    /// [`Koil::shows_drives`])
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
     }
@@ -337,6 +344,7 @@ impl Koil {
     /// What is open, for frontends to show, as it can be given to [`Koil::open`] again:
     /// [`Koil::current_dir`], then a `/` and [`Koil::pattern`] if there is one
     /// It only has `/`, also on Windows (`C:/src/*.rs`), so a pattern can be written after it
+    /// It is `/` while the drives are open (see [`Koil::shows_drives`])
     pub fn location(&self) -> PathBuf {
         let dir = with_slashes(&self.current_dir);
         let Some(pattern) = &self.pattern else {
@@ -372,10 +380,12 @@ impl Koil {
     pub fn listing(&self) -> Vec<Entry> {
         let view = self.view();
         let in_view = |index: usize, path: &Path| view.contains(path, self.ids[index].is_dir());
+        // a drive is a dir, even with no disk in it
+        let is_dir = |index: usize| is_drive_root(&self.ids[index]) || self.ids[index].is_dir();
         let entry = |index: usize, path: &Path| Entry {
             id: Some(to_id(index)),
             name: self.name(path),
-            is_dir: self.ids[index].is_dir(),
+            is_dir: is_dir(index),
         };
 
         let mut entries = Vec::new();
@@ -777,7 +787,12 @@ impl Koil {
 
     /// `path` relative to [`Koil::current_dir`], only with `/` (see [`with_slashes`]), like
     /// the names in the listing, `None` if it is not inside it
+    /// In the drives (see [`Koil::shows_drives`]), it is its drive's name and the rest of it
+    /// (`C:/x`), or for a drive's root its name (`C:`), `None` if it is not on a drive
     pub fn relative(&self, path: &Path) -> Option<PathBuf> {
+        if self.shows_drives() {
+            return drive_name(path);
+        }
         let rest = path.strip_prefix(&self.current_dir).ok()?;
         (!rest.as_os_str().is_empty()).then(|| with_slashes(rest))
     }
@@ -789,7 +804,7 @@ impl Koil {
     pub fn is_pending(&self, entry: &Entry) -> bool {
         match entry.id {
             None => true,
-            Some(id) => self.path_of(id) != Some(self.current_dir.join(&entry.name).as_path()),
+            Some(id) => self.path_of(id) != Some(self.path_at(&entry.name).as_path()),
         }
     }
 
@@ -837,6 +852,10 @@ impl Koil {
     fn open_in_place(&mut self, location: &Path) -> Result<(), OpenError> {
         let Location { dir, pattern, .. } = self.read_location(location, self.settings.regex);
         if let Some(pattern) = &pattern {
+            // the drives are no dir to walk
+            if is_drives(&dir) {
+                return Err(OpenError::PatternInDrives(pattern.as_str().to_string()));
+            }
             pattern.matcher()?;
         }
         if !self.is_dir(&dir) {
@@ -1004,8 +1023,12 @@ impl Koil {
     }
 
     /// Every path on disk that `view` shows (see [`Koil::walk`]), with what is there, nothing
-    /// if [`Koil::current_dir`] is a new dir that is not created yet
+    /// if [`Koil::current_dir`] is a new dir that is not created yet, and the drives' roots if
+    /// they are open (see [`Koil::read_drives`])
     fn read_view(&self, view: &View) -> Result<Walked, OpenError> {
+        if self.shows_drives() {
+            return Ok(self.read_drives());
+        }
         match self.current_dir.is_dir() {
             true => self.walk(view),
             false => Ok(Vec::new()),
@@ -1014,13 +1037,17 @@ impl Koil {
 
     /// Make `paths` (read by [`Koil::read_view`]) [`Koil::current_listing`], giving new IDs to
     /// the ones koil has not seen, and remember what is at each, and what
-    /// [`Koil::current_dir`] and the dirs it is in are (see [`Koil::dirs_seen`])
+    /// [`Koil::current_dir`] and the dirs it is in are (see [`Koil::dirs_seen`]; none for the
+    /// drives, which are no dir on disk)
     /// A changed entry in the view stays too, even if it is hidden, so it is not taken for
     /// deleted in the next update
-    fn list(&mut self, paths: Walked) {
-        self.dirs_seen = (self.current_dir.ancestors())
-            .filter_map(|dir| Some((dir.to_path_buf(), FileKey::at(dir)?)))
-            .collect();
+    pub(crate) fn list(&mut self, paths: Walked) {
+        self.dirs_seen = match self.shows_drives() {
+            true => Vec::new(),
+            false => (self.current_dir.ancestors())
+                .filter_map(|dir| Some((dir.to_path_buf(), FileKey::at(dir)?)))
+                .collect(),
+        };
         self.current_listing.clear();
         // a pattern can show thousands of paths, so they are not searched for in `ids` one by one
         let found: Vec<(Option<usize>, PathBuf, Option<Seen>)> = {
@@ -1061,8 +1088,12 @@ impl Koil {
     }
 
     /// The name of `path` in the listing, relative to [`Koil::current_dir`], only with `/`,
-    /// also on Windows, as users write it
+    /// also on Windows, as users write it, or in the drives, its drive's (see
+    /// [`Koil::relative`])
     fn name(&self, path: &Path) -> PathBuf {
+        if self.shows_drives() {
+            return drive_name(path).unwrap_or_else(|| path.to_path_buf());
+        }
         with_slashes(path.strip_prefix(&self.current_dir).unwrap())
     }
 
@@ -1079,17 +1110,29 @@ impl Koil {
         )
     }
 
-    /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`]
+    /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`], or the drives, which
+    /// are a dir of their own, though nothing else in them is (see [`in_drives`])
     fn is_dir(&self, path: &Path) -> bool {
-        path.is_dir() || self.diff.creates_dir(path)
+        match in_drives(path) {
+            true => is_drives(path),
+            false => path.is_dir() || self.diff.creates_dir(path),
+        }
     }
 
     /// Why `path`, which is not a dir, can not be opened: its first part that is not a dir is
-    /// a file (on disk, or new in the diff), or does not exist
+    /// a file (on disk, or new in the diff), or does not exist, or is a drive that can not be
+    /// read (with no disk in it)
     fn not_a_dir(&self, path: &Path) -> OpenError {
         let first = path.ancestors().take_while(|p| !self.is_dir(p)).last();
         let first = first.unwrap_or(path).to_path_buf();
-        match first.exists() || self.diff.without_id.get(&first) == Some(&false) {
+        if is_drive_root(&first)
+            && let Err(error) = std::fs::read_dir(&first)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return OpenError::Io(error);
+        }
+        let exists = !in_drives(&first) && first.exists();
+        match exists || self.diff.without_id.get(&first) == Some(&false) {
             true => OpenError::NotADirectory(first),
             false => OpenError::NotFound(first),
         }
@@ -1110,6 +1153,9 @@ impl Koil {
 
     /// See [`Koil::update`], which runs it on a copy, as it is left half updated if it fails
     fn update_entries(&mut self, entries: &[Entry]) -> Result<Vec<EntryWarning>, UpdateError> {
+        if self.shows_drives() {
+            return self.update_drives(entries);
+        }
         let mut errors = Vec::new();
         let mut error = |entry, kind| errors.push(EntryError { entry, kind });
 
@@ -1129,6 +1175,13 @@ impl Koil {
                 }
                 None => None,
             };
+            // a drive is in no dir, so it can not be moved or copied into one
+            if let Some(index) = index
+                && is_drive_root(&self.ids[index])
+            {
+                error(i, EntryErrorKind::Drive(self.ids[index].clone()));
+                continue;
+            }
             // what the listing shows was on disk when it was read, and is followed by `sync`
             if let Some(index) = index
                 && !self.current_listing.contains(&index)
@@ -1435,8 +1488,9 @@ fn is_hidden(name: impl AsRef<OsStr>) -> bool {
 }
 
 /// Whether something is at `path`, even a broken link, as a link is not followed
+/// Nothing is in the drives, which Windows would read on its current drive (see [`in_drives`])
 pub(crate) fn on_disk(path: &Path) -> bool {
-    path.symlink_metadata().is_ok()
+    !in_drives(path) && path.symlink_metadata().is_ok()
 }
 
 /// `path` with its start `from` replaced by `to`, `None` if it is neither `from` nor inside it

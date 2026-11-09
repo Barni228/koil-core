@@ -1513,6 +1513,197 @@ fn test_open_quoted_windows() {
     assert_eq!(("my dir", Some("*")), (dir.as_str(), pattern.as_deref()));
 }
 
+/// The root of the drive `test_dir` is on, and its name in the drives (like `C:`)
+#[cfg(windows)]
+fn test_drive() -> (PathBuf, String) {
+    let koil = test_koil();
+    let root = koil.current_dir().ancestors().last().unwrap().to_path_buf();
+    let name = root.to_str().unwrap().trim_end_matches('\\').to_string();
+    (root, name)
+}
+
+/// `koil` (a copy) updated with `entries`
+#[cfg(windows)]
+fn updated(koil: &Koil, entries: &[Entry]) -> Result<Koil, UpdateError> {
+    let mut koil = koil.clone();
+    koil.update(entries)?;
+    Ok(koil)
+}
+
+#[cfg(windows)]
+#[test]
+fn test_drives() {
+    let (root, name) = test_drive();
+    let mut koil = test_koil();
+    // above a drive's root are the drives, at `/`
+    koil.open(&root).unwrap();
+    koil.open("..").unwrap();
+    assert!(koil.shows_drives());
+    assert_eq!(Path::new("/"), koil.current_dir());
+    assert_eq!(Path::new("/"), koil.location());
+    // each drive's root, as a dir named as the drive
+    let listing = koil.listing();
+    let drive = (listing.iter().find(|e| e.name == Path::new(&name))).expect("the drive is listed");
+    assert_eq!(Some(root.as_path()), koil.path_of(drive.id.unwrap()));
+    assert!(!koil.is_pending(drive));
+    for entry in &listing {
+        let shown = entry.name.to_str().unwrap();
+        assert!(
+            entry.is_dir && shown.len() == 2 && shown.ends_with(':'),
+            "{shown}"
+        );
+    }
+    assert_eq!(Some(PathBuf::from(&name)), koil.relative(&root));
+    let inside = root.join("x");
+    assert_eq!(
+        Some(PathBuf::from(format!("{name}/x"))),
+        koil.relative(&inside)
+    );
+    assert!(koil.watched().dirs.is_empty());
+
+    // `..` of them is them again, and a drive's name alone is its root, wherever it is written
+    koil.open("..").unwrap();
+    assert!(koil.shows_drives());
+    koil.open(&name).unwrap();
+    assert_eq!(root, koil.current_dir());
+    koil.open(test_path("dir")).unwrap();
+    koil.open(name.to_lowercase()).unwrap();
+    assert_eq!(root, koil.current_dir());
+
+    // `/` (or `\`) is them from anywhere, and a path in them starts with a drive's name
+    for drives in ["/", r"\"] {
+        koil.open(test_path("dir")).unwrap();
+        koil.open(drives).unwrap();
+        assert!(koil.shows_drives());
+    }
+    let dir = with_slashes(&test_path("dir")).display().to_string();
+    koil.open(format!("/{dir}")).unwrap();
+    assert_eq!(test_path("dir"), koil.current_dir());
+    // through them, from a drive's root to a path on another
+    koil.open(format!("{name}/../{dir}")).unwrap();
+    assert_eq!(test_path("dir"), koil.current_dir());
+    // as many `..` as there are names, then one more
+    let normal = |c: &Component| matches!(c, Component::Normal(_));
+    let levels = koil.current_dir().components().filter(normal).count();
+    koil.open(vec![".."; levels].join("/")).unwrap();
+    assert_eq!(root, koil.current_dir());
+    koil.open(test_path("dir")).unwrap();
+    koil.open(vec![".."; levels + 1].join("/")).unwrap();
+    assert!(koil.shows_drives());
+
+    // anything else in them is nowhere, rather than on the current drive
+    for nope in ["/nope", "nope", "/Windows"] {
+        let error = koil.open(nope).unwrap_err();
+        let path = Path::new("/").join(nope.trim_start_matches('/'));
+        assert!(
+            matches!(&error, OpenError::NotFound(p) if *p == path),
+            "{error:?}"
+        );
+    }
+    // and no pattern searches them
+    for pattern in ["*", "/*", "**/*.rs"] {
+        let error = koil.open(pattern).unwrap_err();
+        assert!(matches!(error, OpenError::PatternInDrives(_)), "{error:?}");
+    }
+    assert!(koil.shows_drives());
+}
+
+#[cfg(windows)]
+#[test]
+fn test_drives_update() {
+    let (root, name) = test_drive();
+    let mut koil = test_koil();
+    let file = test_id(&koil, "file");
+    koil.open("/").unwrap();
+    let listing = koil.listing();
+    let at = (listing.iter().position(|e| e.name == Path::new(&name))).unwrap();
+    let drive = listing[at].id.unwrap();
+    // nothing changes, also with a drive left out
+    koil.update(&listing).unwrap();
+    let mut fewer = listing.clone();
+    fewer.remove(at);
+    koil.update(&fewer).unwrap();
+    assert!(!koil.has_changes());
+    assert_eq!(listing, koil.listing());
+    assert_eq!(Ok(Vec::new()), koil.check(&listing));
+
+    // but a drive can not be renamed, nor anything else be here
+    let mut renamed = listing.clone();
+    renamed[at].name = "Q:".into();
+    let error = EntryErrorKind::Drive(root.clone());
+    assert_eq!(vec![(at, error)], errors(updated(&koil, &renamed)));
+    let end = listing.len();
+    let with = |extra: Entry| [listing.clone(), vec![extra]].concat();
+    let new = with(without_id("new/"));
+    let error = EntryErrorKind::NotADrive("new".into());
+    assert_eq!(vec![(end, error)], errors(updated(&koil, &new)));
+    let moved = with(with_id(file, "file"));
+    let error = EntryErrorKind::NotADrive("file".into());
+    assert_eq!(vec![(end, error)], errors(updated(&koil, &moved)));
+    let written = with(without_id(&format!("{name}/")));
+    let error = EntryErrorKind::AlreadyExists(name.clone().into());
+    assert_eq!(vec![(end, error)], errors(updated(&koil, &written)));
+    let twice = with(listing[at].clone());
+    let path = PathBuf::from(&name);
+    let error = EntryErrorKind::Duplicate { path, first: at };
+    assert_eq!(vec![(end, error)], errors(updated(&koil, &twice)));
+
+    // nor be moved or copied into a dir
+    koil.open(test_path("")).unwrap();
+    let mut entries = test_dir_listing(&koil);
+    entries.push(with_id(drive, "drive/"));
+    let error = EntryErrorKind::Drive(root);
+    assert_eq!(vec![(4, error)], errors(updated(&koil, &entries)));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_drives_sync() {
+    let mut koil = Koil::default();
+    koil.open("/").unwrap();
+    let listing = koil.listing();
+    assert_eq!(Synced::default(), koil.sync(&listing).unwrap());
+    assert_eq!(listing, koil.listing());
+}
+
+#[cfg(windows)]
+#[test]
+fn test_complete_drives() {
+    let (_, name) = test_drive();
+    let slashed = format!("{name}/");
+    let letter = name[..1].to_lowercase();
+    let koil = test_koil();
+    let complete = |koil: &Koil, location: &str| {
+        let completion = koil.complete(location, &Settings::default());
+        (completion.start, completion.names)
+    };
+    // a letter alone (or with its `:`) is the start of a drive's name too
+    let (start, names) = complete(&koil, &letter);
+    assert_eq!(0, start);
+    assert!(names.contains(&slashed), "{names:?}");
+    let colon = format!("{letter}:");
+    assert_eq!((0, vec![slashed.clone()]), complete(&koil, &colon));
+    assert!(
+        !complete(&koil, &format!("dir/{letter}"))
+            .1
+            .contains(&slashed)
+    );
+    // in the drives, the names are only theirs
+    let (start, names) = complete(&koil, "/");
+    assert_eq!(1, start);
+    assert!(names.contains(&slashed), "{names:?}");
+    assert!(
+        names.iter().all(|n| n.len() == 3 && n.ends_with(":/")),
+        "{names:?}"
+    );
+    let one = format!("/{letter}");
+    assert_eq!((1, vec![slashed.clone()]), complete(&koil, &one));
+    let mut drives = koil.clone();
+    drives.open("/").unwrap();
+    assert_eq!((0, names), complete(&drives, ""));
+    assert_eq!((0, vec![slashed]), complete(&drives, &letter));
+}
+
 #[test]
 fn test_glob_absolute() {
     let mut koil = Koil::default();
@@ -2421,9 +2612,13 @@ fn completion_temp_dir() -> tempfile::TempDir {
 
 /// What `location` completes to in `koil` with `settings`: where the part being written
 /// starts, and the names it can be
+/// What `location` completes to, without the drives a letter alone also completes to on
+/// Windows (see `test_complete_drives`)
 fn completed(koil: &Koil, settings: &Settings, location: &str) -> (usize, Vec<String>) {
     let completion = koil.complete(location, settings);
-    (completion.start, completion.names)
+    let drive = |name: &String| name.len() == 3 && name.ends_with(":/");
+    let names = completion.names.into_iter().filter(|n| !drive(n)).collect();
+    (completion.start, names)
 }
 
 fn completion(start: usize, names: &[&str]) -> (usize, Vec<String>) {

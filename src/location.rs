@@ -1,6 +1,9 @@
 //! Reading a location as it is written, like a shell reads a path, see
 //! [`Koil::read_location`] and [`Koil::complete`]
 
+use crate::drives::{
+    DRIVES, drive_names, drive_root, in_drives, is_drive_root, is_drives, starts_drive,
+};
 use crate::pattern::walker;
 use crate::{Koil, Pattern, Settings, is_hidden, on_disk};
 use std::collections::BTreeSet;
@@ -257,15 +260,24 @@ fn has_in_order(name: &str, part: &str) -> bool {
 /// Existing part of the path is canonicalized, the rest is normalized without touching the filesystem
 /// On Windows, it has no `\\?\` before it (which `canonicalize` adds, and frontends would show),
 /// unless the path can not work without it
+/// On Windows, `..` of a drive's root is the drives (`/`, see
+/// [`Koil::shows_drives`](crate::Koil::shows_drives)), where a drive's name is its root (`/C:`
+/// is `C:\`), and anything else is nowhere (see [`in_drives`])
 pub(crate) fn resolve(path: &Path) -> io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
-    for component in std::path::absolute(path)?.components() {
+    for component in absolute(path)?.components() {
         match component {
             Component::CurDir => {}
+            // above a drive's root are the drives
+            Component::ParentDir if is_drive_root(&resolved) => resolved = PathBuf::from(DRIVES),
             // `resolved` is canonical (no symlinks), so `..` is just its parent
             Component::ParentDir => {
                 resolved.pop();
             }
+            Component::Normal(name) if in_drives(&resolved) => match drive_root(name) {
+                Some(root) if is_drives(&resolved) => resolved = root,
+                _ => resolved.push(name),
+            },
             c => {
                 resolved.push(c);
                 if on_disk(&resolved) {
@@ -275,6 +287,16 @@ pub(crate) fn resolve(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+/// [`std::path::absolute`], but on Windows a path with a root is kept as it is: Windows takes
+/// `..` away as written (`C:\..` is `C:\`), and puts its current drive before a path that has
+/// none (`\x`), which [`resolve`] reads in the drives
+fn absolute(path: &Path) -> io::Result<PathBuf> {
+    match cfg!(windows) && path.has_root() {
+        true => Ok(path.to_path_buf()),
+        false => std::path::absolute(path),
+    }
 }
 
 impl Koil {
@@ -294,6 +316,8 @@ impl Koil {
     /// until the first with a special character that is not quoted (`*?[{` for a glob, and
     /// `.,*+?()[]{}|^$\` for a regex), which starts the pattern, where the quoted characters
     /// that are special in it are escaped
+    /// On Windows, a drive's name alone (`C:`) is its root, and `/` is the drives (`..` of a
+    /// drive's root too), see [`Koil::shows_drives`]
     pub fn read_location<P: AsRef<Path>>(&self, location: P, regex: bool) -> Location {
         let location = location.as_ref();
         let text = location.to_string_lossy();
@@ -336,6 +360,10 @@ impl Koil {
     /// written is never read as a pattern
     /// The `~` alone completes to `~/`. Nothing completes if the part's dir is not a dir, or is
     /// a pattern, or the part starts in quotes (or after an escaped `/`)
+    /// On Windows, in the drives (see [`Koil::shows_drives`]: `/`, or the part with no `/`
+    /// before it while they are open) the names are the drives' (`C:/`), and a part with no
+    /// `/` before it that is a letter, or a letter and a `:`, is also the start of a drive's,
+    /// wherever it is written (`t` gives `T:/`, as well as the dirs that start with `t`)
     pub fn complete(&self, location: &str, settings: &Settings) -> Completion {
         let mut read = read_quoted(location, 0);
         let home = expand_tilde(location, &mut read);
@@ -371,6 +399,10 @@ impl Koil {
         if !part.is_empty() && "..".starts_with(&part) {
             dirs.insert("..".to_string());
         }
+        // a letter alone (or with a `:`) can be a drive's, wherever it is written
+        if slash.is_none() && starts_drive(&part) {
+            dirs.extend(drive_names());
+        }
         // smart case, like vim's `smartcase`: case is ignored unless the part has an uppercase
         // letter
         let ignore_case = !part.chars().any(char::is_uppercase);
@@ -404,6 +436,10 @@ impl Koil {
     /// without hidden ones unless `show_hidden`, and without ignored ones if `gitignore`, and
     /// the ones that are new in the diff
     fn dirs_in(&self, dir: &Path, show_hidden: bool, gitignore: bool) -> BTreeSet<String> {
+        // what is in them can not be new
+        if is_drives(dir) {
+            return drive_names().collect();
+        }
         let walk = walker(dir, show_hidden, gitignore)
             .max_depth(Some(1))
             .build();
@@ -433,16 +469,17 @@ impl Koil {
         names
     }
 
-    /// `path` (relative to [`Koil::current_dir`]) as an absolute path, if it is a dir
+    /// `path` (relative to [`Koil::current_dir`], see [`Koil::joined`]) as an absolute path,
+    /// if it is a dir
     fn dir_at(&self, path: &Path) -> Option<PathBuf> {
-        let path = resolve(&self.current_dir.join(path)).ok()?;
+        let path = resolve(&self.joined(path)).ok()?;
         self.is_dir(&path).then_some(path)
     }
 
-    /// `path` (relative to [`Koil::current_dir`]) as an absolute path, resolved as far as it
-    /// can be
+    /// `path` (relative to [`Koil::current_dir`], see [`Koil::joined`]) as an absolute path,
+    /// resolved as far as it can be
     fn absolute(&self, path: &Path) -> PathBuf {
-        let path = self.current_dir.join(path);
+        let path = self.joined(path);
         resolve(&path).unwrap_or(path)
     }
 
