@@ -20,6 +20,8 @@ include = [
 [dependencies]
 # `canonicalize` without the `\\?\` Windows puts before every path
 dunce = "1.0"
+# sets the times of what is moved to another drive, also of a dir or a link
+filetime = "0.2"
 globset = "0.4"
 ignore = "0.4.33"
 pathfinding = "4.16"

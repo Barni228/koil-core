@@ -891,3 +891,176 @@ fn test_undo_in_renamed_dir() {
     koil.undo().unwrap();
     assert_eq!(before, snapshot(temp.path()));
 }
+
+/// When what is at `path` (the link itself, for a link) was modified, in seconds
+fn modified(path: &Path) -> i64 {
+    filetime::FileTime::from_last_modification_time(&path.symlink_metadata().unwrap()).seconds()
+}
+
+/// Make everything in a [`test_temp_dir`] at `root` modified at times of its own, long ago,
+/// the dirs after what is in them, as a file made in a dir changes when it was modified
+fn set_old_times(root: &Path) -> Vec<(&'static str, i64)> {
+    let times = [
+        ("a", 1_000_000_000),
+        ("dir/sub/y", 1_100_000_000),
+        ("dir/sub", 1_200_000_000),
+        ("dir/x", 1_300_000_000),
+        ("dir", 1_400_000_000),
+    ];
+    for (path, time) in times {
+        let time = filetime::FileTime::from_unix_time(time, 0);
+        filetime::set_file_times(root.join(path), time, time).unwrap();
+    }
+    times.to_vec()
+}
+
+#[test]
+fn test_move_across() {
+    // what a move to another filesystem does, here within one: a copy, then the source removed
+    let temp = test_temp_dir();
+    let root = temp.path();
+    let times = set_old_times(root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // a link is moved as a link, and a dir keeps its permissions
+        std::os::unix::fs::symlink("x", root.join("dir/link")).unwrap();
+        fs::set_permissions(root.join("dir/sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        // the link changed when `dir` was modified
+        set_old_times(root);
+    }
+    let before = snapshot(&root.join("dir"));
+
+    crate::apply::move_across(&root.join("dir"), &root.join("moved")).unwrap();
+    assert!(!root.join("dir").exists());
+    assert_eq!(before, snapshot(&root.join("moved")));
+    for (path, time) in times {
+        if let Some(rest) = path.strip_prefix("dir") {
+            let moved = format!("moved{rest}");
+            assert_eq!(time, modified(&root.join(&moved)), "{moved}");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let link = root.join("moved/link");
+        assert_eq!(Path::new("x"), fs::read_link(link).unwrap());
+        let mode = root.join("moved/sub").metadata().unwrap().permissions();
+        assert_eq!(0o700, mode.mode() & 0o777);
+    }
+
+    // a file, with the time it had
+    crate::apply::move_across(&root.join("a"), &root.join("moved/a")).unwrap();
+    assert!(!root.join("a").exists());
+    assert_eq!("a", fs::read_to_string(root.join("moved/a")).unwrap());
+    assert_eq!(1_000_000_000, modified(&root.join("moved/a")));
+}
+
+#[test]
+fn test_move_across_never_overwrites() {
+    let temp = test_temp_dir();
+    let root = temp.path();
+    let before = snapshot(root);
+    for (src, dst) in [("a", "b"), ("a", "dir"), ("dir", "b"), ("dir/sub", "dir/x")] {
+        let error = crate::apply::move_across(&root.join(src), &root.join(dst)).unwrap_err();
+        assert_eq!(io::ErrorKind::AlreadyExists, error.kind(), "{src} -> {dst}");
+    }
+    assert_eq!(before, snapshot(root));
+}
+
+/// Failures that take permissions to make, which only Unix has (and root ignores)
+#[cfg(unix)]
+#[test]
+fn test_move_across_fails_whole() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = test_temp_dir();
+    let root = temp.path();
+    let before = snapshot(root);
+    let set_mode = |path: &str, mode| {
+        fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap()
+    };
+
+    // `dir/x` is copied, then `dir/sub/y` can not be read: what was copied is removed
+    set_mode("dir/sub/y", 0o000);
+    let error = crate::apply::move_across(&root.join("dir"), &root.join("moved")).unwrap_err();
+    assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
+    set_mode("dir/sub/y", 0o644);
+    assert_eq!(before, snapshot(root));
+
+    // `dir/sub/y` is copied, but nothing can be removed from `dir/sub`: the copy is removed
+    set_mode("dir/sub", 0o555);
+    let error = crate::apply::move_across(&root.join("dir/sub/y"), &root.join("y")).unwrap_err();
+    assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
+    set_mode("dir/sub", 0o755);
+    assert_eq!(before, snapshot(root));
+
+    // `dir/x` is removed, then `dir/sub/y` can not be: the copy stays, as it is all of it now
+    set_mode("dir/sub", 0o555);
+    let after = snapshot(&root.join("dir"));
+    let error = crate::apply::move_across(&root.join("dir"), &root.join("moved")).unwrap_err();
+    assert!(error.to_string().contains("was copied to"), "{error}");
+    set_mode("dir/sub", 0o755);
+    set_mode("moved/sub", 0o755);
+    assert_eq!(after, snapshot(&root.join("moved")));
+    assert!(root.join("dir/sub/y").exists());
+}
+
+/// A temp dir on another filesystem than [`test_temp_dir`]'s, which nothing there can be
+/// renamed to: one in `KOIL_TEST_OTHER_FILESYSTEM`, in `/dev/shm` (memory, on Linux), or next
+/// to the build (on CI's Windows, another drive than the temp dir's)
+/// `None` if they are all on the same one, or not there
+fn other_filesystem() -> Option<TempDir> {
+    let temp = tempfile::tempdir().unwrap();
+    let probe = temp.path().join("probe");
+    let dirs = [
+        std::env::var_os("KOIL_TEST_OTHER_FILESYSTEM").map(PathBuf::from),
+        Some(PathBuf::from("/dev/shm")),
+        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")),
+    ];
+    (dirs.into_iter().flatten())
+        .filter_map(|dir| tempfile::tempdir_in(dir).ok())
+        .find(|other| {
+            fs::write(&probe, "").unwrap();
+            fs::rename(&probe, other.path().join("probe"))
+                .is_err_and(|error| error.kind() == io::ErrorKind::CrossesDevices)
+        })
+}
+
+#[test]
+fn test_undo_move_to_another_filesystem() {
+    let Some(other) = other_filesystem() else {
+        return;
+    };
+    let temp = test_temp_dir();
+    let times = set_old_times(temp.path());
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // remove `a` and `dir` here, and write them in the other dir
+    let (a, dir) = (id(&koil, "a"), id(&koil, "dir"));
+    koil.update(&[keep(&koil, "b")]).unwrap();
+    koil.open(other.path()).unwrap();
+    koil.update(&[with_id(a, "a"), with_id(dir, "moved/")])
+        .unwrap();
+    koil.apply().unwrap();
+    assert_eq!(tree(&[("b", Some("b"))]), snapshot(temp.path()));
+    let moved = [
+        ("a", Some("a")),
+        ("moved", None),
+        ("moved/sub", None),
+        ("moved/sub/y", Some("y")),
+        ("moved/x", Some("x")),
+    ];
+    assert_eq!(tree(&moved), snapshot(other.path()));
+    assert_eq!(1_000_000_000, modified(&other.path().join("a")));
+    assert_eq!(1_100_000_000, modified(&other.path().join("moved/sub/y")));
+    assert_eq!(1_400_000_000, modified(&other.path().join("moved")));
+
+    // and back, as they were
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(tree(&[]), snapshot(other.path()));
+    for (path, time) in times {
+        assert_eq!(time, modified(&temp.path().join(path)), "{path}");
+    }
+}

@@ -31,7 +31,7 @@ impl Action {
                 if inside(s, d) {
                     return Err(into_itself(s, d));
                 }
-                fs::rename(s, d)?;
+                rename(s, d)?;
                 Undo::Rename(d.clone(), s.clone())
             }
             Action::Copy(s, d) => {
@@ -39,7 +39,7 @@ impl Action {
                 if inside(s, d) {
                     return Err(into_itself(s, d));
                 }
-                copy(s, d)?;
+                copy(s, d, false)?;
                 Undo::Trash(d.clone())
             }
         };
@@ -248,23 +248,114 @@ impl fmt::Display for Undo {
     }
 }
 
-/// Copy a file, dir (recursively), or symlink (the link itself) from `src` to `dst`
-fn copy(src: &Path, dst: &Path) -> io::Result<()> {
+/// Move `src` to `dst`, which nothing is at: a rename, but to another filesystem (another
+/// drive), where nothing can be renamed to, it is copied and then removed ([`move_across`])
+fn rename(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Err(err) if err.kind() == io::ErrorKind::CrossesDevices => move_across(src, dst),
+        result => result,
+    }
+}
+
+/// Move `src` to `dst` by copying it there, as it is (see [`copy`]), and then removing it, for
+/// good, as `mv` does to another filesystem
+/// If it can not be copied, what was copied is removed, and `src` stays as it was; so it does
+/// if nothing of it can be removed (it is on a disk that can only be read)
+pub(crate) fn move_across(src: &Path, dst: &Path) -> io::Result<()> {
+    // before anything is copied, so what is removed below is only what was copied
     if on_disk(dst) {
         return Err(already_exists(dst));
     }
-    let file_type = src.symlink_metadata()?.file_type();
+    if let Err(err) = copy(src, dst, true) {
+        let _ = remove(dst, &mut false);
+        return Err(err);
+    }
+    let mut removed = false;
+    let Err(err) = remove(src, &mut removed) else {
+        return Ok(());
+    };
+    // all of it is still there, so the copy goes instead
+    if !removed && remove(dst, &mut false).is_ok() {
+        return Err(err);
+    }
+    Err(io::Error::new(
+        err.kind(),
+        format!(
+            "`{}` was copied to `{}`, but can not be removed: {err}",
+            shown(src),
+            shown(dst)
+        ),
+    ))
+}
+
+/// Remove what is at `path` for good: a dir with everything in it, and a link itself
+/// Sets `removed` once anything is gone
+fn remove(path: &Path, removed: &mut bool) -> io::Result<()> {
+    let file_type = path.symlink_metadata()?.file_type();
+    if file_type.is_dir() {
+        for item in fs::read_dir(path)? {
+            remove(&item?.path(), removed)?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        // on Windows a link to a dir is removed as a dir
+        fs::remove_file(path).or_else(|err| match file_type.is_symlink() {
+            true => fs::remove_dir(path),
+            false => Err(err),
+        })?;
+    }
+    *removed = true;
+    Ok(())
+}
+
+/// Copy a file, dir (recursively), or symlink (the link itself) from `src` to `dst`
+/// With `moved`, it is the copy of a move ([`move_across`]), which keeps what a rename would:
+/// when each was modified and accessed, and a dir's permissions (a file's are always copied),
+/// as far as the filesystem it goes to can keep them
+fn copy(src: &Path, dst: &Path, moved: bool) -> io::Result<()> {
+    if on_disk(dst) {
+        return Err(already_exists(dst));
+    }
+    let meta = src.symlink_metadata()?;
+    let file_type = meta.file_type();
     if file_type.is_symlink() {
-        copy_symlink(src, dst)
+        copy_symlink(src, dst)?;
     } else if file_type.is_dir() {
         fs::create_dir(dst)?;
         for item in fs::read_dir(src)? {
             let item = item?;
-            copy(&item.path(), &dst.join(item.file_name()))?;
+            copy(&item.path(), &dst.join(item.file_name()), moved)?;
         }
-        Ok(())
+    } else if file_type.is_file() {
+        fs::copy(src, dst)?;
     } else {
-        fs::copy(src, dst).map(|_| ())
+        // a named pipe, a socket or a device: reading a pipe would wait forever
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("`{}` is not a file, a dir or a link", shown(src)),
+        ));
+    }
+    if moved {
+        keep_metadata(&meta, dst);
+    }
+    Ok(())
+}
+
+/// Give `dst`, the copy of what has `meta` (of the link itself, for a link), its times, and a
+/// dir its permissions, once everything is in it (it may not be writable, and each file
+/// copied into it changes when it was modified)
+/// A filesystem that can not keep one of them (a link's times, on some) keeps the rest
+fn keep_metadata(meta: &fs::Metadata, dst: &Path) {
+    use filetime::FileTime;
+    let accessed = FileTime::from_last_access_time(meta);
+    let modified = FileTime::from_last_modification_time(meta);
+    if meta.is_symlink() {
+        let _ = filetime::set_symlink_file_times(dst, accessed, modified);
+        return;
+    }
+    let _ = filetime::set_file_times(dst, accessed, modified);
+    if meta.is_dir() {
+        let _ = fs::set_permissions(dst, meta.permissions());
     }
 }
 
@@ -273,7 +364,20 @@ fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(fs::read_link(src)?, dst)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
+    let target = fs::read_link(src)?;
+    let linked = match src.symlink_metadata()?.file_type().is_symlink_dir() {
+        true => symlink_dir(&target, dst),
+        false => symlink_file(&target, dst),
+    };
+    // making a link takes a privilege (or developer mode) there; without it, what a link to
+    // a file points to is copied
+    linked.or_else(|_| fs::copy(src, dst).map(|_| ()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     fs::copy(src, dst).map(|_| ())
 }
