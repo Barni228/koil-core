@@ -894,7 +894,8 @@ fn test_undo_in_renamed_dir() {
 
 /// When what is at `path` (the link itself, for a link) was modified, in seconds
 fn modified(path: &Path) -> i64 {
-    filetime::FileTime::from_last_modification_time(&path.symlink_metadata().unwrap()).seconds()
+    filetime::FileTime::from_last_modification_time(&path.symlink_metadata().unwrap())
+        .unix_seconds()
 }
 
 /// Make everything in a [`test_temp_dir`] at `root` modified at times of its own, long ago,
