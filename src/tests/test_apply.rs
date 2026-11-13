@@ -497,7 +497,8 @@ fn test_undo_failed_apply() {
 }
 
 /// Apply only the changes `pick` picks, of what `koil` (on `temp`) would apply, check it gives
-/// `after`, and that what is left to apply is `left`, then take that back, and undo the apply
+/// `after`, and that what is left to apply is `left`, unapply it and check that it is as if it
+/// never ran, apply it again, then take what is left back, and undo the apply
 fn check_picked(
     temp: &TempDir,
     mut koil: Koil,
@@ -510,6 +511,16 @@ fn check_picked(
         .map(|c| c.action)
         .filter(|a| pick(a))
         .collect();
+    let (pending, all) = (koil.pending(), actions_left(&koil));
+    koil.apply_only(&picked).unwrap();
+    assert_eq!(expected(after), snapshot(temp.path()));
+    assert_eq!(sorted(left), actions_left(&koil));
+
+    let applied = koil.history().last().unwrap().clone();
+    koil.unapply(&applied, pending).unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(all, actions_left(&koil));
+    assert!(!koil.history().contains(&applied));
     koil.apply_only(&picked).unwrap();
     assert_eq!(expected(after), snapshot(temp.path()));
     assert_eq!(sorted(left), actions_left(&koil));
@@ -733,6 +744,54 @@ fn test_apply_only_keeps_what_failed() {
     ));
     assert!(!temp.path().join("a").exists());
     assert_eq!(sorted(&[add("new"), add("new2")]), actions_left(&koil));
+}
+
+#[test]
+fn test_unapply_last_first() {
+    // two applies picked from the same changes are unapplied newest first, each with the
+    // changes as they were before it, which a frontend keeps serialized
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+    let entries = [
+        with_id(id(&koil, "a"), "a2"),
+        with_id(id(&koil, "b"), "b2"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    let all = actions_left(&koil);
+    let kept = |koil: &Koil| serde_json::to_string(&koil.pending()).unwrap();
+    let pending = |json: &str| serde_json::from_str::<Pending>(json).unwrap();
+    let renaming = |koil: &Koil, name: &str| -> Vec<Action> {
+        (koil.changes().into_iter())
+            .map(|c| c.action)
+            .filter(|a| matches!(a, Action::Rename(s, _) if s.ends_with(name)))
+            .collect()
+    };
+
+    let first_pending = kept(&koil);
+    koil.apply_only(&renaming(&koil, "a")).unwrap();
+    let first = koil.history().last().unwrap().clone();
+    let left = actions_left(&koil);
+    assert_eq!(vec![rename("b", "b2")], left);
+    let second_pending = kept(&koil);
+    koil.apply_only(&renaming(&koil, "b")).unwrap();
+    let second = koil.history().last().unwrap().clone();
+    let applied = snapshot(temp.path());
+
+    let result = koil.unapply(&first, pending(&first_pending));
+    assert!(matches!(result, Err(KoilError::AppliedSince)), "{result:?}");
+    assert_eq!(applied, snapshot(temp.path()));
+    koil.unapply(&second, pending(&second_pending)).unwrap();
+    assert_eq!(left, actions_left(&koil));
+    koil.unapply(&first, pending(&first_pending)).unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(all, actions_left(&koil));
+    let result = koil.unapply(&first, pending(&first_pending));
+    assert!(
+        matches!(result, Err(KoilError::NothingToUndo)),
+        "{result:?}"
+    );
 }
 
 #[test]

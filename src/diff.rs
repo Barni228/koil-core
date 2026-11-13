@@ -1,3 +1,4 @@
+use crate::apply::Undo;
 use crate::serde_path::Repr;
 use crate::{Action, on_disk, planner, rebase};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -146,6 +147,23 @@ impl Diff {
                     }
                     None => self.follow(from, to),
                 },
+            }
+        }
+        self.with_id.retain(|_, change| !unchanged(change));
+    }
+
+    /// What is left of this diff once the undo `steps` ran, in the order they ran (see
+    /// [`crate::Koil::unapply`], when one fails): as [`Diff::after_steps`] has it, what they
+    /// trashed is gone with what was inside it, and the rest follows what they moved; a path
+    /// they restored is not new anymore
+    pub fn after_undo(&mut self, steps: &[Undo]) {
+        for step in steps {
+            match step {
+                Undo::Trash(path) => self.deleted(path),
+                Undo::Restore(trashed) => {
+                    self.without_id.remove(&trashed.original);
+                }
+                Undo::Rename(from, to) => self.follow(from, to),
             }
         }
         self.with_id.retain(|_, change| !unchanged(change));

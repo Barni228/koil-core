@@ -184,6 +184,13 @@ pub struct Applied {
     pub steps: Vec<Undo>,
 }
 
+/// The changes that were pending at some point (see [`Koil::pending`]), which
+/// [`Koil::unapply`] has pending again: a frontend keeps them before [`Koil::apply_only`], to
+/// undo it as if it never ran. A frontend keeps them as they are, serialized too
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pending(Diff);
+
 /// An apply of [`Koil::history`], as [`Koil::undo_only`] can revert it, see
 /// [`Koil::undoable`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,44 +725,55 @@ impl Koil {
         without_unmet(&self.undo_needs(), &mut undone);
         // newest first, which also keeps the indexes of the rest as they are while each goes
         let order: Vec<usize> = (0..undone.len()).rev().filter(|&i| undone[i]).collect();
-        if order.is_empty() {
-            return Err(KoilError::NothingToUndo);
-        }
-        let steps = || order.iter().flat_map(|&i| &self.undo[i].steps);
-        apply::check(steps(), &trash::Contents::default())
-            .map_err(|(step, blocked)| KoilError::UndoBlocked { step, blocked })?;
-
-        let total = steps().count();
-        let mut done = 0;
-        let mut result = Ok(());
-        let mut removed = HashSet::new();
-        'applies: for i in order {
-            let steps = self.undo[i].steps.clone();
-            for (k, step) in steps.iter().enumerate() {
-                if let Undo::Trash(path) | Undo::Rename(path, _) = step {
-                    removed.insert(path.clone());
-                }
-                if let Err(source) = step.run() {
-                    // the steps that did not run stay, so they can be undone later
-                    self.undo[i].steps = steps[k..].to_vec();
-                    result = Err(KoilError::UndoFailed {
-                        step: step.clone(),
-                        done,
-                        total,
-                        source,
-                    });
-                    break 'applies;
-                }
-                done += 1;
-            }
-            self.undo.remove(i);
-        }
-        self.unsee(&removed);
+        let (ran, result) = self.revert(&order)?;
         let refreshed = self.refresh();
         result?;
         Ok(Report {
-            changes: done,
+            changes: ran.len(),
             warning: refreshed?,
+        })
+    }
+
+    /// The changes pending now, for [`Koil::unapply`] to have pending again
+    pub fn pending(&self) -> Pending {
+        Pending(self.diff.clone())
+    }
+
+    /// Revert `applied`, the last apply of [`Koil::history`] (see [`Koil::undo_only`]), and
+    /// have the changes in `pending` pending, in place of those pending now, as if it never
+    /// ran: given what [`Koil::pending`] gave right before [`Koil::apply_only`], what it
+    /// applied is pending again, with what it left, which a frontend's undo of the apply it
+    /// just made does. Then the open dir is read again
+    /// Unlike [`Koil::undo_only`], it runs while changes are pending, which `pending` takes
+    /// the place of. It fails with [`KoilError::AppliedSince`] if `applied` is not the last
+    /// apply (`pending` would have what was applied since pending again), and like
+    /// [`Koil::undo_only`], nothing changes if a step can not run
+    /// ([`KoilError::UndoBlocked`]); if a step fails anyway, the steps that did not run stay
+    /// in the history, and so do the changes pending now, where the steps that ran moved them
+    /// (see [`Diff::after_undo`]), as `pending` is not what is on disk then
+    pub fn unapply(&mut self, applied: &Applied, pending: Pending) -> Result<Report, KoilError> {
+        let last = (self.undo.len().checked_sub(1)).filter(|&i| &self.undo[i] == applied);
+        let Some(last) = last else {
+            return Err(match self.undo.contains(applied) {
+                true => KoilError::AppliedSince,
+                false => KoilError::NothingToUndo,
+            });
+        };
+        let (ran, result) = self.revert(&[last])?;
+        if result.is_ok() {
+            self.diff = pending.0;
+        } else {
+            let mut left = std::mem::take(&mut self.diff);
+            left.after_undo(&ran);
+            // what is gone from disk can not change anymore
+            left.with_id.retain(|_, (before, _)| on_disk(before));
+            self.rekey(left);
+        }
+        let reopened = self.reopen();
+        result?;
+        Ok(Report {
+            changes: ran.len(),
+            warning: reopened?,
         })
     }
 
@@ -950,6 +968,48 @@ impl Koil {
         steps.reverse();
         self.push_undo(steps);
         result
+    }
+
+    /// Run the undo steps of the applies of [`Koil::history`] at `order` (newest first, which
+    /// keeps the indexes of the rest as they are while each goes), taking each out of the
+    /// history once it is undone, if [`apply::check`] says they can all run (else nothing
+    /// runs: [`KoilError::UndoBlocked`]). Gives the steps that ran, and how it ended: if a
+    /// step failed, the ones after it did not run, and its apply keeps the ones it did not
+    /// run, so they can be undone later
+    fn revert(&mut self, order: &[usize]) -> Result<(Vec<Undo>, Result<(), KoilError>), KoilError> {
+        if order.is_empty() {
+            return Err(KoilError::NothingToUndo);
+        }
+        let steps = || order.iter().flat_map(|&i| &self.undo[i].steps);
+        apply::check(steps(), &trash::Contents::default())
+            .map_err(|(step, blocked)| KoilError::UndoBlocked { step, blocked })?;
+
+        let total = steps().count();
+        let mut ran = Vec::new();
+        let mut result = Ok(());
+        let mut removed = HashSet::new();
+        'applies: for &i in order {
+            let steps = self.undo[i].steps.clone();
+            for (k, step) in steps.iter().enumerate() {
+                if let Undo::Trash(path) | Undo::Rename(path, _) = step {
+                    removed.insert(path.clone());
+                }
+                if let Err(source) = step.run() {
+                    self.undo[i].steps = steps[k..].to_vec();
+                    result = Err(KoilError::UndoFailed {
+                        step: step.clone(),
+                        done: ran.len(),
+                        total,
+                        source,
+                    });
+                    break 'applies;
+                }
+                ran.push(step.clone());
+            }
+            self.undo.remove(i);
+        }
+        self.unsee(&removed);
+        Ok((ran, result))
     }
 
     /// Forget what was seen at the paths in `removed` and inside them, which were moved away or

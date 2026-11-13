@@ -105,7 +105,9 @@ temporary name.
   back and moves created paths to the trash. Every apply is kept in `history` (which a
   frontend can keep across sessions with `set_history`), and `undo_only` undoes any of
   them, with the newer ones that changed the same paths; `undoable` says which those are,
-  and which can not be undone now, as what they change on disk changed since.
+  and which can not be undone now, as what they change on disk changed since. `unapply`
+  undoes the last apply as if it never ran, with what was pending before it (`pending`)
+  pending again, while other changes are pending.
 - **Changes on disk.** `sync` reads the open dir again while the user is still editing,
   and returns how their listing should change to show what is on disk now: new entries,
   gone ones, and renamed or moved ones (found by their inode, or creation time on Windows),

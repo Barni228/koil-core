@@ -2,6 +2,27 @@ use super::*;
 use diff::Diff;
 
 #[test]
+fn test_diff_after_undo() {
+    // what an undo that failed halfway ran: a rename back carries what is inside the dir,
+    // and a trashed dir takes what was changed inside it
+    let mut diff = Diff::default();
+    diff.set_before(0, "b/x".into());
+    diff.push_after(0, "b/y".into());
+    diff.set_before(1, "new/z".into());
+    diff.push_after(1, "w".into());
+    diff.without_id.insert("b/n".into(), false);
+    diff.without_id.insert("c".into(), true);
+    diff.after_undo(&[
+        Undo::Rename("b".into(), "a".into()),
+        Undo::Trash("new".into()),
+    ]);
+    let with_id = HashMap::from([(0, ("a/x".into(), vec!["a/y".into()]))]);
+    assert_eq!(with_id, diff.with_id);
+    let without_id = HashMap::from([("a/n".into(), false), ("c".into(), true)]);
+    assert_eq!(without_id, diff.without_id);
+}
+
+#[test]
 fn test_diff_delete() {
     let mut diff = Diff::default();
     diff.set_before(0, "poppy".into());

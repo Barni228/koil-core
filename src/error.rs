@@ -78,6 +78,11 @@ pub enum KoilError {
     #[error("Nothing to undo")]
     NothingToUndo,
 
+    /// [`Koil::unapply`](crate::Koil::unapply) was given an apply that is not the last one,
+    /// so the changes pending before it would have what was applied since pending again
+    #[error("Something was applied after it, undo that first")]
+    AppliedSince,
+
     /// [`Koil::create_now`](crate::Koil::create_now) was given a path that the changes do not
     /// create or copy to
     #[error("`{}` is not new", shown(.0))]
