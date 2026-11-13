@@ -496,32 +496,72 @@ fn test_undo_failed_apply() {
     assert_eq!(before, snapshot(temp.path()));
 }
 
-/// Apply only the changes of `listing` (on a fresh [`test_temp_dir`]) that `pick` picks, check
-/// it gives `after`, and that the rest are forgotten, then undo it
-fn check_apply_only(
-    listing: impl Fn(&Koil) -> Vec<Entry>,
+/// Apply only the changes `pick` picks, of what `koil` (on `temp`) would apply, check it gives
+/// `after`, and that what is left to apply is `left`, then take that back, and undo the apply
+fn check_picked(
+    temp: &TempDir,
+    mut koil: Koil,
     pick: impl Fn(&Action) -> bool,
     after: &[(&str, Option<&str>)],
+    left: &[Action],
 ) {
-    let temp = test_temp_dir();
     let before = snapshot(temp.path());
-    let mut koil = temp_koil(&temp);
-
-    koil.update(&listing(&koil)).unwrap();
     let picked: Vec<Action> = (koil.changes().into_iter())
         .map(|c| c.action)
         .filter(|a| pick(a))
         .collect();
     koil.apply_only(&picked).unwrap();
-    let expected: BTreeMap<PathBuf, Option<String>> = after
-        .iter()
-        .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
-        .collect();
-    assert_eq!(expected, snapshot(temp.path()));
-    assert_eq!(Vec::<Action>::new(), koil.compute_actions());
+    assert_eq!(expected(after), snapshot(temp.path()));
+    assert_eq!(sorted(left), actions_left(&koil));
 
+    let all: Vec<Action> = koil.changes().into_iter().map(|c| c.action).collect();
+    assert_eq!(left.len(), koil.discard_only(&all).unwrap().changes);
+    assert!(!koil.has_changes());
     koil.undo().unwrap();
     assert_eq!(before, snapshot(temp.path()));
+}
+
+/// [`check_picked`] of the changes of `listing`, on a fresh [`test_temp_dir`]
+fn check_apply_only(
+    listing: impl Fn(&Koil) -> Vec<Entry>,
+    pick: impl Fn(&Action) -> bool,
+    after: &[(&str, Option<&str>)],
+    left: &[Action],
+) {
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    koil.update(&listing(&koil)).unwrap();
+    check_picked(&temp, koil, pick, after, left);
+}
+
+/// `paths` as [`snapshot`] gives them
+fn expected(paths: &[(&str, Option<&str>)]) -> BTreeMap<PathBuf, Option<String>> {
+    (paths.iter())
+        .map(|(p, c)| (PathBuf::from(p), c.map(str::to_string)))
+        .collect()
+}
+
+fn sorted(actions: &[Action]) -> Vec<Action> {
+    let mut actions = actions.to_vec();
+    actions.sort();
+    actions
+}
+
+/// What applying would do, with paths relative to the open dir, as [`rename`] and the like
+/// write them, sorted
+fn actions_left(koil: &Koil) -> Vec<Action> {
+    let relative = |p: &PathBuf| p.strip_prefix(koil.current_dir()).unwrap().to_path_buf();
+    let left: Vec<Action> = (koil.compute_actions().iter())
+        .map(|action| match action {
+            Action::CreateFile(p) => Action::CreateFile(relative(p)),
+            Action::CreateDir(p) => Action::CreateDir(relative(p)),
+            Action::DeleteFile(p) => Action::DeleteFile(relative(p)),
+            Action::DeleteDir(p) => Action::DeleteDir(relative(p)),
+            Action::Rename(s, d) => Action::Rename(relative(s), relative(d)),
+            Action::Copy(s, d) => Action::Copy(relative(s), relative(d)),
+        })
+        .collect();
+    sorted(&left)
 }
 
 /// Everything in [`test_temp_dir`] that is in `dir`
@@ -534,11 +574,12 @@ const DIR: [(&str, Option<&str>); 4] = [
 
 #[test]
 fn test_apply_only_some() {
-    // the rename, but not the delete
+    // the rename, but not the delete, which stays
     check_apply_only(
         |k| vec![with_id(id(k, "a"), "renamed"), keep(k, "dir/")],
         |a| matches!(a, Action::Rename(..)),
         &[[("b", Some("b")), ("renamed", Some("a"))].as_slice(), &DIR].concat(),
+        &[delete("b")],
     );
 }
 
@@ -557,6 +598,8 @@ fn test_apply_only_with_what_it_needs() {
         },
         |a| !matches!(a, Action::Rename(s, _) if s.ends_with("b")),
         &[[("a2", Some("a")), ("b", Some("b"))].as_slice(), &DIR].concat(),
+        // `a` is at `a2` now, which the copy is of
+        &[copy("a2", "b"), rename("b", "a")],
     );
 }
 
@@ -582,7 +625,160 @@ fn test_apply_only_new_dir() {
             &DIR,
         ]
         .concat(),
+        &[
+            add("new/file"),
+            add_dir("new/nested"),
+            add("new/nested/file"),
+        ],
     );
+}
+
+#[test]
+fn test_apply_only_follows_a_renamed_dir() {
+    // what user changed inside `dir` goes with it, and so does what was written in it from
+    // outside, but `a` goes where `dir` was, which the rename freed
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    koil.open(temp.path().join("dir")).unwrap();
+    let inside = [with_id(id(&koil, "x"), "x2"), keep(&koil, "sub/")];
+    koil.update(&inside).unwrap();
+    koil.open(temp.path()).unwrap();
+    let outside = [
+        with_id(id(&koil, "dir"), "renamed/"),
+        with_id(id(&koil, "a"), "dir"),
+        keep(&koil, "b"),
+        without_id("dir/new"),
+    ];
+    koil.update(&outside).unwrap();
+    check_picked(
+        &temp,
+        koil,
+        |a| matches!(a, Action::Rename(s, _) if s.ends_with("dir")),
+        &[
+            ("a", Some("a")),
+            ("b", Some("b")),
+            ("renamed", None),
+            ("renamed/sub", None),
+            ("renamed/sub/y", Some("y")),
+            ("renamed/x", Some("x")),
+        ],
+        &[
+            add("renamed/new"),
+            rename("a", "dir"),
+            rename("renamed/x", "renamed/x2"),
+        ],
+    );
+}
+
+#[test]
+fn test_apply_only_swap() {
+    // a swap goes through a temp path, which nothing is left at
+    check_apply_only(
+        |k| {
+            vec![
+                with_id(id(k, "a"), "b"),
+                with_id(id(k, "b"), "a"),
+                with_id(id(k, "dir/"), "dir2/"),
+            ]
+        },
+        |a| !matches!(a, Action::Rename(s, _) if s.ends_with("dir")),
+        &[[("a", Some("b")), ("b", Some("a"))].as_slice(), &DIR].concat(),
+        &[rename("dir", "dir2")],
+    );
+}
+
+#[test]
+fn test_apply_only_deleted_dir() {
+    // what user changed inside a dir that is deleted goes to the trash with it, and what was
+    // moved into it stays where it is, but what is outside stays pending
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    let b = id(&koil, "b");
+    koil.open(temp.path().join("dir")).unwrap();
+    let inside = [
+        with_id(id(&koil, "x"), "x2"),
+        keep(&koil, "sub/"),
+        without_id("new"),
+        with_id(b, "b"),
+    ];
+    koil.update(&inside).unwrap();
+    koil.open(temp.path()).unwrap();
+    koil.update(&[with_id(id(&koil, "a"), "a2")]).unwrap();
+    check_picked(
+        &temp,
+        koil,
+        |a| matches!(a, Action::DeleteDir(_)),
+        &[("a", Some("a")), ("b", Some("b"))],
+        &[rename("a", "a2")],
+    );
+}
+
+#[test]
+fn test_apply_only_keeps_what_failed() {
+    // the create fails, as `new` appeared, but it stays, with what did not run after it
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    let entries = [
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+        without_id("new"),
+        without_id("new2"),
+    ];
+    koil.update(&entries).unwrap();
+    fs::write(temp.path().join("new"), "new").unwrap();
+    let all: Vec<Action> = koil.changes().into_iter().map(|c| c.action).collect();
+    assert!(matches!(
+        koil.apply_only(&all),
+        Err(KoilError::ApplyFailed { done: 1, .. })
+    ));
+    assert!(!temp.path().join("a").exists());
+    assert_eq!(sorted(&[add("new"), add("new2")]), actions_left(&koil));
+}
+
+#[test]
+fn test_discard_only() {
+    // the rename of `a` is taken back, and the copy onto `a`, which needs it, goes with it;
+    // the other copy and the new file stay
+    let temp = test_temp_dir();
+    let mut koil = temp_koil(&temp);
+    let entries = [
+        with_id(id(&koil, "a"), "c"),
+        keep(&koil, "b"),
+        with_id(id(&koil, "b"), "a"),
+        with_id(id(&koil, "b"), "b2"),
+        keep(&koil, "dir/"),
+        without_id("new"),
+    ];
+    koil.update(&entries).unwrap();
+    let before = snapshot(temp.path());
+    let renamed = (koil.changes().into_iter())
+        .map(|c| c.action)
+        .find(|a| matches!(a, Action::Rename(..)))
+        .unwrap();
+    assert_eq!(2, koil.discard_only(&[renamed]).unwrap().changes);
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(sorted(&[add("new"), copy("b", "b2")]), actions_left(&koil));
+    // the listing shows them as they are again
+    let mut names: Vec<PathBuf> = koil.listing().into_iter().map(|e| e.name).collect();
+    names.sort();
+    let expected: Vec<PathBuf> = ["a", "b", "b2", "dir", "new"].map(PathBuf::from).into();
+    assert_eq!(expected, names);
+
+    // a rename with a copy is the copy alone without it (the last path is the rename's)
+    let mut koil = temp_koil(&temp);
+    let entries = [
+        with_id(id(&koil, "a"), "a2"),
+        with_id(id(&koil, "a"), "a3"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    let renamed = (koil.changes().into_iter())
+        .map(|c| c.action)
+        .find(|a| matches!(a, Action::Rename(..)))
+        .unwrap();
+    koil.discard_only(&[renamed]).unwrap();
+    assert_eq!(vec![copy("a", "a2")], actions_left(&koil));
 }
 
 #[test]

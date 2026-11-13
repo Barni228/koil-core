@@ -524,21 +524,47 @@ impl Koil {
     }
 
     /// [`Koil::apply`], but only the changes in `picked` (actions of [`Koil::changes`]), and
-    /// every other change is forgotten, as the refresh shows what is on disk
+    /// every other change stays pending, where what was applied moved it (see
+    /// [`Diff::after_steps`]: a change inside a dir that was renamed is inside it where it is
+    /// now), under the ID of the path its file is at now
     /// A change that needs one that is not picked is not applied either (see
     /// [`Change::needs`]): it would fail (a rename onto a path that is still taken), or do
     /// what was not picked (create the new dir it goes into)
+    /// If an action fails, the rest are not run, and stay pending too
     pub fn apply_only(&mut self, picked: &[Action]) -> Result<Report, KoilError> {
         let picked: HashSet<&Action> = picked.iter().collect();
+        let actions: Vec<Action> = (self.pick(|a| picked.contains(a)).into_iter())
+            .filter_map(|(action, applied)| applied.then_some(action))
+            .collect();
+        self.run_keeping(&planner::plan_actions(&actions, on_disk, Path::is_dir))
+    }
+
+    /// Take the changes in `picked` (actions of [`Koil::changes`]) back, as if user never made
+    /// them, without changing anything on disk, and with them every change that needs one
+    /// (see [`Change::needs`]), which could not be applied without it; the others stay
+    /// pending. The open dir is read again, so its listing shows the entries as they are
+    /// `changes` in the [`Report`] is how many were taken back
+    pub fn discard_only(&mut self, picked: &[Action]) -> io::Result<Report> {
+        let picked: HashSet<&Action> = picked.iter().collect();
+        let discarded: Vec<Action> = (self.pick(|a| !picked.contains(a)).into_iter())
+            .filter_map(|(action, kept)| (!kept).then_some(action))
+            .collect();
+        self.diff.without(&discarded);
+        Ok(Report {
+            changes: discarded.len(),
+            warning: self.reopen()?,
+        })
+    }
+
+    /// [`Koil::changes`]' actions, each with whether `picked` picks it and every change it
+    /// needs, also through others (see [`Change::needs`])
+    fn pick(&self, picked: impl Fn(&Action) -> bool) -> Vec<(Action, bool)> {
         let (actions, needs): (Vec<Action>, Vec<Vec<usize>>) = (self.changes().into_iter())
             .map(|c| (c.action, c.needs))
             .unzip();
-        let mut applied: Vec<bool> = actions.iter().map(|a| picked.contains(a)).collect();
-        without_unmet(&needs, &mut applied);
-        let actions: Vec<Action> = (actions.into_iter().zip(applied))
-            .filter_map(|(action, applied)| applied.then_some(action))
-            .collect();
-        self.run_actions(&planner::plan_actions(&actions, on_disk, Path::is_dir))
+        let mut kept: Vec<bool> = actions.iter().map(picked).collect();
+        without_unmet(&needs, &mut kept);
+        actions.into_iter().zip(kept).collect()
     }
 
     /// What [`Koil::create_now`] would run to make the new files, dirs or copies at `paths`:
@@ -588,34 +614,12 @@ impl Koil {
     /// Make the new files, dirs or copies at `paths` on disk now, with the new dirs they are in
     /// (see [`Koil::create_steps`]), rather than when the changes are applied, so a frontend
     /// can open a new file to write in it, or a copy to change it apart from what it copies
-    /// Unlike [`Koil::apply_only`], every other change stays pending. The open dir is read
+    /// Like [`Koil::apply_only`], every other change stays pending. The open dir is read
     /// again, so its listing shows what was made as on disk (with an ID, a copy's own), and it
     /// can be reverted with [`Koil::undo`], like an apply
     pub fn create_now(&mut self, paths: &[impl AsRef<Path>]) -> Result<Report, KoilError> {
         let actions = self.create_steps(paths)?;
-        let result = self.run(&actions);
-        // what was made is not new or a copy anymore, even if a later step failed (a missing
-        // parent is not in the diff, it is only missing)
-        for action in &actions {
-            match action {
-                Action::CreateFile(path) | Action::CreateDir(path) if on_disk(path) => {
-                    self.diff.without_id.remove(path);
-                }
-                Action::Copy(source, path) if on_disk(path) => {
-                    let copied = self.diff.with_id.values_mut().filter(|(b, _)| b == source);
-                    for (_, afters) in copied {
-                        afters.retain(|p| p != path);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let reopened = self.reopen();
-        result?;
-        Ok(Report {
-            changes: actions.len(),
-            warning: reopened?,
-        })
+        self.run_keeping(&actions)
     }
 
     /// What applying copies to `path`, if it does: `path` is written with the ID of a file (or
@@ -867,6 +871,46 @@ impl Koil {
     }
 
     /// Run `actions` in order, then refresh, see [`Koil::apply`]
+    /// [`Koil::run`] `steps` (actions of the diff, planned), keeping the rest of the diff
+    /// pending, where they moved it (see [`Diff::after_steps`]), even if one failed: what
+    /// was made is not new or a copy anymore, and what moved is under the ID of the path it
+    /// is at now. Then the open dir is read again, like [`Koil::refresh`] does
+    fn run_keeping(&mut self, steps: &[Action]) -> Result<Report, KoilError> {
+        let result = self.run(steps);
+        let ran = match &result {
+            Err(KoilError::ApplyFailed { done, .. }) => *done,
+            _ => steps.len(),
+        };
+        let mut left = std::mem::take(&mut self.diff);
+        left.after_steps(&steps[..ran]);
+        // what is gone from disk can not change anymore
+        left.with_id.retain(|_, (before, _)| on_disk(before));
+        self.rekey(left);
+        let reopened = self.reopen();
+        result?;
+        Ok(Report {
+            changes: steps.len(),
+            warning: reopened?,
+        })
+    }
+
+    /// Make `diff` koil's, each ID's change under the ID of the path it is at now: an apply
+    /// moved it there (see [`Koil::run_keeping`]), and a path koil knows is always its own ID
+    fn rekey(&mut self, diff: Diff) {
+        let (moved, at): (Vec<_>, Vec<_>) = (diff.with_id.into_iter())
+            .partition(|(index, (before, _))| self.ids.get(*index) != Some(before));
+        let befores = moved
+            .iter()
+            .map(|(_, (before, _))| before.clone())
+            .collect();
+        let indexes = self.indexes_of(befores);
+        let moved = (indexes.into_iter().zip(moved)).map(|(index, (_, change))| (index, change));
+        self.diff = Diff {
+            with_id: at.into_iter().chain(moved).collect(),
+            without_id: diff.without_id,
+        };
+    }
+
     fn run_actions(&mut self, actions: &[Action]) -> Result<Report, KoilError> {
         let result = self.run(actions);
         // even if some action failed, others changed the filesystem
@@ -1049,21 +1093,10 @@ impl Koil {
                 .collect(),
         };
         self.current_listing.clear();
-        // a pattern can show thousands of paths, so they are not searched for in `ids` one by one
-        let found: Vec<(Option<usize>, PathBuf, Option<Seen>)> = {
-            let known: HashMap<&Path, usize> = (self.ids.iter().enumerate())
-                .map(|(index, path)| (path.as_path(), index))
-                .collect();
-            (paths.into_iter())
-                .filter(|(path, _)| !self.ignore.contains(path))
-                .map(|(path, seen)| (known.get(path.as_path()).copied(), path, seen))
-                .collect()
-        };
-        for (index, path, seen) in found {
-            let index = index.unwrap_or_else(|| {
-                self.ids.push(path);
-                self.ids.len() - 1
-            });
+        let (paths, seen): (Vec<PathBuf>, Vec<Option<Seen>>) = (paths.into_iter())
+            .filter(|(path, _)| !self.ignore.contains(path))
+            .unzip();
+        for (index, seen) in self.indexes_of(paths).into_iter().zip(seen) {
             self.current_listing.insert(index);
             if let Some(seen) = seen {
                 self.seen.insert(index, seen);
@@ -1147,6 +1180,30 @@ impl Koil {
     }
 
     /// The index of `id` in [`Koil::ids`], `None` if it is not there
+    /// The ID index of each of `paths`, a new one for a path koil has none for
+    /// A pattern can show thousands of paths, so they are not searched for in `ids` one by one
+    fn indexes_of(&mut self, paths: Vec<PathBuf>) -> Vec<usize> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let found: Vec<(Option<usize>, PathBuf)> = {
+            let known: HashMap<&Path, usize> = (self.ids.iter().enumerate())
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            (paths.into_iter())
+                .map(|path| (known.get(path.as_path()).copied(), path))
+                .collect()
+        };
+        (found.into_iter())
+            .map(|(index, path)| {
+                index.unwrap_or_else(|| {
+                    self.ids.push(path);
+                    self.ids.len() - 1
+                })
+            })
+            .collect()
+    }
+
     fn index_of(&self, id: Id) -> Option<usize> {
         usize::try_from(id.0).ok().filter(|&i| i < self.ids.len())
     }

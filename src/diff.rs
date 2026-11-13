@@ -88,9 +88,112 @@ impl Diff {
     /// Whether this diff changes nothing: every ID is only at the path it had (or not in it at
     /// all), and nothing is new
     pub fn is_empty(&self) -> bool {
-        self.without_id.is_empty()
-            && (self.with_id.values())
-                .all(|(before, afters)| afters.as_slice() == [before.as_path()])
+        self.without_id.is_empty() && self.with_id.values().all(unchanged)
+    }
+
+    /// Takes `changes` (actions of [`Diff::actions`]) out of this diff, as if user never made
+    /// them (see [`crate::Koil::discard_only`]): what they create or copy is not made, and what
+    /// they delete or rename stays where it is
+    pub fn without(&mut self, changes: &[Action]) {
+        for change in changes {
+            match change {
+                Action::CreateFile(path) | Action::CreateDir(path) => {
+                    // a missing parent is not in the diff, it goes with what is inside it
+                    self.without_id.remove(path);
+                }
+                Action::DeleteFile(path) | Action::DeleteDir(path) => {
+                    self.with_id.retain(|_, (before, _)| before != path);
+                }
+                Action::Copy(from, to) => {
+                    self.drop_copy(from, to);
+                }
+                Action::Rename(from, to) => {
+                    let renamed = (self.with_id.values_mut()).find(|(before, _)| before == from);
+                    if let Some((_, afters)) = renamed {
+                        afters.retain(|p| p != to);
+                        afters.push(from.clone());
+                    }
+                }
+            }
+        }
+        self.with_id.retain(|_, change| !unchanged(change));
+    }
+
+    /// What is left of this diff once `steps` ran, what [`planner::plan_actions`] made of some
+    /// of its actions, in the order they ran (see [`crate::Koil::apply_only`]): what they made
+    /// is not new anymore, what they deleted is gone with what was inside it, and the rest
+    /// follows what they moved: an ID's path, and a path written inside a renamed dir, which
+    /// goes with it (see [`Outcome::carried`]), but not one written where the dir was, which
+    /// the rename freed for it
+    pub fn after_steps(&mut self, steps: &[Action]) {
+        // the temp paths copies were made at first, by the IDs they copy, to go where they go
+        let mut temps: HashMap<&Path, usize> = HashMap::new();
+        for step in steps {
+            match step {
+                Action::CreateFile(path) | Action::CreateDir(path) => {
+                    self.without_id.remove(path);
+                }
+                Action::DeleteFile(path) | Action::DeleteDir(path) => self.deleted(path),
+                Action::Copy(from, to) => {
+                    if let Some(index) = self.drop_copy(from, to) {
+                        temps.insert(to, index);
+                    }
+                }
+                Action::Rename(from, to) => match temps.remove(from.as_path()) {
+                    Some(index) => {
+                        let copied = self.with_id.get_mut(&index).map(|(_, a)| a);
+                        copied.into_iter().for_each(|a| a.retain(|p| p != to));
+                    }
+                    None => self.follow(from, to),
+                },
+            }
+        }
+        self.with_id.retain(|_, change| !unchanged(change));
+    }
+
+    /// Takes the copy of `from` at `to` out, and gives the ID copied, if `to` is not one of
+    /// its paths: a temp path the copy goes to first
+    fn drop_copy(&mut self, from: &Path, to: &Path) -> Option<usize> {
+        let (&index, (_, afters)) = (self.with_id.iter_mut()).find(|(_, (b, _))| b == from)?;
+        let len = afters.len();
+        afters.retain(|p| p != to);
+        (afters.len() == len).then_some(index)
+    }
+
+    /// What is left once `path` is deleted: what was inside it went to the trash with it, and a
+    /// path written inside it would make a new dir there, so what is put there is left where it
+    /// is (as the trash has what applying it all would put there)
+    fn deleted(&mut self, path: &Path) {
+        let outside = |p: &PathBuf| p == path || !p.starts_with(path);
+        self.with_id.retain(|_, (before, afters)| {
+            let had = afters.len();
+            afters.retain(outside);
+            !before.starts_with(path) && (afters.len() == had || !afters.is_empty())
+        });
+        self.without_id.retain(|p, _| outside(p));
+    }
+
+    /// What is left once `from` is renamed to `to`: an ID that was at it, or inside it, is
+    /// where it went, and so is a path written inside it
+    fn follow(&mut self, from: &Path, to: &Path) {
+        let inside = |path: &mut PathBuf| {
+            if path != from
+                && let Some(new) = rebase(path, from, to)
+            {
+                *path = new;
+            }
+        };
+        for (before, afters) in self.with_id.values_mut() {
+            if let Some(new) = rebase(before, from, to) {
+                *before = new;
+            }
+            afters.iter_mut().for_each(inside);
+        }
+        let created = std::mem::take(&mut self.without_id);
+        for (mut path, is_dir) in created {
+            inside(&mut path);
+            self.without_id.insert(path, is_dir);
+        }
     }
 
     /// Return true if `path` is a dir that does not exist yet, but will after this diff
@@ -195,6 +298,12 @@ impl Diff {
 
         actions
     }
+}
+
+/// Whether an ID's change (its path before, and those after) changes nothing: it is only at
+/// the path it had
+fn unchanged((before, afters): &(PathBuf, Vec<PathBuf>)) -> bool {
+    afters.as_slice() == [before.as_path()]
 }
 
 /// What a [`Diff`] does to the paths it changes, to check a path written in a listing against
