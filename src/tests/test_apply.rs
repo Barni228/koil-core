@@ -386,6 +386,163 @@ fn test_undo_blocked_by_changes_on_disk() {
     assert_eq!(history, koil.history());
 }
 
+/// The index of the step of `applied` that moves something to `to` (in the open dir)
+fn step_to(koil: &Koil, applied: &Applied, to: &str) -> usize {
+    let to = koil.current_dir().join(to);
+    (applied.steps.iter())
+        .position(|step| matches!(step, Undo::Rename(_, d) if *d == to))
+        .unwrap()
+}
+
+#[test]
+fn test_undo_one_step() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // one apply renames `a` and `b`, which have nothing to do with each other
+    let entries = [
+        with_id(id(&koil, "a"), "a2"),
+        with_id(id(&koil, "b"), "b2"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let history = koil.history().to_vec();
+    assert_eq!(2, history[0].steps.len());
+    let undoable = koil.undoable().unwrap();
+    assert!(undoable[0].steps.iter().all(|step| step.needs.is_empty()));
+    assert!(undoable[0].steps.iter().all(|step| step.blocked.is_none()));
+
+    // so one is undone without the other, which its apply keeps
+    let a = step_to(&koil, &history[0], "a");
+    let picked = [(history[0].clone(), vec![a])];
+    assert_eq!(1, koil.undo_some(&picked).unwrap().changes);
+    assert!(temp.path().join("a").exists());
+    assert!(temp.path().join("b2").exists());
+    let left = koil.history().to_vec();
+    assert_eq!(1, left.len());
+    assert_eq!(history[0].time, left[0].time);
+    assert_eq!(vec![history[0].steps[1 - a].clone()], left[0].steps);
+
+    // the apply as it was is not in the history anymore, so nothing of it is undone
+    let result = koil.undo_some(&picked);
+    assert!(
+        matches!(result, Err(KoilError::NothingToUndo)),
+        "{result:?}"
+    );
+    // a step that is not there is left out
+    let result = koil.undo_some(&[(left[0].clone(), vec![5])]);
+    assert!(
+        matches!(result, Err(KoilError::NothingToUndo)),
+        "{result:?}"
+    );
+
+    // and the rest of it is undone later
+    koil.undo().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert!(koil.history().is_empty());
+}
+
+#[test]
+fn test_undo_step_with_the_steps_it_needs() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // rename `a` to `c`, then one apply renames `b` to `a`, and `c` to `d`
+    let entries = [
+        with_id(id(&koil, "a"), "c"),
+        keep(&koil, "b"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let entries = [
+        with_id(id(&koil, "b"), "a"),
+        with_id(id(&koil, "c"), "d"),
+        keep(&koil, "dir/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    let history = koil.history().to_vec();
+    let to_b = step_to(&koil, &history[1], "b");
+
+    // putting `a` back needs both of the newer apply's steps: `c` back from `d`, and `a`
+    // free again, but neither of those needs the other
+    let undoable = koil.undoable().unwrap();
+    assert_eq!(vec![(1, 0), (1, 1)], undoable[0].steps[0].needs);
+    assert!(undoable[1].steps.iter().all(|step| step.needs.is_empty()));
+    assert!(
+        undoable
+            .iter()
+            .all(|u| u.steps.iter().all(|s| s.blocked.is_none()))
+    );
+
+    // so it is not undone without them
+    let result = koil.undo_some(&[(history[0].clone(), vec![0])]);
+    assert!(
+        matches!(result, Err(KoilError::NothingToUndo)),
+        "{result:?}"
+    );
+    assert_eq!(history, koil.history());
+
+    // the newer apply's step alone is, and then the older one needs only the other
+    assert_eq!(
+        1,
+        koil.undo_some(&[(history[1].clone(), vec![to_b])])
+            .unwrap()
+            .changes
+    );
+    assert!(temp.path().join("b").exists());
+    let undoable = koil.undoable().unwrap();
+    assert_eq!(vec![(1, 0)], undoable[0].steps[0].needs);
+
+    // a step blocked on disk blocks the ones that need it, but not the others
+    fs::rename(temp.path().join("d"), temp.path().join("gone")).unwrap();
+    let undoable = koil.undoable().unwrap();
+    assert!(undoable[0].steps[0].blocked.is_some());
+    assert!(undoable[1].steps[0].blocked.is_some());
+    fs::rename(temp.path().join("gone"), temp.path().join("d")).unwrap();
+
+    // with it, both are undone, the newest first
+    let left = koil.history().to_vec();
+    let picked = [(left[0].clone(), vec![0]), (left[1].clone(), vec![0])];
+    assert_eq!(2, koil.undo_some(&picked).unwrap().changes);
+    assert!(koil.history().is_empty());
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+#[test]
+fn test_undo_step_inside_a_renamed_dir() {
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let mut koil = temp_koil(&temp);
+
+    // rename `dir/x`, then `dir` itself, in two applies
+    koil.open("dir").unwrap();
+    let entries = [keep(&koil, "sub/"), with_id(id(&koil, "x"), "x2")];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+    koil.open("..").unwrap();
+    let entries = [
+        keep(&koil, "a"),
+        keep(&koil, "b"),
+        with_id(id(&koil, "dir/"), "dir2/"),
+    ];
+    koil.update(&entries).unwrap();
+    koil.apply().unwrap();
+
+    // the file's name can not be put back before the dir it was in is
+    let undoable = koil.undoable().unwrap();
+    assert_eq!(vec![(1, 0)], undoable[0].steps[0].needs);
+    assert!(undoable[1].steps[0].needs.is_empty());
+    let history = koil.history().to_vec();
+    let picked = [(history[1].clone(), vec![0]), (history[0].clone(), vec![0])];
+    assert_eq!(2, koil.undo_some(&picked).unwrap().changes);
+    assert_eq!(before, snapshot(temp.path()));
+}
+
 /// Once the trash is emptied, the path of what an apply deleted is free there, and what is
 /// trashed at it later must never be restored in its place
 /// Only on macOS, where the trash's paths can be emptied one by one

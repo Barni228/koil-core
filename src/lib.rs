@@ -7,6 +7,7 @@ use crate::error::io_error;
 use crate::pattern::{View, Walked};
 use crate::sync::{FileKey, Seen};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf, is_separator};
@@ -201,6 +202,23 @@ pub struct Undoable {
     /// it is in, so undoing them first puts back what it changed
     pub needs: Vec<usize>,
     /// Why it can not be undone now, with the applies it needs (all of them, not only
+    /// directly): the first step that can not run, and why, `None` if it can
+    pub blocked: Option<(Undo, Blocked)>,
+    /// Each of its steps (`applied.steps`), as [`Koil::undo_some`] can revert it without the
+    /// others
+    pub steps: Vec<UndoableStep>,
+}
+
+/// A step of an apply of [`Koil::history`], as [`Koil::undo_some`] can revert it without the
+/// rest of its apply, see [`Undoable::steps`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoableStep {
+    /// The steps it can not be undone without, only directly, each as the index of its apply
+    /// (in the list this one's apply is in) and its index in that apply's steps: those that
+    /// run before it (a newer apply's, or one before it in its own apply) and change a path
+    /// it changes, or one inside it or that it is in
+    pub needs: Vec<(usize, usize)>,
+    /// Why it can not be undone now, with the steps it needs (all of them, not only
     /// directly): the first step that can not run, and why, `None` if it can
     pub blocked: Option<(Undo, Blocked)>,
 }
@@ -693,16 +711,28 @@ impl Koil {
     pub fn undoable(&self) -> Result<Vec<Undoable>, KoilError> {
         self.check_nothing_pending()?;
         let needs = self.undo_needs();
+        let step_needs = self.step_needs();
         let trash = trash::Contents::default();
         let undoable = (self.undo.iter().zip(&needs).enumerate())
             .map(|(i, (applied, direct))| {
                 // with every apply it needs, newest first, as they would be undone
                 let with = with_needs(&needs, i);
                 let steps = with.iter().rev().flat_map(|&j| &self.undo[j].steps);
+                let each = (step_needs[i].iter().enumerate())
+                    .map(|(k, direct)| {
+                        let with = with_step_needs(&step_needs, (i, k));
+                        let steps = with.iter().map(|&(Reverse(j), k)| &self.undo[j].steps[k]);
+                        UndoableStep {
+                            needs: direct.clone(),
+                            blocked: apply::check(steps, &trash).err(),
+                        }
+                    })
+                    .collect();
                 Undoable {
                     applied: applied.clone(),
                     needs: direct.clone(),
                     blocked: apply::check(steps, &trash).err(),
+                    steps: each,
                 }
             })
             .collect();
@@ -724,7 +754,63 @@ impl Koil {
         let mut undone: Vec<bool> = self.undo.iter().map(|a| picked.contains(a)).collect();
         without_unmet(&self.undo_needs(), &mut undone);
         // newest first, which also keeps the indexes of the rest as they are while each goes
-        let order: Vec<usize> = (0..undone.len()).rev().filter(|&i| undone[i]).collect();
+        let order: Vec<(usize, Vec<usize>)> = (0..undone.len())
+            .rev()
+            .filter(|&i| undone[i])
+            .map(|i| (i, (0..self.undo[i].steps.len()).collect()))
+            .collect();
+        let (ran, result) = self.revert(&order)?;
+        let refreshed = self.refresh();
+        result?;
+        Ok(Report {
+            changes: ran.len(),
+            warning: refreshed?,
+        })
+    }
+
+    /// Revert only some steps of the applies of [`Koil::history`]: `picked` has applies, each
+    /// with the indexes of its steps to revert (see [`Undoable::steps`]), which run newest
+    /// apply first, and in their order in an apply. An apply keeps its steps that are not
+    /// reverted, to undo later, and is out of the history once it has none. Then the listing
+    /// is refreshed
+    /// A step that needs one that is not picked (see [`UndoableStep::needs`]) is not undone
+    /// either, nor are those of an apply not in the history anymore
+    /// Like [`Koil::undo_only`], nothing is undone if a step can not run
+    /// ([`KoilError::UndoBlocked`]), and if a step fails anyway, the ones not run yet stay
+    /// Fails if there are changes that are not applied, since undo would make them wrong
+    pub fn undo_some(&mut self, picked: &[(Applied, Vec<usize>)]) -> Result<Report, KoilError> {
+        self.check_nothing_pending()?;
+        // every step, an apply after another, and where each apply's start
+        let starts: Vec<usize> = (self.undo.iter())
+            .scan(0, |next, applied| {
+                let start = *next;
+                *next += applied.steps.len();
+                Some(start)
+            })
+            .collect();
+        let total: usize = self.undo.iter().map(|applied| applied.steps.len()).sum();
+        let mut undone = vec![false; total];
+        for (applied, steps) in picked {
+            let Some(i) = self.undo.iter().position(|a| a == applied) else {
+                continue;
+            };
+            for &k in steps.iter().filter(|&&k| k < applied.steps.len()) {
+                undone[starts[i] + k] = true;
+            }
+        }
+        let needs: Vec<Vec<usize>> = (self.step_needs().into_iter().flatten())
+            .map(|needs| needs.iter().map(|&(j, k)| starts[j] + k).collect())
+            .collect();
+        without_unmet(&needs, &mut undone);
+        // newest first, which also keeps the indexes of the rest as they are while each goes
+        let order: Vec<(usize, Vec<usize>)> = (0..self.undo.len())
+            .rev()
+            .map(|i| {
+                let steps = 0..self.undo[i].steps.len();
+                (i, steps.filter(|k| undone[starts[i] + k]).collect())
+            })
+            .filter(|(_, steps): &(usize, Vec<usize>)| !steps.is_empty())
+            .collect();
         let (ran, result) = self.revert(&order)?;
         let refreshed = self.refresh();
         result?;
@@ -759,7 +845,8 @@ impl Koil {
                 false => KoilError::NothingToUndo,
             });
         };
-        let (ran, result) = self.revert(&[last])?;
+        let steps = (0..self.undo[last].steps.len()).collect();
+        let (ran, result) = self.revert(&[(last, steps)])?;
         if result.is_ok() {
             self.diff = pending.0;
         } else {
@@ -970,43 +1057,63 @@ impl Koil {
         result
     }
 
-    /// Run the undo steps of the applies of [`Koil::history`] at `order` (newest first, which
-    /// keeps the indexes of the rest as they are while each goes), taking each out of the
-    /// history once it is undone, if [`apply::check`] says they can all run (else nothing
-    /// runs: [`KoilError::UndoBlocked`]). Gives the steps that ran, and how it ended: if a
-    /// step failed, the ones after it did not run, and its apply keeps the ones it did not
-    /// run, so they can be undone later
-    fn revert(&mut self, order: &[usize]) -> Result<(Vec<Undo>, Result<(), KoilError>), KoilError> {
-        if order.is_empty() {
+    /// Run undo steps of the applies of [`Koil::history`]: `order` has the index of each
+    /// apply (newest first, which keeps the indexes of the rest as they are while each goes),
+    /// with the indexes of its steps to run, in order. Each step is taken out of its apply
+    /// once it ran, and an apply out of the history once it has none left, if
+    /// [`apply::check`] says they can all run (else nothing runs:
+    /// [`KoilError::UndoBlocked`]). Gives the steps that ran, and how it ended: if a step
+    /// failed, the ones after it did not run, and stay in their applies, so they can be
+    /// undone later
+    fn revert(
+        &mut self,
+        order: &[(usize, Vec<usize>)],
+    ) -> Result<(Vec<Undo>, Result<(), KoilError>), KoilError> {
+        let steps =
+            || (order.iter()).flat_map(|(i, steps)| steps.iter().map(|&k| &self.undo[*i].steps[k]));
+        let total = steps().count();
+        if total == 0 {
             return Err(KoilError::NothingToUndo);
         }
-        let steps = || order.iter().flat_map(|&i| &self.undo[i].steps);
         apply::check(steps(), &trash::Contents::default())
             .map_err(|(step, blocked)| KoilError::UndoBlocked { step, blocked })?;
 
-        let total = steps().count();
         let mut ran = Vec::new();
         let mut result = Ok(());
         let mut removed = HashSet::new();
-        'applies: for &i in order {
-            let steps = self.undo[i].steps.clone();
-            for (k, step) in steps.iter().enumerate() {
+        for (i, picked) in order {
+            let steps = std::mem::take(&mut self.undo[*i].steps);
+            let mut done = vec![false; steps.len()];
+            for &k in picked {
+                let step = &steps[k];
                 if let Undo::Trash(path) | Undo::Rename(path, _) = step {
                     removed.insert(path.clone());
                 }
                 if let Err(source) = step.run() {
-                    self.undo[i].steps = steps[k..].to_vec();
                     result = Err(KoilError::UndoFailed {
                         step: step.clone(),
                         done: ran.len(),
                         total,
                         source,
                     });
-                    break 'applies;
+                    break;
                 }
+                done[k] = true;
                 ran.push(step.clone());
             }
-            self.undo.remove(i);
+            // the apply keeps the steps that did not run
+            let left: Vec<Undo> = (steps.into_iter().zip(done))
+                .filter(|(_, done)| !done)
+                .map(|(step, _)| step)
+                .collect();
+            if left.is_empty() {
+                self.undo.remove(*i);
+            } else {
+                self.undo[*i].steps = left;
+            }
+            if result.is_err() {
+                break;
+            }
         }
         self.unsee(&removed);
         Ok((ran, result))
@@ -1048,6 +1155,38 @@ impl Koil {
                     .collect()
             })
             .collect()
+    }
+
+    /// For each step of each apply of [`Koil::history`], the steps it can not be undone
+    /// without (see [`UndoableStep::needs`]), sorted
+    fn step_needs(&self) -> Vec<Vec<Vec<(usize, usize)>>> {
+        // the steps that ran so far with each path, and with a path at or inside each
+        let mut exact: HashMap<&Path, Vec<(usize, usize)>> = HashMap::new();
+        let mut around: HashMap<&Path, Vec<(usize, usize)>> = HashMap::new();
+        let mut needs: Vec<Vec<Vec<(usize, usize)>>> = (self.undo.iter())
+            .map(|applied| vec![Vec::new(); applied.steps.len()])
+            .collect();
+        // in the order they would run, so each finds only the ones before it
+        for (i, applied) in self.undo.iter().enumerate().rev() {
+            for (k, step) in applied.steps.iter().enumerate() {
+                let paths = step.paths();
+                let mut touched: BTreeSet<(usize, usize)> = BTreeSet::new();
+                for path in &paths {
+                    // a path of the other is this one or inside it, or a dir this one is in
+                    touched.extend(around.get(path).into_iter().flatten());
+                    let dirs = path.ancestors().skip(1);
+                    touched.extend(dirs.filter_map(|dir| exact.get(dir)).flatten());
+                }
+                needs[i][k] = touched.into_iter().collect();
+                for path in paths {
+                    exact.entry(path).or_default().push((i, k));
+                    for dir in path.ancestors() {
+                        around.entry(dir).or_default().push((i, k));
+                    }
+                }
+            }
+        }
+        needs
     }
 
     /// Remember `steps` that revert an apply, so [`Koil::undo`] can run them later
@@ -1562,6 +1701,23 @@ fn with_needs(needs: &[Vec<usize>], from: usize) -> BTreeSet<usize> {
     while let Some(j) = stack.pop() {
         if with.insert(j) {
             stack.extend(&needs[j]);
+        }
+    }
+    with
+}
+
+/// The step `from` (its apply and its index in it) and every step it needs, also through
+/// others, where `needs` are the steps each needs directly (see [`UndoableStep::needs`]), in
+/// the order they would be undone: the newest apply first, and an apply's in their order
+fn with_step_needs(
+    needs: &[Vec<Vec<(usize, usize)>>],
+    from: (usize, usize),
+) -> BTreeSet<(Reverse<usize>, usize)> {
+    let mut with = BTreeSet::from([(Reverse(from.0), from.1)]);
+    let mut stack = needs[from.0][from.1].clone();
+    while let Some((i, k)) = stack.pop() {
+        if with.insert((Reverse(i), k)) {
+            stack.extend(&needs[i][k]);
         }
     }
     with
