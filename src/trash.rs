@@ -124,6 +124,8 @@ mod platform {
 ))]
 mod platform {
     use super::{Trashed, not_in_trash};
+    use crate::apply::retry;
+    use crate::on_disk;
     use std::cell::OnceCell;
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -139,7 +141,9 @@ mod platform {
     pub fn trash(path: &Path) -> io::Result<(PathBuf, Option<Stamp>)> {
         // before it is trashed, while its parent can still be canonicalized the same way
         let parent = canonical_parent(path)?;
-        trash::delete(path).map_err(io::Error::other)?;
+        // while it is still there, as what was aborted moved nothing
+        retry(|| trash::delete(path), |err| refused(err) && on_disk(path))
+            .map_err(io::Error::other)?;
         // the newest item that came from `path`, which must be the one just trashed
         let items = list().map_err(io::Error::other)?;
         items
@@ -159,7 +163,35 @@ mod platform {
             .into_iter()
             .find(|item| item.id == trashed.id.as_os_str() && same(stamp(item), trashed))
             .ok_or_else(|| not_in_trash(trashed))?;
-        restore_all([item]).map_err(io::Error::other)
+        // what is at its path then is never overwritten: `restore_all` fails on it
+        retry(|| restore_all([item.clone()]), refused).map_err(io::Error::other)
+    }
+
+    /// Whether Windows' shell refused to trash or restore something for now, as another
+    /// program has it, or something in it, open (see [`retry`]): the copy engine's errors for
+    /// that, and Windows' own, or a trash only said to be aborted, which is all it says then
+    #[cfg(windows)]
+    fn refused(err: &trash::Error) -> bool {
+        const IN_USE: [u32; 7] = [
+            0x8007_0005, // E_ACCESSDENIED
+            0x8007_0020, // ERROR_SHARING_VIOLATION
+            0x8007_0021, // ERROR_LOCK_VIOLATION
+            0x8027_0021, // COPYENGINE_E_ACCESS_DENIED_SRC
+            0x8027_0022, // COPYENGINE_E_ACCESS_DENIED_DEST
+            0x8027_0027, // COPYENGINE_E_SHARING_VIOLATION_SRC
+            0x8027_0028, // COPYENGINE_E_SHARING_VIOLATION_DEST
+        ];
+        match err {
+            trash::Error::Unknown { .. } => true,
+            trash::Error::Os { code, .. } => IN_USE.contains(&(*code as u32)),
+            _ => false,
+        }
+    }
+
+    /// Nothing refuses that way on the freedesktop trash (see [`retry`])
+    #[cfg(not(windows))]
+    fn refused(_: &trash::Error) -> bool {
+        false
     }
 
     /// The stamp of `item`, `None` if the trash does not say when it was trashed

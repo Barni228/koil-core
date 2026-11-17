@@ -1477,3 +1477,92 @@ fn test_undo_move_to_another_filesystem() {
         assert_eq!(time, modified(&temp.path().join(path)), "{path}");
     }
 }
+
+/// Opens the file at `path` as another program would for a moment (OneDrive to sync it, an
+/// antivirus to scan it), and lets go of it in a thread, a while after
+/// `share` is what it lets others do with the file meanwhile (`FILE_SHARE_*`)
+#[cfg(windows)]
+fn hold(path: &Path, share: u32) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .open(path)
+        .unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(file);
+    })
+}
+
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, as most programs that read a file
+/// for a moment open it, which still keeps the dir it is in from being renamed
+#[cfg(windows)]
+const SHARE_ALL: u32 = 1 | 2 | 4;
+
+/// Windows refuses to rename, trash or restore a dir while something in it is open, which
+/// programs that watch the disk do for a moment, right after it changed: the step is tried
+/// again, until it works
+#[cfg(windows)]
+#[test]
+fn test_retry_while_open() {
+    let temp = test_temp_dir();
+    let root = temp.path();
+    let before = snapshot(root);
+    let (dir, moved) = (root.join("dir"), root.join("moved"));
+
+    let held = hold(&dir.join("sub/y"), SHARE_ALL);
+    let refused = fs::rename(&dir, &moved).unwrap_err();
+    assert_eq!(Some(5), refused.raw_os_error(), "{refused}");
+    let renamed = Action::Rename(dir.clone(), moved.clone()).run().unwrap();
+    held.join().unwrap();
+
+    let held = hold(&moved.join("sub/y"), SHARE_ALL);
+    let refused = ::trash::delete(&moved).unwrap_err();
+    assert!(
+        matches!(refused, ::trash::Error::Unknown { .. }),
+        "{refused}"
+    );
+    let trashed = Action::DeleteDir(moved.clone()).run().unwrap();
+    held.join().unwrap();
+    assert!(!moved.exists());
+
+    // what was trashed, which is held in the trash
+    let root = fs::canonicalize(root).unwrap();
+    let in_trash = (::trash::os_limited::list().unwrap().into_iter())
+        .filter(|item| {
+            item.name == "moved" && fs::canonicalize(&item.original_parent).is_ok_and(|p| p == root)
+        })
+        .max_by_key(|item| item.time_deleted)
+        .unwrap();
+    let held = hold(&Path::new(&in_trash.id).join("sub/y"), SHARE_ALL);
+    trashed.unwrap().run().unwrap();
+    held.join().unwrap();
+    renamed.unwrap().run().unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+}
+
+/// A rename tried again never replaces what came at its path while it waited, which
+/// `fs::rename` does to a file
+#[cfg(windows)]
+#[test]
+fn test_retry_never_overwrites() {
+    let temp = test_temp_dir();
+    let root = temp.path().to_path_buf();
+    // `a` is open by a program that keeps it from being renamed (no `FILE_SHARE_DELETE`),
+    // which makes `c` and then lets go of `a`
+    let held = hold(&root.join("a"), 1 | 2);
+    let c = root.join("c");
+    let maker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(c, "c").unwrap();
+    });
+    let error = Action::Rename(root.join("a"), root.join("c"))
+        .run()
+        .unwrap_err();
+    maker.join().unwrap();
+    held.join().unwrap();
+    assert_eq!(io::ErrorKind::AlreadyExists, error.kind(), "{error}");
+    assert_eq!("a", fs::read_to_string(root.join("a")).unwrap());
+    assert_eq!("c", fs::read_to_string(root.join("c")).unwrap());
+}

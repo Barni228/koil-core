@@ -2,7 +2,8 @@ use crate::trash::{self, Contents, Trashed};
 use crate::{Action, on_disk, rebase, shown};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::{fmt, fs, io};
+use std::time::{Duration, Instant};
+use std::{fmt, fs, io, thread};
 
 impl Action {
     /// Run this action on the filesystem, deleted paths are moved to the trash
@@ -24,10 +25,6 @@ impl Action {
             }
             Action::DeleteFile(n) | Action::DeleteDir(n) => Undo::Restore(trash::trash(n)?),
             Action::Rename(s, d) => {
-                // on case insensitive filesystems `a -> A` sees `A` as taken, but it is `a` itself
-                if on_disk(d) && !same_file(s, d)? {
-                    return Err(already_exists(d));
-                }
                 if inside(s, d) {
                     return Err(into_itself(s, d));
                 }
@@ -248,10 +245,63 @@ impl fmt::Display for Undo {
     }
 }
 
-/// Move `src` to `dst`, which nothing is at: a rename, but to another filesystem (another
+/// How long a step that Windows refuses for a moment is tried again (see [`retry`])
+/// A step that fails for good waits that long first, and a frontend that applies on its UI
+/// thread does not answer meanwhile, which Windows takes for hung after 5 s
+const RETRY_FOR: Duration = Duration::from_secs(3);
+
+/// The longest wait between two tries of [`retry`]
+const RETRY_WAIT: Duration = Duration::from_millis(250);
+
+/// Runs `step` until it works, or fails for good: while `refused` says its error is Windows
+/// refusing it for now, it runs again, waiting longer each time, for up to [`RETRY_FOR`]
+/// Windows can not rename, trash or remove a path while another program has it, or anything
+/// in it, open, and programs that watch the disk open what just changed, for a moment
+/// (OneDrive to sync it, an antivirus to scan it, the search indexer), so a step right after
+/// another one on the same paths was refused, where the same steps seconds apart worked (a dir
+/// moved out of the dir it is in, which was deleted, then put in its place). git and npm try
+/// again there too. Elsewhere nothing refuses that way, and `refused` is never true
+pub(crate) fn retry<T, E>(
+    mut step: impl FnMut() -> Result<T, E>,
+    refused: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let start = Instant::now();
+    let mut wait = Duration::from_millis(5);
+    loop {
+        match step() {
+            Err(err) if refused(&err) && start.elapsed() + wait < RETRY_FOR => {
+                thread::sleep(wait);
+                wait = (wait * 2).min(RETRY_WAIT);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether Windows refused a step, as another program has the path, or something in it, open
+/// (see [`retry`]): `ERROR_ACCESS_DENIED` (a dir with something open in it),
+/// `ERROR_SHARING_VIOLATION` (a file open by a program that does not let it be renamed, a dir
+/// that is a program's current dir), or `ERROR_LOCK_VIOLATION`
+fn in_use(err: &io::Error) -> bool {
+    cfg!(windows) && matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Move `src` to `dst`, which must be free: a rename, but to another filesystem (another
 /// drive), where nothing can be renamed to, it is copied and then removed ([`move_across`])
+/// Retried while Windows refuses it (see [`retry`]), and `dst` is checked before each try, as
+/// `fs::rename` replaces a file there, which may have come while it waited
 fn rename(src: &Path, dst: &Path) -> io::Result<()> {
-    match fs::rename(src, dst) {
+    let renamed = retry(
+        || {
+            // on case insensitive filesystems `a -> A` sees `A` as taken, but it is `a` itself
+            if on_disk(dst) && !same_file(src, dst)? {
+                return Err(already_exists(dst));
+            }
+            fs::rename(src, dst)
+        },
+        in_use,
+    );
+    match renamed {
         Err(err) if err.kind() == io::ErrorKind::CrossesDevices => move_across(src, dst),
         result => result,
     }
@@ -290,19 +340,26 @@ pub(crate) fn move_across(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Remove what is at `path` for good: a dir with everything in it, and a link itself
 /// Sets `removed` once anything is gone
+/// Each file and dir is retried while Windows refuses it (see [`retry`])
 fn remove(path: &Path, removed: &mut bool) -> io::Result<()> {
     let file_type = path.symlink_metadata()?.file_type();
     if file_type.is_dir() {
         for item in fs::read_dir(path)? {
             remove(&item?.path(), removed)?;
         }
-        fs::remove_dir(path)?;
+        // ERROR_DIR_NOT_EMPTY too: a file removed while another program had it open is there
+        // until that program lets go of it (on a filesystem that is not NTFS)
+        let not_empty = |err: &io::Error| cfg!(windows) && err.raw_os_error() == Some(145);
+        retry(|| fs::remove_dir(path), |err| in_use(err) || not_empty(err))?;
     } else {
         // on Windows a link to a dir is removed as a dir
-        fs::remove_file(path).or_else(|err| match file_type.is_symlink() {
-            true => fs::remove_dir(path),
-            false => Err(err),
-        })?;
+        let remove_file = || {
+            fs::remove_file(path).or_else(|err| match file_type.is_symlink() {
+                true => fs::remove_dir(path),
+                false => Err(err),
+            })
+        };
+        retry(remove_file, in_use)?;
     }
     *removed = true;
     Ok(())
