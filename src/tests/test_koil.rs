@@ -2133,7 +2133,7 @@ fn test_regex_dirs() {
 /// The names that the regex `pattern` lists in `dir`
 fn regex_names(dir: &Path, pattern: &str) -> Vec<String> {
     let mut koil = Koil::builder().settings(regex()).build();
-    koil.open(dir.join(pattern)).unwrap();
+    koil.open(inside(dir, pattern)).unwrap();
     (koil.listing().iter())
         .map(|e| with_slashes(&e.name).to_string_lossy().into_owned())
         .collect()
@@ -2141,7 +2141,7 @@ fn regex_names(dir: &Path, pattern: &str) -> Vec<String> {
 
 #[test]
 fn test_regex_looks_around() {
-    let dir = test_path("");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_dir");
     // a look behind, also for the `/` after a dir
     assert_eq!(vec!["file", "qwerty"], regex_names(&dir, ",*(?<!2)"));
     assert_eq!(vec!["dir"], regex_names(&dir, ".*(?<=/)"));
