@@ -81,7 +81,8 @@ temporary name.
   reserved names like `CON`, emoji, invisible or look-alike characters, spaces at the edges,
   a trailing `.`, a leading `-`, and names that are not valid UTF-8.
 - **Patterns.** Open a glob like `src/**/*.rs`, or a regex, to edit every matching file and
-  dir at once. Names are shown relative to the base dir. Dirs that nothing inside can match
+  dir at once. A regex can look around and back, like `.*(?<!\.min)\.js` or `(,+)/\1\.rs`.
+  Names are shown relative to the base dir. Dirs that nothing inside can match
   are never searched, and a pattern that matches or has to search too much (`Limits`) stops
   early, instead of reading every path.
 - **Globs match dirs with their `/`.** A dir is matched as it is listed, with a `/` after

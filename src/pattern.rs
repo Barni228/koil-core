@@ -4,9 +4,9 @@
 use crate::drives::{is_drive_root, is_drives};
 use crate::sync::Seen;
 use crate::{GlobError, Koil, OpenError, OverLimit, is_hidden};
+use fancy_regex::{Absent, Assertion, Expr, Regex, RegexBuilder};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::{WalkBuilder, WalkState};
-use regex::Regex;
 use regex_automata::dfa::{Automaton, StartKind, dense};
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
@@ -66,6 +66,7 @@ pub enum Pattern {
     Glob(String),
     /// Like `src/.*\.rs`, which must match the whole path
     /// `,` means any character except `/` (like `.`, but within one dir), and `\,` is a `,`
+    /// It can look around and back, like `,*(?<!\.min)\.js` or `(,+)-\1` (see `fancy-regex`)
     Regex(String),
 }
 
@@ -102,8 +103,9 @@ impl Pattern {
                 Regex::new(regex).map_err(invalid)?;
                 // the whole path must match
                 let whole = format!("^(?:{})$", expand_commas(regex));
-                let whole = Regex::new(&whole).map_err(invalid)?;
-                Ok(Matcher::Regex(whole))
+                RegexMatcher::new(&whole)
+                    .map(Matcher::Regex)
+                    .map_err(invalid)
             }
         }
     }
@@ -122,43 +124,59 @@ pub(crate) struct View {
 }
 
 impl View {
-    /// Whether `path` is shown in the listing
+    /// Whether `path` is shown in the listing (not if its pattern takes too long to tell, see
+    /// [`View::try_contains`])
     pub(crate) fn contains(&self, path: &Path, is_dir: bool) -> bool {
+        self.try_contains(path, is_dir).unwrap_or(false)
+    }
+
+    /// Whether `path` is shown in the listing, or [`TooSlow`]
+    pub(crate) fn try_contains(&self, path: &Path, is_dir: bool) -> Result<bool, TooSlow> {
         match &self.matcher {
-            None if is_drives(&self.base) => is_drive_root(path),
-            None => path.parent() == Some(&self.base),
-            Some(matcher) => path
-                .strip_prefix(&self.base)
-                .is_ok_and(|p| matcher.is_match(p, is_dir)),
+            None if is_drives(&self.base) => Ok(is_drive_root(path)),
+            None => Ok(path.parent() == Some(&self.base)),
+            Some(matcher) => match path.strip_prefix(&self.base) {
+                Ok(path) => matcher.is_match(path, is_dir),
+                Err(_) => Ok(false),
+            },
         }
     }
 }
+
+/// A regex gave up on a path, as it went back over it more than [`BACKTRACK_LIMIT`] times (see
+/// [`OverLimit::Backtracking`])
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TooSlow;
 
 /// A compiled [`Pattern`]
 #[derive(Clone)]
 pub(crate) enum Matcher {
     /// The glob without its trailing `/`, and whether it had one
     Glob(GlobMatcher, bool),
-    Regex(Regex),
+    Regex(RegexMatcher),
 }
 
 impl Matcher {
     /// Whether `path`, relative to the base dir, matches (see [`match_text`])
-    fn is_match(&self, path: &Path, is_dir: bool) -> bool {
+    fn is_match(&self, path: &Path, is_dir: bool) -> Result<bool, TooSlow> {
         let text = match_text(path, is_dir);
         match self {
-            Matcher::Glob(glob, true) => text.strip_suffix('/').is_some_and(|t| glob.is_match(t)),
-            Matcher::Glob(glob, false) => glob.is_match(&text),
+            Matcher::Glob(glob, true) => {
+                Ok(text.strip_suffix('/').is_some_and(|t| glob.is_match(t)))
+            }
+            Matcher::Glob(glob, false) => Ok(glob.is_match(&text)),
             Matcher::Regex(regex) => regex.is_match(&text),
         }
     }
 
-    /// The regex that [`Matcher::is_match`] uses, as a DFA, `None` if it would be too big
+    /// A regex that matches all that [`Matcher::is_match`] does (and for a regex that looks
+    /// around, more, see [`RegexMatcher::loose`]), as a DFA, `None` if it would be too big, or
+    /// there is no such regex
     fn dfa(&self) -> Option<dense::DFA<Vec<u32>>> {
         // a glob is matched as bytes, where `.` also matches a new line, like globset does
         let (regex, glob) = match self {
             Matcher::Glob(glob, _) => (glob.glob().regex(), true),
-            Matcher::Regex(regex) => (regex.as_str(), false),
+            Matcher::Regex(regex) => (regex.loose.as_deref()?, false),
         };
         let size = Some(DFA_SIZE_LIMIT);
         let config = dense::Config::new()
@@ -175,6 +193,221 @@ impl Matcher {
 
 /// How many bytes a pattern's DFA can take, a bigger one skips no dirs
 const DFA_SIZE_LIMIT: usize = 1 << 20;
+
+/// How many times a regex can go back over one path to try another way to match it, before it
+/// gives up ([`TooSlow`]): only one that looks around or back goes back at all, and far less
+/// than this, unless it can match the same text in very many ways, like `(a|aa)+(?<!a)`
+const BACKTRACK_LIMIT: usize = 100_000;
+
+/// A compiled [`Pattern::Regex`]
+#[derive(Clone)]
+pub(crate) struct RegexMatcher {
+    /// What says whether a path matches: the regex as it was written (between `^` and `$`)
+    /// One with nothing that the `regex` crate can not do is matched by it, in linear time
+    exact: Regex,
+    /// A regex for the `regex` crate that matches every path `exact` does: the same regex, or
+    /// for one that looks around or back, one without that, which matches more (see
+    /// [`Loosener`]). `None` if it has something that [`Loosener`] does not know
+    /// It tells which dirs to skip ([`Prune`]), which only needs to never skip a match
+    loose: Option<String>,
+    /// `loose` compiled, if it matches more than `exact`: a path it does not match is not
+    /// tried with `exact`, which is much slower when it has to go back
+    filter: Option<Regex>,
+}
+
+impl RegexMatcher {
+    /// `whole` is the regex that must match all of a path's text (see [`match_text`])
+    fn new(whole: &str) -> Result<RegexMatcher, fancy_regex::Error> {
+        let exact = RegexBuilder::new(whole)
+            .backtrack_limit(BACKTRACK_LIMIT)
+            .build()?;
+        let tree = Expr::parse_tree(whole)?;
+        let mut loosener = Loosener::new(&tree.expr);
+        let loose = loosener.loosen(&tree.expr, false).map(|expr| {
+            let mut loose = String::new();
+            expr.to_str(&mut loose, 0);
+            loose
+        });
+        let looser = loosener.looser;
+        let filter = (loose.as_deref())
+            .filter(|_| looser)
+            .and_then(|loose| Regex::new(loose).ok());
+        Ok(RegexMatcher {
+            // without a regex to tell the dirs to skip, they are all entered
+            loose: loose.filter(|_| !looser || filter.is_some()),
+            exact,
+            filter,
+        })
+    }
+
+    fn is_match(&self, text: &str) -> Result<bool, TooSlow> {
+        if let Some(filter) = &self.filter
+            && !filter.is_match(text).unwrap_or(true)
+        {
+            return Ok(false);
+        }
+        self.exact.is_match(text).map_err(|_| TooSlow)
+    }
+}
+
+/// Makes a regex the `regex` crate can do (see [`Expr::to_str`]) that matches everything
+/// another does, see [`Loosener::loosen`]
+struct Loosener<'a> {
+    /// What is in each group of the regex, `(...)`, in the order they open: `\1` is the
+    /// first one
+    groups: Vec<&'a Expr>,
+    /// How many groups opened so far
+    opened: usize,
+    /// The groups that are open now, by their numbers (from 1)
+    open: Vec<usize>,
+    /// Whether something was taken out, so the regex made matches more
+    looser: bool,
+}
+
+impl<'a> Loosener<'a> {
+    fn new(expr: &'a Expr) -> Loosener<'a> {
+        fn collect<'a>(expr: &'a Expr, groups: &mut Vec<&'a Expr>) {
+            if let Expr::Group(child) = expr {
+                groups.push(child);
+            }
+            for child in expr.children_iter() {
+                collect(child, groups);
+            }
+        }
+        let mut groups = Vec::new();
+        collect(expr, &mut groups);
+        Loosener {
+            groups,
+            opened: 0,
+            open: Vec::new(),
+            looser: false,
+        }
+    }
+
+    /// A regex that matches everything `expr` does, `None` if `expr` has something that is
+    /// not known here
+    /// What the `regex` crate can not do is taken out, each in a way that can only match more
+    /// ([`Loosener::looser`] is set then): a look around matches where it is not checked too,
+    /// and a `\1` anything its group can
+    /// `copy` if `expr` is read again for a `\1`, which leaves the `\1` in it out
+    fn loosen(&mut self, expr: &Expr, copy: bool) -> Option<Expr> {
+        // these stand alone when printed, also right before a `*`, unlike `Expr::Empty`
+        let delegate = |inner: &str| Expr::Delegate {
+            inner: inner.into(),
+            casei: false,
+        };
+        let (nothing, anything) = ("(?:)", "(?s:.*)");
+        Some(match expr {
+            Expr::Empty | Expr::Any { .. } | Expr::Literal { .. } | Expr::Delegate { .. } => {
+                expr.clone()
+            }
+            // the ones [`Expr::to_str`] prints
+            Expr::Assertion(
+                Assertion::StartText
+                | Assertion::EndText
+                | Assertion::StartLine { .. }
+                | Assertion::StartLineOniguruma { .. }
+                | Assertion::EndLine { .. }
+                | Assertion::WordBoundary
+                | Assertion::NotWordBoundary
+                | Assertion::LeftWordBoundary
+                | Assertion::RightWordBoundary
+                | Assertion::LeftWordHalfBoundary
+                | Assertion::RightWordHalfBoundary,
+            ) => expr.clone(),
+            Expr::Concat(children) => Expr::Concat(self.loosen_all(children, copy)?),
+            Expr::Alt(children) => Expr::Alt(self.loosen_all(children, copy)?),
+            Expr::Group(child) => {
+                if !copy {
+                    self.opened += 1;
+                    self.open.push(self.opened);
+                }
+                let child = self.loosen(child, copy);
+                if !copy {
+                    self.open.pop();
+                }
+                Expr::Group(child?.into())
+            }
+            Expr::Repeat {
+                child,
+                lo,
+                hi,
+                greedy,
+            } => Expr::Repeat {
+                child: self.loosen(child, copy)?.into(),
+                lo: *lo,
+                hi: *hi,
+                greedy: *greedy,
+            },
+            // `(?>a)` and `a++` match what `a` does, when they match
+            Expr::AtomicGroup(child) => {
+                self.looser = true;
+                self.loosen(child, copy)?
+            }
+            // `(?(1)a|b)` matches what `a` or `b` does
+            Expr::Conditional {
+                condition,
+                true_branch,
+                false_branch,
+            } => {
+                self.looser = true;
+                self.skip(condition, copy);
+                Expr::Alt(vec![
+                    self.loosen(true_branch, copy)?,
+                    self.loosen(false_branch, copy)?,
+                ])
+            }
+            // these take no text, and only say where there is no match
+            Expr::LookAround(..)
+            | Expr::KeepOut
+            | Expr::ContinueFromPreviousMatchEnd
+            | Expr::BackrefExistsCondition { .. }
+            | Expr::BacktrackingControlVerb(_)
+            | Expr::DefineGroup { .. }
+            | Expr::Absent(Absent::Stopper(_) | Absent::Clear) => {
+                self.looser = true;
+                self.skip(expr, copy);
+                delegate(nothing)
+            }
+            // the text of a group that closed, which is one that what is in it matches
+            &Expr::Backref { group, casei }
+                if !copy && group <= self.opened && !self.open.contains(&group) =>
+            {
+                self.looser = true;
+                let inside = self.loosen(self.groups.get(group.checked_sub(1)?)?, true)?;
+                let mut inner = String::new();
+                // as one thing, like a group, also before a `*`
+                inside.to_str(&mut inner, 3);
+                Expr::Delegate { inner, casei }
+            }
+            // these take some text, which is not looked into here
+            Expr::Backref { .. }
+            | Expr::BackrefWithRelativeRecursionLevel { .. }
+            | Expr::SubroutineCall(_)
+            | Expr::Absent(Absent::Repeater(_) | Absent::Expression { .. }) => {
+                self.looser = true;
+                self.skip(expr, copy);
+                delegate(anything)
+            }
+            _ => return None,
+        })
+    }
+
+    fn loosen_all(&mut self, exprs: &[Expr], copy: bool) -> Option<Vec<Expr>> {
+        exprs.iter().map(|e| self.loosen(e, copy)).collect()
+    }
+
+    /// Counts the groups in `expr`, which is left out
+    fn skip(&mut self, expr: &Expr, copy: bool) {
+        fn groups(expr: &Expr) -> usize {
+            let own = matches!(expr, Expr::Group(_)) as usize;
+            own + expr.children_iter().map(groups).sum::<usize>()
+        }
+        if !copy {
+            self.opened += groups(expr);
+        }
+    }
+}
 
 /// The text a pattern is matched against: `path` (relative to the base dir) with a `/` between
 /// its parts, and after it if it is a dir
@@ -624,7 +857,18 @@ impl Koil {
                 let skip_inside = is_dir
                     && (!dots_enter || prune.as_ref().is_some_and(|p| p.skips_inside(item.path())));
                 let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
-                let matches = match dots_show && view.contains(item.path(), is_dir) {
+                let shown = match dots_show {
+                    true => view.try_contains(item.path(), is_dir),
+                    false => Ok(false),
+                };
+                let Ok(shown) = shown else {
+                    *over_limit.lock().unwrap() = pattern.map(|pattern| OverLimit::Backtracking {
+                        pattern: pattern.as_str().to_string(),
+                        limit: BACKTRACK_LIMIT,
+                    });
+                    return WalkState::Quit;
+                };
+                let matches = match shown {
                     true => {
                         // here, on the walk's threads, as it reads the disk again (and a dir's
                         // entries, when sorting by size)

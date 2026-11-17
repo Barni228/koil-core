@@ -124,7 +124,7 @@ pub enum OpenError {
     InvalidRegex {
         regex: String,
         #[source]
-        source: regex::Error,
+        source: fancy_regex::Error,
     },
 
     #[error(transparent)]
@@ -180,6 +180,12 @@ pub enum OverLimit {
 
     #[error("`{pattern}` has to search more than {limit} paths")]
     Searched { pattern: String, limit: usize },
+
+    /// A regex that looks around or back went back over one path more than `limit` times to
+    /// try another way to match it, as one that can match the same text in very many ways
+    /// does, like `(a|aa)+(?<!a)`
+    #[error("`{pattern}` takes too long to match, it can match the same text in too many ways")]
+    Backtracking { pattern: String, limit: usize },
 }
 
 /// Why [`Koil::update`](crate::Koil::update) rejected the entries, nothing was changed

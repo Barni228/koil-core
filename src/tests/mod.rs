@@ -1,5 +1,5 @@
 use super::*;
-use crate::pattern::expand_commas;
+use crate::pattern::{Prune, View, expand_commas};
 use crate::sort::natural_order;
 use std::fs;
 

@@ -20,12 +20,14 @@ include = [
 [dependencies]
 # `canonicalize` without the `\\?\` Windows puts before every path
 dunce = "1.0"
+# regexes that look around and back (`(?<!a)`, `\1`), the rest is matched as `regex` does
+# its `Expr` (see `loosen`) may change in a new version
+fancy-regex = "~0.20"
 # sets the times of what is moved to another drive, also of a dir or a link
 filetime = "0.2"
 globset = "0.4"
 ignore = "0.4.33"
 pathfinding = "4.16"
-regex = "1.13.1"
 # the DFA that tells which dirs a pattern can skip
 regex-automata = { version = "0.4.13", default-features = false, features = [
     "std",

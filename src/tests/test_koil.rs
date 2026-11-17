@@ -2130,6 +2130,178 @@ fn test_regex_dirs() {
     assert_eq!(keep_all(&koil, &["x"]), koil.listing());
 }
 
+/// The names that the regex `pattern` lists in `dir`
+fn regex_names(dir: &Path, pattern: &str) -> Vec<String> {
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open(dir.join(pattern)).unwrap();
+    (koil.listing().iter())
+        .map(|e| with_slashes(&e.name).to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn test_regex_looks_around() {
+    let dir = test_path("");
+    // a look behind, also for the `/` after a dir
+    assert_eq!(vec!["file", "qwerty"], regex_names(&dir, ",*(?<!2)"));
+    assert_eq!(vec!["dir"], regex_names(&dir, ".*(?<=/)"));
+    assert_eq!(
+        vec!["dir/inside", "file"],
+        regex_names(&dir, ".*(?<!/|2|y)")
+    );
+    // a look ahead
+    assert_eq!(vec!["qwerty"], regex_names(&dir, "(?!file),*"));
+    assert_eq!(vec!["file2"], regex_names(&dir, r"(?=.*\d).*"));
+    // `,` is any character except `/` in them too
+    assert_eq!(vec!["dir/inside"], regex_names(&dir, ".*(?<=/,{6})"));
+    // a possessive `*` keeps the `2` it took, an atomic group too
+    assert_eq!(vec!["file2"], regex_names(&dir, ",*2"));
+    assert_eq!(Vec::<String>::new(), regex_names(&dir, ",*+2"));
+    assert_eq!(Vec::<String>::new(), regex_names(&dir, "(?>,*)2"));
+    assert_eq!(vec!["file2"], regex_names(&dir, "[a-z]++2"));
+    // flags
+    assert_eq!(vec!["file", "file2"], regex_names(&dir, "(?i)FILE,?"));
+}
+
+#[test]
+fn test_regex_backreference() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["abab", "abcd", "x-x.txt", "x-y.txt"] {
+        fs::write(temp.path().join(name), "").unwrap();
+    }
+    fs::create_dir(temp.path().join("same")).unwrap();
+    fs::write(temp.path().join("same/same.rs"), "").unwrap();
+    fs::write(temp.path().join("same/other.rs"), "").unwrap();
+    assert_eq!(vec!["abab"], regex_names(temp.path(), r"(,+)\1"));
+    assert_eq!(
+        vec!["x-x.txt"],
+        regex_names(temp.path(), r"(?<a>,)-\k<a>\.txt")
+    );
+    // a file named as its dir
+    assert_eq!(
+        vec!["same/same.rs"],
+        regex_names(temp.path(), r"(,+)/\1\.rs")
+    );
+}
+
+/// What shows the regex `pattern` in the dir `/base`
+fn regex_view(pattern: &str) -> View {
+    View {
+        base: "/base".into(),
+        matcher: Some(Pattern::Regex(pattern.into()).matcher().unwrap()),
+    }
+}
+
+#[test]
+fn test_regex_looking_around_skips_dirs() {
+    // a regex that looks around skips the dirs it would skip without that
+    let view = regex_view(r"(src|lib)/,*(?<!\.min)\.js");
+    let prune = Prune::new(&view).unwrap();
+    assert!(!prune.skips_inside(Path::new("/base/src")));
+    assert!(!prune.skips_inside(Path::new("/base/lib")));
+    assert!(prune.skips_inside(Path::new("/base/other")));
+    assert!(prune.skips_inside(Path::new("/base/src/deep")));
+    assert!(view.contains(Path::new("/base/src/a.js"), false));
+    assert!(!view.contains(Path::new("/base/src/a.min.js"), false));
+    assert!(!view.contains(Path::new("/base/other/a.js"), false));
+
+    // but not the ones only a look around rules out, which it enters for nothing
+    let view = regex_view("(?!target/).*");
+    let prune = Prune::new(&view).unwrap();
+    assert!(!prune.skips_inside(Path::new("/base/target")));
+    assert!(!view.contains(Path::new("/base/target/debug"), true));
+
+    // a `\1` is taken as anything its group can match
+    let view = regex_view(r"(,+)/\1\.rs");
+    let prune = Prune::new(&view).unwrap();
+    assert!(!prune.skips_inside(Path::new("/base/a")));
+    assert!(prune.skips_inside(Path::new("/base/a/b")));
+    assert!(view.contains(Path::new("/base/a/a.rs"), false));
+    assert!(!view.contains(Path::new("/base/a/b.rs"), false));
+    // but one inside its own group as any text
+    let prune = Prune::new(&regex_view(r"(a/\1?)+b")).unwrap();
+    assert!(!prune.skips_inside(Path::new("/base/a/x/y")));
+
+    // a regex with something that is not known skips none
+    assert!(Prune::new(&regex_view(r".*\Z")).is_none());
+}
+
+#[test]
+fn test_regex_skips_no_match() {
+    let patterns = [
+        r"(src|lib)/,*(?<!\.min)\.js",
+        r".*(?<!\.min)\.js",
+        "(?!lib/).*",
+        r"(,+)/\1\.js",
+        r"(,+)/(?:,+/)*\1\.js",
+        r"(?=(,+))src/(,+)/\1\.js",
+        r"(?<!(x))(s)(r)(c)/(?:,+/)?\2\3\4\.js",
+        r"(?i)(SRC)/(?-i)(?:,+/)?\1\.js",
+        r"((?:(?!\.),)+)/(d,+/)?\1\.js",
+        r"(l(i)b)/\1\.js|(s)rc/\3rc\.js",
+        r"(?>src|s)/,*+",
+        r"(?<d>,+)/(?(<d>)a|b)\.js",
+        r"src/\K,*\.js",
+        r"(?i)SRC/(?=A),*",
+        r".*(?<=/)",
+        r"(?:(?!\.min),)*\.js",
+        r"src/(?:s|(?!x))*+a\.js",
+        r".*\Z",
+    ];
+    let paths = [
+        ("src", true),
+        ("src/a.js", false),
+        ("src/a.min.js", false),
+        ("src/src.js", false),
+        ("src/deep", true),
+        ("src/deep/a.js", false),
+        ("src/deep/src.js", false),
+        ("lib", true),
+        ("lib/lib.js", false),
+        ("SRC/src.js", false),
+        ("SRC/deep/SRC.js", false),
+        ("a.js", false),
+        ("s/x", false),
+    ];
+    for pattern in patterns {
+        let view = regex_view(pattern);
+        let prune = Prune::new(&view);
+        let mut matched = false;
+        for (path, is_dir) in paths {
+            let path = Path::new("/base").join(path);
+            if !view.contains(&path, is_dir) {
+                continue;
+            }
+            matched = true;
+            for dir in path.ancestors().skip(1).take_while(|d| *d != view.base) {
+                let skips = prune.as_ref().is_some_and(|p| p.skips_inside(dir));
+                assert!(!skips, "`{pattern}` skips {dir:?}, with {path:?} in it");
+            }
+        }
+        assert!(matched, "`{pattern}` matches no path");
+    }
+}
+
+#[test]
+fn test_regex_too_slow() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("a".repeat(40)), "").unwrap();
+    fs::write(temp.path().join("b"), "").unwrap();
+    let mut koil = Koil::builder().settings(regex()).build();
+    koil.open(temp.path()).unwrap();
+    // every way to split the `a`s is tried, as none ends after something else
+    assert!(matches!(
+        koil.open("(a|aa)+(?<!a)"),
+        Err(OpenError::OverLimit(OverLimit::Backtracking { pattern, .. }))
+            if pattern == "(a|aa)+(?<!a)"
+    ));
+    // nothing changed
+    assert_eq!(None, koil.pattern());
+    // without the look behind, it is matched in linear time
+    koil.open("(a|aa)+").unwrap();
+    assert_eq!(1, koil.listing().len());
+}
+
 #[test]
 fn test_regex_setting_keeps_open_pattern() {
     let mut koil = glob_koil("**/*");

@@ -317,6 +317,8 @@ impl Koil {
     /// `.,*+?()[]{}|^$\` for a regex). A dir's path has a `/` at its end, so `,*/` shows only
     /// dirs, and `,*` only files. A glob's `*` never matches `/`, and a regex must match the
     /// whole path, where `,` is any character except `/`
+    /// A regex can look around and back (`.*(?<!\.min)\.js`, `(,+)/\1\.rs`), see `fancy-regex`
+    /// for its syntax
     /// Only `/` separates, also on Windows: a plain path with `\` (like one pasted from
     /// Windows) opens, and [`Koil::location`] then shows it with `/`, but in a pattern `\` is
     /// an escape, as everywhere else (so `C:\src\*.rs` is not the glob `*.rs` in `src`)
