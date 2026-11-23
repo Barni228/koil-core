@@ -6,15 +6,15 @@ use crate::sync::Seen;
 use crate::{GlobError, Koil, OpenError, OverLimit, is_hidden};
 use fancy_regex::{Absent, Assertion, Expr, Regex, RegexBuilder};
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::{WalkBuilder, WalkState};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex_automata::dfa::{Automaton, StartKind, dense};
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// How much opening a pattern can read, so one that matches too much (like `.*` in a home dir)
 /// stops early, instead of reading every path, and the listing stays short enough to edit
@@ -798,9 +798,41 @@ pub(crate) fn walker(dir: &Path, show_hidden: bool, gitignore: bool) -> WalkBuil
         .git_global(gitignore)
         .git_exclude(gitignore)
         .parents(gitignore)
-        // git never shows its own dir
-        .filter_entry(move |item| !(gitignore && item.file_name() == ".git"));
+        .filter_entry(move |item| !is_git_dir(item, gitignore));
     walk
+}
+
+/// Whether a walk leaves out `item` as git's own dir (git never shows it), if `gitignore`
+fn is_git_dir(item: &DirEntry, gitignore: bool) -> bool {
+    gitignore && item.file_name() == ".git"
+}
+
+/// Runs `visit` on every entry of `walk`, in this thread: the web has no others, and
+/// [`WalkBuilder::build_parallel`] always starts some
+#[cfg_attr(not(target_os = "emscripten"), allow(dead_code))]
+fn walk_in_order(
+    mut walk: WalkBuilder,
+    gitignore: bool,
+    visit: impl Fn(Result<DirEntry, ignore::Error>) -> WalkState,
+) {
+    // the last dir `visit` skipped: the walk goes depth first, so a dir's entries come right
+    // after it, and leaving them out here keeps it from going further into them
+    let skipped: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+    let in_skipped = Arc::clone(&skipped);
+    walk.filter_entry(move |item| {
+        let skipped = in_skipped.lock().unwrap();
+        !is_git_dir(item, gitignore) && item.path().parent() != skipped.as_deref()
+    });
+    for item in walk.build() {
+        let dir = (item.as_ref().ok())
+            .filter(|item| item.file_type().is_some_and(|t| t.is_dir()))
+            .map(|item| item.path().to_path_buf());
+        match visit(item) {
+            WalkState::Continue => {}
+            WalkState::Skip => *skipped.lock().unwrap() = dir,
+            WalkState::Quit => break,
+        }
+    }
 }
 
 impl Koil {
@@ -825,9 +857,8 @@ impl Koil {
             Some(Pattern::Glob(glob)) if !hidden => Dots::new(glob),
             _ => None,
         };
-        let walk = walker(&self.current_dir, hidden || dots.is_some(), gitignore)
-            .max_depth(max_depth)
-            .build_parallel();
+        let mut walk = walker(&self.current_dir, hidden || dots.is_some(), gitignore);
+        walk.max_depth(max_depth);
 
         let prune = Prune::new(view);
         let base = self.current_dir.as_path();
@@ -835,68 +866,70 @@ impl Koil {
         let paths = Mutex::new(Vec::new());
         let (searched, matched) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let over_limit = Mutex::new(None);
-        walk.run(|| {
-            Box::new(|item| {
-                // what can not be read is skipped
-                let Ok(item) = item else {
-                    return WalkState::Continue;
-                };
-                // the walk starts with the dir itself
-                if item.depth() == 0 {
-                    return WalkState::Continue;
+        let visit = |item: Result<DirEntry, ignore::Error>| {
+            // what can not be read is skipped
+            let Ok(item) = item else {
+                return WalkState::Continue;
+            };
+            // the walk starts with the dir itself
+            if item.depth() == 0 {
+                return WalkState::Continue;
+            }
+            let is_dir = item.file_type().is_some_and(|t| t.is_dir());
+            // with `dots`, the walk has the hidden entries too, and they say which to take
+            let (dots_show, dots_enter) = match &dots {
+                Some(dots) => dots.walks(&item, base, is_dir),
+                None => (true, true),
+            };
+            if !dots_show && !dots_enter {
+                return WalkState::Skip;
+            }
+            let skip_inside = is_dir
+                && (!dots_enter || prune.as_ref().is_some_and(|p| p.skips_inside(item.path())));
+            let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
+            let shown = match dots_show {
+                true => view.try_contains(item.path(), is_dir),
+                false => Ok(false),
+            };
+            let Ok(shown) = shown else {
+                *over_limit.lock().unwrap() = pattern.map(|pattern| OverLimit::Backtracking {
+                    pattern: pattern.as_str().to_string(),
+                    limit: BACKTRACK_LIMIT,
+                });
+                return WalkState::Quit;
+            };
+            let matches = match shown {
+                true => {
+                    // here, on the walk's threads, as it reads the disk again (and a dir's
+                    // entries, when sorting by size)
+                    let seen = (item.metadata().ok()).map(|m| Seen::new(item.path(), &m, settings));
+                    paths.lock().unwrap().push((item.into_path(), seen));
+                    matched.fetch_add(1, Ordering::Relaxed) + 1
                 }
-                let is_dir = item.file_type().is_some_and(|t| t.is_dir());
-                // with `dots`, the walk has the hidden entries too, and they say which to take
-                let (dots_show, dots_enter) = match &dots {
-                    Some(dots) => dots.walks(&item, base, is_dir),
-                    None => (true, true),
-                };
-                if !dots_show && !dots_enter {
-                    return WalkState::Skip;
-                }
-                let skip_inside = is_dir
-                    && (!dots_enter || prune.as_ref().is_some_and(|p| p.skips_inside(item.path())));
-                let searched = searched.fetch_add(1, Ordering::Relaxed) + 1;
-                let shown = match dots_show {
-                    true => view.try_contains(item.path(), is_dir),
-                    false => Ok(false),
-                };
-                let Ok(shown) = shown else {
-                    *over_limit.lock().unwrap() = pattern.map(|pattern| OverLimit::Backtracking {
-                        pattern: pattern.as_str().to_string(),
-                        limit: BACKTRACK_LIMIT,
-                    });
-                    return WalkState::Quit;
-                };
-                let matches = match shown {
-                    true => {
-                        // here, on the walk's threads, as it reads the disk again (and a dir's
-                        // entries, when sorting by size)
-                        let seen =
-                            (item.metadata().ok()).map(|m| Seen::new(item.path(), &m, settings));
-                        paths.lock().unwrap().push((item.into_path(), seen));
-                        matched.fetch_add(1, Ordering::Relaxed) + 1
-                    }
-                    false => matched.load(Ordering::Relaxed),
-                };
-                if let Some(pattern) = pattern
-                    && let Err(error) = limits.check(pattern, matches, searched)
-                {
-                    *over_limit.lock().unwrap() = Some(error);
-                    return WalkState::Quit;
-                }
-                match skip_inside {
-                    true => WalkState::Skip,
-                    false => WalkState::Continue,
-                }
-            })
-        });
+                false => matched.load(Ordering::Relaxed),
+            };
+            if let Some(pattern) = pattern
+                && let Err(error) = limits.check(pattern, matches, searched)
+            {
+                *over_limit.lock().unwrap() = Some(error);
+                return WalkState::Quit;
+            }
+            match skip_inside {
+                true => WalkState::Skip,
+                false => WalkState::Continue,
+            }
+        };
+        #[cfg(not(target_os = "emscripten"))]
+        walk.build_parallel().run(|| Box::new(&visit));
+        #[cfg(target_os = "emscripten")]
+        walk_in_order(walk, gitignore, visit);
 
         if let Some(error) = over_limit.into_inner().unwrap() {
             return Err(error.into());
         }
         let mut paths = paths.into_inner().unwrap();
-        // the walk runs on many threads, in no order, and new IDs are given in this one
+        // the walk runs on many threads (but on the web), in no order, and new IDs are given in
+        // this one
         paths.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(paths)
     }
