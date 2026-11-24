@@ -18,7 +18,8 @@ pub struct Trashed {
     #[serde(with = "crate::serde_path")]
     pub original: PathBuf,
     /// Where to find it in the trash
-    /// On macOS it is the path inside the trash, on other systems it is [`trash::TrashItem::id`]
+    /// On macOS and the web it is the path inside the trash, on other systems it is
+    /// [`trash::TrashItem::id`]
     #[serde(with = "crate::serde_path")]
     id: PathBuf,
     /// What tells it apart from what is trashed later at `id`, which is free again once the
@@ -113,13 +114,53 @@ mod platform {
     }
 }
 
+// The web (Emscripten) has a home dir, where `trash` keeps the freedesktop trash, but `trash`
+// can not find the mount points there, and fails to trash, list or restore anything without
+// them, so there koil keeps that trash itself (see `home`)
+#[cfg(target_os = "emscripten")]
+mod platform {
+    use super::{Trashed, home, not_in_trash};
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) use home::Stamp;
+
+    pub fn trash(path: &Path) -> io::Result<(PathBuf, Option<Stamp>)> {
+        let (id, stamp) = home::trash(&home::dir()?, path)?;
+        Ok((id, Some(stamp)))
+    }
+
+    pub fn restore(trashed: &Trashed) -> io::Result<()> {
+        if !in_trash(trashed) {
+            return Err(not_in_trash(trashed));
+        }
+        home::put_back(&trashed.id, &trashed.original)
+    }
+
+    fn in_trash(trashed: &Trashed) -> bool {
+        home::has(&trashed.id, trashed.stamp.as_deref())
+    }
+
+    /// Tells whether items are still in the trash, so [`restore`] can bring them back
+    /// Made with `default`, as on other systems, so not a unit struct
+    #[derive(Default)]
+    pub struct Contents {}
+
+    impl Contents {
+        pub fn has(&self, trashed: &Trashed) -> bool {
+            in_trash(trashed)
+        }
+    }
+}
+
 #[cfg(any(
     target_os = "windows",
     all(
         unix,
         not(target_os = "macos"),
         not(target_os = "ios"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "emscripten")
     )
 ))]
 mod platform {
@@ -235,5 +276,139 @@ mod platform {
             Some(p) if !p.as_os_str().is_empty() => fs::canonicalize(p),
             _ => std::env::current_dir(),
         }
+    }
+}
+
+/// The freedesktop home trash, as koil keeps it on the web (see `platform` there):
+/// `$XDG_DATA_HOME/Trash`, by default `~/.local/share/Trash`, with the items in its `files`,
+/// and an info file for each in its `info` (`<its name>.trashinfo`), which says where it came
+/// from and when it was trashed. Making the info file takes the name, so an item gets the first
+/// one free: its own, then `name.2`, `name.3`…, as `trash` gives on Linux
+/// Built everywhere, so it keeps compiling and is tested, but only the web uses it, so it takes
+/// an item's path in the trash and its stamp, not a [`Trashed`], whose stamp is another elsewhere
+#[cfg_attr(not(target_os = "emscripten"), allow(dead_code))]
+pub(crate) mod home {
+    use crate::apply::{inside, into_itself, rename};
+    use crate::{on_disk, shown};
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::{env, fs, io};
+
+    /// When the item was trashed, as its info file's `DeletionDate` says (local time, to the
+    /// second; the web has no time zones, so UTC there): an item trashed at the same path
+    /// after the trash was emptied has another
+    pub(crate) type Stamp = String;
+
+    /// The home trash: `$XDG_DATA_HOME/Trash`, else `$HOME/.local/share/Trash`
+    pub fn dir() -> io::Result<PathBuf> {
+        let var = |name| (env::var_os(name).map(PathBuf::from)).filter(|path| path.is_absolute());
+        let data =
+            var("XDG_DATA_HOME").or_else(|| var("HOME").map(|home| home.join(".local/share")));
+        (data.map(|data| data.join("Trash"))).ok_or_else(|| {
+            io::Error::other("Neither XDG_DATA_HOME nor HOME says where the trash is")
+        })
+    }
+
+    /// Move `path` into the trash at `dir`, which is made if it is not there
+    /// Returns where it is in the trash, and its stamp
+    pub fn trash(dir: &Path, path: &Path) -> io::Result<(PathBuf, Stamp)> {
+        let path = std::path::absolute(path)?;
+        let Some(name) = path.file_name() else {
+            let why = format!("`{}` has no name to trash it by", shown(&path));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        };
+        let files = dir.join("files");
+        // a dir the trash is in: the web's home dir is a file system of its own, and a dir moved
+        // to it from outside is copied, which would copy it into itself
+        if inside(&path, &files.join(name)) {
+            return Err(into_itself(&path, &files));
+        }
+        fs::create_dir_all(&files)?;
+        fs::create_dir_all(dir.join("info"))?;
+        let date = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let info = format!(
+            "[Trash Info]\nPath={}\nDeletionDate={date}\n",
+            uri_path(&path)
+        );
+        let mut count = 0;
+        loop {
+            count += 1;
+            let mut in_trash = name.to_owned();
+            if count > 1 {
+                in_trash.push(format!(".{count}"));
+            }
+            let id = files.join(&in_trash);
+            let info_file = info_file(&id);
+            let mut file = match fs::File::create_new(&info_file) {
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                file => file?,
+            };
+            // before it moves, so nothing is in the trash without saying where it came from;
+            // `rename` copies it, if it is on another file system, and never overwrites
+            match (file.write_all(info.as_bytes())).and_then(|()| rename(&path, &id)) {
+                Ok(()) => return Ok((id, date)),
+                Err(err) => {
+                    let _ = fs::remove_file(&info_file);
+                    // something is in `files` at that name, without an info file
+                    if err.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the item at `id` in the trash back to `original`, making the dirs it was in if
+    /// they are gone, as the freedesktop trash does (see [`super::RESTORE_MAKES_PARENTS`]); never
+    /// overwrites what is there
+    pub fn put_back(id: &Path, original: &Path) -> io::Result<()> {
+        if let Some(parent) = original.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        rename(id, original)?;
+        // it is back, and an info file left behind would only keep its name taken
+        let _ = fs::remove_file(info_file(id));
+        Ok(())
+    }
+
+    /// Whether the item at `id` is still in the trash, and not one trashed at its path later:
+    /// its info file has `stamp`, if one is given
+    pub fn has(id: &Path, stamp: Option<&str>) -> bool {
+        on_disk(id) && stamp.is_none_or(|stamp| deletion_date(id).as_deref() == Some(stamp))
+    }
+
+    /// The `DeletionDate` of the item at `id` in the trash, from its info file
+    fn deletion_date(id: &Path) -> Option<String> {
+        let info = fs::read_to_string(info_file(id)).ok()?;
+        let date = info
+            .lines()
+            .find_map(|line| line.strip_prefix("DeletionDate="))?;
+        Some(date.trim().to_string())
+    }
+
+    /// The info file of the item at `id`, in the trash's `files`
+    fn info_file(id: &Path) -> PathBuf {
+        let trash = id.parent().and_then(Path::parent).unwrap_or(Path::new(""));
+        let mut name = id.file_name().unwrap_or_default().to_owned();
+        name.push(".trashinfo");
+        trash.join("info").join(name)
+    }
+
+    /// `path` as an info file's `Path` has it: escaped as in a URI, every byte but an ASCII
+    /// letter or digit and `/-._~` as `%` and its hex
+    fn uri_path(path: &Path) -> String {
+        let mut uri = String::new();
+        for &byte in path.as_os_str().as_encoded_bytes() {
+            match byte {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                    uri.push(char::from(byte))
+                }
+                _ => {
+                    let _ = write!(uri, "%{byte:02X}");
+                }
+            }
+        }
+        uri
     }
 }

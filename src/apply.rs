@@ -290,7 +290,7 @@ fn in_use(err: &io::Error) -> bool {
 /// drive), where nothing can be renamed to, it is copied and then removed ([`move_across`])
 /// Retried while Windows refuses it (see [`retry`]), and `dst` is checked before each try, as
 /// `fs::rename` replaces a file there, which may have come while it waited
-fn rename(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn rename(src: &Path, dst: &Path) -> io::Result<()> {
     let renamed = retry(
         || {
             // on case insensitive filesystems `a -> A` sees `A` as taken, but it is `a` itself
@@ -486,7 +486,7 @@ pub(crate) fn inside(src: &Path, dst: &Path) -> bool {
             .any(|parent| parent == src || same_file(parent, src).unwrap_or(false))
 }
 
-fn into_itself(src: &Path, dst: &Path) -> io::Error {
+pub(crate) fn into_itself(src: &Path, dst: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(

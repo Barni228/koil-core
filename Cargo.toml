@@ -18,6 +18,8 @@ include = [
 ]
 
 [dependencies]
+# when an item was trashed, in the trash koil keeps on the web (`trash.rs`'s `home`)
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `canonicalize` without the `\\?\` Windows puts before every path
 dunce = "1.0"
 # regexes that look around and back (`(?<!a)`, `\1`), the rest is matched as `regex` does

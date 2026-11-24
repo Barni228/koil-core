@@ -578,6 +578,114 @@ fn test_undo_after_the_trash_was_emptied() {
     assert!(!first.path().join(&name).exists());
 }
 
+/// The trash koil keeps on the web (`trash::home`), here in a temp dir: what goes in has an info
+/// file that says where it came from, and comes back from it there, without it
+#[test]
+fn test_web_trash() {
+    use crate::trash::home;
+    let temp = test_temp_dir();
+    let trash = temp.path().join("Trash");
+    let named = temp.path().join("a b é");
+    fs::write(&named, "named").unwrap();
+    let (id, stamp) = home::trash(&trash, &named).unwrap();
+    assert_eq!(trash.join("files/a b é"), id);
+    assert!(!on_disk(&named));
+    assert_eq!("named", fs::read_to_string(&id).unwrap());
+    let info = fs::read_to_string(trash.join("info/a b é.trashinfo")).unwrap();
+    let lines: Vec<&str> = info.lines().collect();
+    assert_eq!("[Trash Info]", lines[0]);
+    assert!(lines[1].starts_with("Path=/"), "{info}");
+    assert!(lines[1].ends_with("/a%20b%20%C3%A9"), "{info}");
+    assert_eq!(format!("DeletionDate={stamp}"), lines[2]);
+    assert!(home::has(&id, Some(&stamp)));
+
+    home::put_back(&id, &named).unwrap();
+    assert_eq!("named", fs::read_to_string(&named).unwrap());
+    assert!(!on_disk(&id));
+    assert!(!on_disk(&trash.join("info/a b é.trashinfo")));
+    assert!(!home::has(&id, None));
+
+    // a dir, with what is in it
+    let (dir, _) = home::trash(&trash, &temp.path().join("dir")).unwrap();
+    assert_eq!("y", fs::read_to_string(dir.join("sub/y")).unwrap());
+    home::put_back(&dir, &temp.path().join("dir")).unwrap();
+    assert_eq!(
+        "y",
+        fs::read_to_string(temp.path().join("dir/sub/y")).unwrap()
+    );
+}
+
+/// An item trashed with the name of one in the trash gets the next name free, and comes back
+/// never over what is there, making the dirs it goes in
+#[test]
+fn test_web_trash_same_name() {
+    use crate::trash::home;
+    let temp = test_temp_dir();
+    let trash = temp.path().join("Trash");
+    let a = temp.path().join("a");
+    let (first, _) = home::trash(&trash, &a).unwrap();
+    fs::write(&a, "again").unwrap();
+    let (second, _) = home::trash(&trash, &a).unwrap();
+    assert_eq!(trash.join("files/a"), first);
+    assert_eq!(trash.join("files/a.2"), second);
+    assert!(on_disk(&trash.join("info/a.2.trashinfo")));
+    // something in `files` without an info file keeps its name too
+    fs::write(trash.join("files/a.3"), "stray").unwrap();
+    fs::write(&a, "third").unwrap();
+    let (third, _) = home::trash(&trash, &a).unwrap();
+    assert_eq!(trash.join("files/a.4"), third);
+    assert!(!on_disk(&trash.join("info/a.3.trashinfo")));
+
+    let b = temp.path().join("b");
+    let err = home::put_back(&second, &b).unwrap_err();
+    assert_eq!(io::ErrorKind::AlreadyExists, err.kind());
+    assert_eq!("again", fs::read_to_string(&second).unwrap());
+    assert_eq!("b", fs::read_to_string(&b).unwrap());
+
+    let gone = temp.path().join("gone/dir/a");
+    home::put_back(&second, &gone).unwrap();
+    assert_eq!("again", fs::read_to_string(&gone).unwrap());
+    home::put_back(&first, &a).unwrap();
+    assert_eq!("a", fs::read_to_string(&a).unwrap());
+}
+
+/// Once the web's trash is emptied, what is trashed at the path of what an apply deleted is
+/// not taken for it: its info file says it was trashed at another time
+#[test]
+fn test_web_trash_emptied() {
+    use crate::trash::home;
+    let temp = test_temp_dir();
+    let trash = temp.path().join("Trash");
+    let a = temp.path().join("a");
+    let (id, stamp) = home::trash(&trash, &a).unwrap();
+    fs::remove_dir_all(&trash).unwrap();
+    fs::write(&a, "other").unwrap();
+    let (other, _) = home::trash(&trash, &a).unwrap();
+    assert_eq!(id, other);
+    // trashed in the same second here, so its time is made another
+    let info = trash.join("info/a.trashinfo");
+    let later = fs::read_to_string(&info)
+        .unwrap()
+        .replace(&stamp, "2001-02-03T04:05:06");
+    fs::write(&info, later).unwrap();
+    assert!(!home::has(&id, Some(&stamp)));
+    assert!(home::has(&id, Some("2001-02-03T04:05:06")));
+    assert!(home::has(&id, None));
+}
+
+/// A dir the web's trash is in can not go into it: it would be copied into itself, as the
+/// trash is on a file system of its own there
+#[test]
+fn test_web_trash_never_into_itself() {
+    use crate::trash::home;
+    let temp = test_temp_dir();
+    let before = snapshot(temp.path());
+    let trash = temp.path().join("dir/sub/Trash");
+    let err = home::trash(&trash, &temp.path().join("dir")).unwrap_err();
+    assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+    assert_eq!(before, snapshot(temp.path()));
+}
+
 #[test]
 fn test_history_in_another_session() {
     let temp = test_temp_dir();
