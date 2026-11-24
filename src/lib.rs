@@ -406,9 +406,9 @@ impl Koil {
     /// It never has `..`, which a frontend opens some other way
     pub fn listing(&self) -> Vec<Entry> {
         let view = self.view();
-        let in_view = |index: usize, path: &Path| view.contains(path, self.ids[index].is_dir());
+        let in_view = |index: usize, path: &Path| view.contains(path, self.is_dir_at(index));
         // a drive is a dir, even with no disk in it
-        let is_dir = |index: usize| is_drive_root(&self.ids[index]) || self.ids[index].is_dir();
+        let is_dir = |index: usize| is_drive_root(&self.ids[index]) || self.is_dir_at(index);
         let entry = |index: usize, path: &Path| Entry {
             id: Some(to_id(index)),
             name: self.name(path),
@@ -1342,6 +1342,16 @@ impl Koil {
             settings.show_hidden,
             settings.respect_gitignore,
         )
+    }
+
+    /// Whether the path of the ID `index` is a dir on disk, like [`Path::is_dir`]: as the open
+    /// view was read, if it is in it (see [`Koil::seen`]), so the listing of a dir of 260,000
+    /// files does not ask the disk about each again (which took seconds)
+    fn is_dir_at(&self, index: usize) -> bool {
+        match self.seen.get(&index) {
+            Some(seen) if self.current_listing.contains(&index) => seen.meta.is_dir,
+            _ => self.ids[index].is_dir(),
+        }
     }
 
     /// Whether `path` is a dir on disk, or a new dir in [`Koil::diff`], or the drives, which

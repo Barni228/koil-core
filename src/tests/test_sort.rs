@@ -396,3 +396,37 @@ fn test_settings_without_sort_load() {
         (sort.by, sort.reverse, sort.dirs_first)
     );
 }
+
+/// A dir with enough entries to read what is at them on threads (see `seen_at`): each is what
+/// it is, whichever thread read it, and new IDs are given in the order of the names
+#[test]
+fn test_many_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    let size = |i: usize| i % 97;
+    for i in 0..3000 {
+        let path = root.join(format!("f{i:04}"));
+        match i % 10 {
+            0 => fs::create_dir(path).unwrap(),
+            _ => fs::write(path, "x".repeat(size(i))).unwrap(),
+        }
+    }
+    let koil = open_sorted(&root, SortBy::Size, false);
+    let listing = koil.listing();
+    assert_eq!(3000, listing.len());
+    for entry in &listing {
+        let i: usize = entry.name.to_str().unwrap()[1..].parse().unwrap();
+        assert_eq!(i.is_multiple_of(10), entry.is_dir, "{entry:?}");
+        let meta = koil.metadata(entry.id.unwrap()).unwrap();
+        assert_eq!(entry.is_dir, meta.is_dir);
+        if !entry.is_dir {
+            assert_eq!(size(i) as u64, meta.size, "{entry:?}");
+        }
+    }
+    let mut by_id = listing.clone();
+    by_id.sort_by_key(|e| e.id);
+    let names: Vec<PathBuf> = by_id.into_iter().map(|e| e.name).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(sorted, names);
+}

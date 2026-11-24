@@ -3,7 +3,7 @@
 
 use crate::drives::{is_drive_root, is_drives};
 use crate::sync::Seen;
-use crate::{GlobError, Koil, OpenError, OverLimit, is_hidden};
+use crate::{GlobError, Koil, OpenError, OverLimit, Settings, is_hidden};
 use fancy_regex::{Absent, Assertion, Expr, Regex, RegexBuilder};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::{DirEntry, WalkBuilder, WalkState};
@@ -862,8 +862,8 @@ impl Koil {
 
         let prune = Prune::new(view);
         let base = self.current_dir.as_path();
-        let (pattern, limits, settings) = (self.pattern.as_ref(), self.limits, &self.settings);
-        let paths = Mutex::new(Vec::new());
+        let (pattern, limits) = (self.pattern.as_ref(), self.limits);
+        let found = Mutex::new(Vec::new());
         let (searched, matched) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let over_limit = Mutex::new(None);
         let visit = |item: Result<DirEntry, ignore::Error>| {
@@ -900,10 +900,7 @@ impl Koil {
             };
             let matches = match shown {
                 true => {
-                    // here, on the walk's threads, as it reads the disk again (and a dir's
-                    // entries, when sorting by size)
-                    let seen = (item.metadata().ok()).map(|m| Seen::new(item.path(), &m, settings));
-                    paths.lock().unwrap().push((item.into_path(), seen));
+                    found.lock().unwrap().push(item);
                     matched.fetch_add(1, Ordering::Relaxed) + 1
                 }
                 false => matched.load(Ordering::Relaxed),
@@ -927,10 +924,58 @@ impl Koil {
         if let Some(error) = over_limit.into_inner().unwrap() {
             return Err(error.into());
         }
-        let mut paths = paths.into_inner().unwrap();
+        let mut found = found.into_inner().unwrap();
         // the walk runs on many threads (but on the web), in no order, and new IDs are given in
-        // this one
-        paths.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(paths)
+        // this one; a dir's own entries have no `/` after the dir's, so their bytes are in the
+        // order of their parts, and comparing them so is faster (a dir of 260,000 files took
+        // most of a second)
+        match max_depth {
+            Some(1) => found.sort_unstable_by(|a, b| {
+                let (a, b) = (a.path().as_os_str(), b.path().as_os_str());
+                a.as_encoded_bytes().cmp(b.as_encoded_bytes())
+            }),
+            _ => found.sort_unstable_by(|a, b| a.path().cmp(b.path())),
+        }
+        Ok(seen_at(found, &self.settings))
     }
+}
+
+/// The paths of `items`, with what is at each (see [`Walked`]), read on as many threads as
+/// there are cores (but on the web), as it reads the disk again (and a dir's entries, when
+/// sorting by size): the walk reads a dir's entries on one thread, where a dir of 260,000 files
+/// took seconds
+fn seen_at(items: Vec<DirEntry>, settings: &Settings) -> Walked {
+    let read = |items: Vec<DirEntry>| -> Walked {
+        (items.into_iter())
+            .map(|item| {
+                let seen = (item.metadata().ok()).map(|m| Seen::new(item.path(), &m, settings));
+                (item.into_path(), seen)
+            })
+            .collect()
+    };
+    // a thread for fewer is slower than reading them here
+    const LEAST: usize = 1000;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cfg!(target_os = "emscripten") || threads < 2 || items.len() < 2 * LEAST {
+        return read(items);
+    }
+    let size = items.len().div_ceil(threads).max(LEAST);
+    let mut parts = Vec::new();
+    let mut items = items.into_iter();
+    loop {
+        let part: Vec<DirEntry> = items.by_ref().take(size).collect();
+        if part.is_empty() {
+            break;
+        }
+        parts.push(part);
+    }
+    std::thread::scope(|scope| {
+        let read = &read;
+        let reads: Vec<_> = (parts.into_iter())
+            .map(|part| scope.spawn(move || read(part)))
+            .collect();
+        (reads.into_iter())
+            .flat_map(|read| read.join().unwrap())
+            .collect()
+    })
 }
