@@ -594,8 +594,18 @@ fn test_web_trash() {
     let info = fs::read_to_string(trash.join("info/a b é.trashinfo")).unwrap();
     let lines: Vec<&str> = info.lines().collect();
     assert_eq!("[Trash Info]", lines[0]);
-    assert!(lines[1].starts_with("Path=/"), "{info}");
-    assert!(lines[1].ends_with("/a%20b%20%C3%A9"), "{info}");
+    // absolute, and escaped as in a URI: on Windows, where only the tests run it, with its
+    // `\` as `%5C`
+    let (start, separator) = if cfg!(windows) {
+        ("Path=", "%5C")
+    } else {
+        ("Path=/", "/")
+    };
+    assert!(lines[1].starts_with(start), "{info}");
+    assert!(
+        lines[1].ends_with(&format!("{separator}a%20b%20%C3%A9")),
+        "{info}"
+    );
     assert_eq!(format!("DeletionDate={stamp}"), lines[2]);
     assert!(home::has(&id, Some(&stamp)));
 
